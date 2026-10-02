@@ -1,0 +1,39 @@
+services:
+  ai-router:
+    image: ai-router:local
+    build:
+      context: .
+      target: gateway
+    container_name: ai-router
+    restart: unless-stopped
+    init: true
+    user: "10001:10001"
+    read_only: true
+    ports:
+      - "127.0.0.1:${AI_ROUTER_PORT:-8090}:8080"
+    environment:
+      # Digests only. Operator exports JSON in the calling shell; no env_file.
+      AI_ROUTER_KEYS: "${AI_ROUTER_KEYS:?Export digest records before starting}"
+      AI_ROUTER_NATIVE_ENABLED: "false"
+      AI_ROUTER_EXPECTED_AGY_VERSION: "1.2.15"
+      AI_ROUTER_TRUSTED_PROXIES: "${AI_ROUTER_TRUSTED_PROXIES:-}"
+    volumes:
+      - auth:/var/lib/ai-router/auth
+      - telemetry:/var/lib/ai-router/telemetry
+    tmpfs:
+      - /run/ai-router:rw,nosuid,nodev,noexec,size=256m,uid=10001,gid=10001,mode=0700
+      - /tmp:rw,nosuid,nodev,noexec,size=64m,uid=10001,gid=10001,mode=0700
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 2g
+    cpus: 2
+    stop_grace_period: 30s
+
+volumes:
+  auth:
+    name: ai-router-auth
+  telemetry:
+    name: ai-router-telemetry

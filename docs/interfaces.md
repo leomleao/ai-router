@@ -31,7 +31,7 @@ keys. Config validates bounds, absolute storage paths, digest/ID/scope format.
 `auth::generate_key(id, scopes) -> (String, KeyConfig)` uses 64 random bytes.
 `authenticate(&[KeyConfig], bearer: &str) -> Option<KeyConfig>` uses constant-time
 digest comparison. `RateLimiter::new(limit:u32, max_entries:usize)` and
-`check(&self, key:&str) -> bool` is a bounded fixed/sliding window admission gate.
+`check(&self, key:&str) -> bool` is a bounded 60-second fixed-window admission gate.
 
 Protocol types derive serde where appropriate:
 
@@ -45,7 +45,7 @@ Protocol types derive serde where appropriate:
 - `RunProfile` enum `Model`, `Native`.
 - `RunRequest { request_id:String, model:String, prompt:String,
   system:String, tools:Vec<ToolDefinition>, schema:Option<Value>,
-  profile:RunProfile, effort:Option<String>, files:Vec<InputFile> }`.
+  profile:RunProfile, effort:Option<String>, mode:Option<String>, files:Vec<InputFile> }`.
 - `RunResult { text:String, structured_output:Option<Value>,
   conversation_id:String, usage:Option<Usage>, usage_partial:bool,
   tool_calls:Vec<ToolCall>, status:String }`.
@@ -68,8 +68,13 @@ Protocol types derive serde where appropriate:
 
 `Runner::new(Arc<Config>) -> Runner` (Clone).
 `Runner::start(RunRequest, CancellationToken) -> Result<RunStream, ApiError>`
-is async. `RunStream { events: mpsc::Receiver<RunEvent>, workspace:PathBuf }`.
-Workspace is `config.workspace_dir/<request_id>`; root owns eventual cleanup.
+is async and returns before any filesystem preparation. `RunStream` contains
+`events:mpsc::Receiver<RunEvent>`, `workspace:PathBuf`,
+`workspace_owned:Arc<AtomicBool>` and `finished:CancellationToken`. An owned
+worker prepares the workspace and supervises the process; preparation failures
+arrive as terminal error events. `finished` is signalled after filesystem and
+process cleanup. Workspace is `config.workspace_dir/<request_id>`; the root
+holds admission until cleanup and deletes only directories the runner created.
 `Runner::probe() -> ProviderStatus` is async, bounded and never logs credentials.
 Cancel/timeout kills the complete child process group, drains/waits, and emits
 one terminal event. AGY is invoked by argument vector, never a shell. Capture
@@ -94,8 +99,13 @@ official sandbox, never permission skipping, and is gated by config.
 `async record(&self, RequestRecord)`; `async snapshot(&self) -> Snapshot`;
 `async set_provider(&self, ProviderStatus)`;
 `async set_runtime(&self, active:usize, queued:usize)`.
+`note_rejection(&self, code:&str)` synchronously updates six fixed atomic
+counters. Preflight rejection history is sampled at 30 records/minute. These
+counters reset at process start and are distinct from retained-history totals.
+Insertion evicts excess records in O(1); expiration scans run at most once per
+minute, and snapshot aggregation runs outside the records mutex.
 RequestRecord: `request_id:String, client_id:String, model:String, endpoint:String,
-started_at:String, duration_ms:u64, first_output_ms:Option<u64>,
+started_at:String, duration_ms:u64, startup_ms:Option<u64>, first_output_ms:Option<u64>,
 status:String, error_code:Option<String>, usage:Option<Usage>, usage_partial:bool`.
 Snapshot derives Serialize; includes recent records and aggregate status/usage.
 `async monitor::serve(Arc<Telemetry>, PathBuf, CancellationToken)
@@ -123,3 +133,7 @@ sandbox verification and never accept caller-supplied raw provider IDs. Chat
 workspaces deleted on completion/cancellation; native workspaces on TTL/delete.
 Metrics never include event payloads. Tests use explicit fake provider path and
 synthetic keys; fixtures cannot launch signed-in host AGY.
+`AppState::drain(Duration) -> bool` waits for admission cleanup and telemetry
+recording before shutdown flush. `native::shutdown(&AppState) -> bool` cancels
+jobs and reports whether ownership-aware workspace cleanup completed. Failed
+or expired cleanup produces a nonzero gateway exit; Compose allows 30 seconds.

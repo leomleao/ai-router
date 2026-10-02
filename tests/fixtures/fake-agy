@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+"""Deterministic AGY protocol fixture. Never invokes or discovers a real AGY.
+
+Scenarios are selected by literal __fake_*__ markers in the submitted prompt.
+Tools are handed off through the actual Rust MCP relay process, not a fake
+tool-call text response. No credential files or host project files are read.
+"""
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+args = sys.argv[1:]
+
+def emit(value):
+    print(json.dumps(value, separators=(",", ":")), flush=True)
+
+def flag(name, default=None):
+    return args[args.index(name) + 1] if name in args else default
+
+if args == ["--version"]:
+    print("1.2.15")
+    sys.exit(0)
+if args == ["models"]:
+    print("ID                         Name\ngemini-3-pro               Gemini 3 Pro\nclaude-sonnet-4            Claude Sonnet 4")
+    sys.exit(0)
+if flag("-p") == "/quota":
+    emit({"status": "SUCCESS", "command": {"name": "usage", "data": {
+        "description": "fixture", "groups": [{"name": "Gemini Models", "buckets": [{
+            "id": "gemini-5h", "name": "Five Hour Limit Remaining", "window": "5h",
+            "remaining_fraction": 0.75, "reset_time": "2026-10-07T17:22:30Z"
+        }]}]}}})
+    sys.exit(0)
+
+assert "--dangerously-skip-permissions" not in args
+assert flag("--input-format") == "stream-json"
+assert flag("--output-format") == "stream-json"
+assert "--disable-slash-commands" in args
+assert "--continue" not in args and "--conversation" not in args
+assert "--print-timeout" in args
+assert Path(os.environ["HOME"]).name == "auth" or os.environ["HOME"] == "/data/auth"
+assert Path(os.environ["TMPDIR"]) == Path.cwd() / "tmp"
+assert Path(os.environ["TMPDIR"]).is_dir()
+
+model_only = flag("--agent") == "router-model"
+tools = []
+command = None
+relay_args = None
+if model_only:
+    # Read only the router-created synthetic agent/catalogue, never glob a home.
+    agent = Path(".agents/agents/router-model/agent.md").read_text()
+    header = agent.split("---", 2)[1]
+    assert "excludeDefaultComponents: true" in header
+    assert "inheritMcp: false" in header
+    for line in header.splitlines():
+        if line.strip().startswith("command:"):
+            command = json.loads(line.split(":", 1)[1])
+        if line.strip().startswith("args:"):
+            relay_args = json.loads(line.split(":", 1)[1])
+    if command:
+        assert relay_args[0] == "mcp-relay"
+        assert Path(relay_args[1]).name == "router-tools.json"
+        tools = json.loads(Path(relay_args[1]).read_text())
+else:
+    assert "--sandbox" in args
+
+conversation_id = "fixture-" + Path.cwd().name
+if flag("--model") == "fake-auth-before-init":
+    emit({"event":"result", "result":{"status":"ERROR", "error":"authentication required"}})
+    sys.exit(1)
+emit({"event": "init", "conversation_id": conversation_id, "init": {
+    "cwd": str(Path.cwd()), "model": flag("--model"),
+    "agent": "router-model" if model_only else "default",
+    "tools": ["run_command"] if flag("--model") == "fake-fallback" else (["call_mcp_tool"] if tools else ([] if model_only else ["run_command", "write_to_file"])),
+    "permission_mode": "request-review"
+}})
+
+# The fixture emits init before reading input, to prove the router checks the
+# tool inventory before allowing a prompt into a possibly fallback agent.
+line = sys.stdin.readline()
+if not line:
+    sys.exit(2)
+message = json.loads(line)
+Path("prompt-received.txt").write_text("synthetic fixture input was supplied")
+assert message["event"] == "user"
+prompt = message["message"]["content"]
+assert isinstance(prompt, str)
+
+def step(**fields):
+    emit({"event": "step_update", "step_update": {
+        "conversation_id": conversation_id, "step_index": 1,
+        "state": "DONE", "step_type": "agent_response", **fields
+    }})
+
+usage = {"input_tokens": 20, "output_tokens": 3, "thinking_tokens": 0,
+         "cache_read_tokens": 0, "total_tokens": 23}
+
+if "__fake_descendant__" in prompt or "__fake_timeout__" in prompt:
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+    Path("descendant.pid").write_text(str(child.pid))
+if "__fake_timeout__" in prompt:
+    time.sleep(300)
+if "__fake_malformed__" in prompt:
+    print("{not-json", flush=True)
+    time.sleep(300)
+if "__fake_huge__" in prompt:
+    print("x" * (9 * 1024 * 1024), flush=True)
+    time.sleep(300)
+if "__fake_auth__" in prompt:
+    print("authentication required: sensitive diagnostic omitted by gateway", file=sys.stderr, flush=True)
+    sys.exit(1)
+if "__fake_quota__" in prompt:
+    emit({"event": "result", "result": {"status": "ERROR", "error": "RESOURCE_EXHAUSTED quota"}})
+    sys.exit(1)
+if "__fake_native_violation__" in prompt:
+    step(step_type="tool", state="ACTIVE", tool_name="run_command", tool_info={"name":"run_command", "parameters":{"CommandLine":"never executed"}})
+    time.sleep(300)
+if "__fake_permission__" in prompt:
+    emit({"event":"result", "result":{"status":"SUCCESS", "response":"", "denied_actions":[{"action":"command"}]}})
+    sys.exit(0)
+if "__fake_no_result__" in prompt:
+    step(text_delta="unfinished")
+    sys.exit(0)
+if "__fake_stderr_permission__" in prompt:
+    print("run_command was soft-denied because it requires approval", file=sys.stderr, flush=True)
+
+tool_result_count = sum(prompt.count(marker) for marker in (
+    '"role":"tool"', '"role": "tool"', '"type":"function_call_output"',
+    '"type": "function_call_output"'))
+has_tool_result = tool_result_count > 0
+select_tool = (tool_result_count < 2 if "__fake_second_tool__" in prompt else
+               ("__fake_tool__" in prompt or (not has_tool_result and "__fake_final__" not in prompt)))
+if tools and select_tool:
+    tool = tools[0]
+    properties = tool["parameters"].get("properties", {})
+    arguments = {}
+    for name, definition in properties.items():
+        kind = definition.get("type", "string")
+        arguments[name] = {"string":"London", "integer":1, "number":1.0,
+                           "boolean":True, "array":[], "object":{}}.get(kind, "London")
+    step(text_delta="", usage=usage)
+    step(step_index=2, step_type="tool", state="ACTIVE", tool_name="call_mcp_tool",
+         tool_info={"name":"call_mcp_tool", "parameters":{
+             "ServerName":"ai-router", "ToolName":tool["name"], "Arguments":arguments}})
+    # Real MCP handshake and catalogue request, followed by a call with no reply.
+    relay = subprocess.Popen([command] + relay_args, stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    def rpc(request, expect_reply=True):
+        relay.stdin.write(json.dumps(request) + "\n")
+        relay.stdin.flush()
+        if expect_reply:
+            response = json.loads(relay.stdout.readline())
+            assert response.get("id") == request["id"]
+            assert "error" not in response
+            return response
+    rpc({"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{"protocolVersion":"2025-03-26", "capabilities":{}, "clientInfo":{"name":"fake-agy", "version":"1"}}})
+    listed = rpc({"jsonrpc":"2.0", "id":2, "method":"tools/list"})
+    assert listed["result"]["tools"][0]["inputSchema"] == tool["parameters"]
+    rpc({"jsonrpc":"2.0", "id":3, "method":"tools/call", "params":{"name":tool["name"], "arguments":arguments}}, False)
+    time.sleep(300)
+
+if not model_only:
+    Path("answer.txt").write_text("Native fixture artifact\n")
+    step(step_type="tool", tool_name="write_to_file", tool_info={"name":"write_to_file", "parameters":{"TargetFile":"answer.txt"}})
+    if "__fake_large_native__" in prompt:
+        # 270 bounded 8 KiB deltas: 2.11 MiB of text, below the provider's
+        # default 8 MiB cap but above native replay retention's 2 MiB bound.
+        chunk = "n" * 8192
+        for index in range(270):
+            step(step_index=index + 2, state="ACTIVE", text_delta=chunk)
+        emit({"event":"result", "result": {
+            "conversation_id":conversation_id, "status":"SUCCESS",
+            "response":chunk * 270, "usage":usage}})
+        sys.exit(0)
+
+output = "Fixture final answer" if has_tool_result or "__fake_final__" in prompt else "Hello from fixture"
+structured = None
+if "--json-schema" in args:
+    schema = json.loads(flag("--json-schema"))
+    structured = {name: 1 if item.get("type") == "integer" else "fixture"
+                  for name, item in schema.get("properties", {}).items()}
+    if "__fake_bad_schema__" in prompt:
+        structured = {name: "wrong-type" for name in structured}
+    output = json.dumps(structured, separators=(",", ":"))
+if "__fake_result_only__" not in prompt:
+    middle = len(output) // 2
+    step(state="ACTIVE", text_delta=output[:middle])
+    step(text_delta=output[middle:], usage=usage)
+result = {"conversation_id":conversation_id, "status":"SUCCESS", "response":output, "usage":usage}
+if structured is not None:
+    result["structured_output"] = structured
+emit({"event":"result", "result":result})

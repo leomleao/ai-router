@@ -1,0 +1,17 @@
+# Secret paths must be excluded before Docker transfers the build context.
+**/.env*
+**/*.pem
+**/*.key
+**/secrets
+**/secrets/**
+**/credentials
+**/credentials/**
+.git
+**/.git
+target
+**/target
+node_modules
+**/node_modules
+.DS_Store
+**/__pycache__
+**/*.pyc

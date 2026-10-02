@@ -1,6 +1,8 @@
 # Implementation plan
 
-Status: approved architecture; implementation pending.
+Status: local implementation and automated acceptance complete; authenticated
+provider/client/sandbox acceptance awaits operator login. Implementation
+authorised on 2026-10-02.
 The implementation and validation use local Docker.
 
 ## Outcome
@@ -65,8 +67,8 @@ graph TD
   P3 --> P4
   P4 --> P5["P5: local Docker acceptance and adversarial tests"]
   P5 --> P6["P6: independent review and fixes"]
-  P6 --> P5
-  P5 --> P7["P7: documentation, final commits and handoff"]
+  P6 --> F6["F6: fix findings and rerun affected checks"]
+  F6 --> P7["P7: documentation, final commits and handoff"]
   P3 --> L1["L1: operator AGY login in local Docker"]
   L1 --> L2["L2: real CLI / client / sandbox capability checks"]
   P4 --> L2
@@ -74,8 +76,8 @@ graph TD
 ```
 
 P1/P2/P3 have separate file ownership and can run in parallel after P0.
-P4 is integrated by the coordinator. P5/P6 repeat only when fixes or failures
-justify it. L1 needs the user's interactive authentication, never secret-file
+P4 is integrated by the coordinator. Follow-up reviews are new DAG iterations
+when fixes or failures justify them, rather than cyclic dependencies. L1 needs the user's interactive authentication, never secret-file
 access by an agent. Work independent of L1 continues while that gate is pending.
 
 ## Deliverables and acceptance
@@ -127,3 +129,33 @@ access by an agent. Work independent of L1 continues while that gate is pending.
 
 Community adapters inform the design; they do not prove our implementation's
 compatibility. Official headless transport currently accepts text blocks only.
+
+## Implementation record
+
+- P0 complete: initial plan/interfaces committed before implementation.
+- P1–P4 implemented: Rust validation/security, runner/relay, monitor/container,
+  both API styles, async native jobs and safe artifact transport.
+- P5 complete locally: fresh Docker build passed 67 Rust tests and 76 network /
+  OpenAI Python SDK 3.24.0 / policy checks. Test state is separate from real login.
+- The actual production image passed 13 unauthenticated smoke checks with
+  disposable synthetic state and the pinned official Linux ARM64 CLI.
+- P6/F6: independent cross-module reviews found and fixed startup policy,
+  process cleanup/admission races, output/subscriber/body bounds, artifact
+  hardlinks, early provider errors, MCP capture ordering, rejection-history
+  load, preparation ownership and shutdown telemetry/cleanup. Focused final
+  review approved the fixes; evidence is recorded in `docs/validation.md`.
+- P7 local documentation/commits delivered; its final live handoff still
+  depends on the L1/L2 operator gates. No live
+  Linux subscription inference, real n8n/Hermes app or native sandbox success
+  is claimed before these gates pass.
+
+Implementation refinements: native events are bounded to 2 MiB/4096 per run,
+16 retained runs, two subscribers per run and eight heavy response streams.
+Completed runs can be explicitly deleted. CLI-ready timing is measured from
+request admission (so includes queue time); TTFT and total are separate metrics.
+Workspaces are removed after process cleanup. Every CLI process has a dedicated
+service HOME, private TMPDIR, cleared environment and self-update disabled.
+Startup writes a fixed AGY settings policy and empty global MCP catalogue
+without reading its saved login. Preflight rejection history is sampled while
+fixed rejection counters include authenticated validation failures. Shutdown
+drains admissions before its final metadata flush and reports cleanup failure.

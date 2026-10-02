@@ -1,599 +1,211 @@
 # ai-router
-A rust based OpenAI compatible router
-## Overview
 
-The goal of this project is to expose a **local OpenAI-compatible API endpoint** that internally delegates work to Google's **Antigravity tooling** authenticated with an existing **Google AI Pro subscription**.
+A Rust HTTP gateway over the official Antigravity (`agy`) CLI. It is intended
+for n8n, Hermes, and OpenAI-compatible applications using an existing Google
+AI Pro login. Google authentication stays inside the official CLI.
 
-The motivation is simple: an AI Pro subscription may include substantial Antigravity usage that otherwise goes unused when day-to-day work is performed through tools such as ChatGPT, Codex, Claude Code, OpenWebUI, Continue, or custom applications.
+See [PLAN.md](PLAN.md) for the implementation plan and design decisions.
 
-Instead of requiring every client to understand Antigravity directly, a local gateway translates standard OpenAI-style requests into Antigravity CLI jobs and translates the output back into an OpenAI-compatible response.
+## Architecture
 
-The intended architecture is:
-
-```text
-OpenAI-compatible client
-        |
-        | HTTPS / OpenAI API
-        v
-+-----------------------+
-| Local AI Gateway      |
-| FastAPI / Node        |
-|                       |
-| - API authentication  |
-| - request validation  |
-| - OpenAI translation  |
-| - streaming adapter   |
-| - logging             |
-| - rate limiting       |
-+-----------+-----------+
-            |
-            | local subprocess
-            v
-+-----------------------+
-| Antigravity CLI       |
-| authenticated using   |
-| the user's Google     |
-| account / AI Pro      |
-+-----------+-----------+
-            |
-            v
-       Google services
+```mermaid
+flowchart LR
+    C[n8n / Hermes / HTTP client] --> P[HTTPS reverse proxy]
+    P --> R[127.0.0.1:8090 → Rust gateway]
+    R --> A[Authentication, limits, validation]
+    A --> M[Shared AGY subprocess supervisor]
+    M --> G[Official AGY 1.2.15]
+    G --> S[Google subscription]
+    M --> T[Private monitor socket]
+    G --> V[Named AGY state volume]
+    M --> W[Temporary request workspaces]
 ```
 
-## Core Idea
+Both OpenAI API styles share one runner. Model requests replay submitted
+history in a fresh workspace, use a fixed agent without default components,
+and disable slash expansion. A private inert MCP relay offers client-supplied
+tools: it captures one validated call, stops AGY, and returns `tool_calls` or a
+Responses `function_call`. The client executes the tool and sends its result
+with the full history. No client tool runs on this server.
 
-The gateway exposes endpoints that resemble the OpenAI API:
+Native runs are separate and require a `native` key scope. They expose
+structured CLI progress, explicitly uploaded files, and owner-scoped artifacts.
+Native execution is disabled until real sandbox containment has been verified.
+No host directories, Docker socket, or arbitrary caller-defined MCP servers,
+hooks, agents, executable paths, or CLI arguments are exposed.
 
-```text
-GET  /v1/models
-POST /v1/chat/completions
-POST /v1/responses
+## Quick start in local Docker
+
+Docker is required; host Rust and Python are not required.
+
+```sh
+docker build --target gateway -t ai-router:local .
+./scripts/keygen.sh n8n model
 ```
 
-A client can therefore be configured with something like:
+Key generation shows an 86-character random API key to the operator once and
+prints its digest record as JSON. Save the raw key in the client. Export only
+an array of digest records in the shell used to start Docker:
 
-```text
-OPENAI_BASE_URL=https://ai.example.com/v1
-OPENAI_API_KEY=sk-local-xxxxxxxx
+```sh
+export AI_ROUTER_KEYS='[{"id":"n8n","sha256":"REPLACE_WITH_GENERATED_DIGEST","scopes":["model"]}]'
+docker compose --env-file /dev/null up -d
+./scripts/login.sh --remote
 ```
 
-From the client's perspective, it is talking to an OpenAI-compatible model provider.
+The placeholder must be replaced with the generated 64-hex-character digest.
+For Hermes, generate another client key and include its digest record in the
+array. The service refuses missing or malformed key configuration. Never put
+a Google login token into gateway configuration.
 
-Internally, however, the gateway starts or communicates with the official Antigravity CLI and forwards the request to it.
+Use `--env-file /dev/null` on every Compose command to prevent implicit loading
+of a local dotenv file. This repository does not use dotenv or an `env_file`.
 
-## Why Use a Gateway?
+The login helper runs official AGY interactively as UID 10001 with the same
+home directory as gateway workers. `--remote` selects its browser/code flow.
+After login, readiness refreshes within 60 seconds:
 
-Many AI tools support custom OpenAI-compatible endpoints even when they do not directly support every AI provider.
-
-A compatibility layer therefore makes it possible to use Antigravity-backed inference from applications such as:
-
-- OpenWebUI
-- Continue
-- custom Python applications
-- internal automation
-- coding agents
-- workflow engines
-- applications built around the OpenAI SDK
-
-The gateway also provides one central location for authentication, logging, routing, and access control.
-
-## Important Design Principle
-
-The gateway should treat the official Antigravity tooling as the provider boundary.
-
-The preferred design is:
-
-```text
-Client
-  |
-  v
-OpenAI-compatible gateway
-  |
-  v
-Official Antigravity CLI
-  |
-  v
-Existing Google authentication
+```sh
+curl --fail http://127.0.0.1:8090/health
+curl --fail http://127.0.0.1:8090/ready
+./scripts/monitor.sh --text --range 1h
 ```
 
-The gateway should **not** attempt to extract browser cookies, OAuth tokens, internal credentials, or reverse-engineer private Google endpoints.
+An optional auth-only helper container can share this volume. Remove that
+helper before starting the gateway; preserve the `ai-router-auth` volume.
 
-Avoid architectures such as:
+[Operations, login, rotation, monitoring, and verification](docs/operations.md)
+cover the full procedure. No SSH daemon is installed in the container: SSH to
+the host, then use `docker exec`.
+
+## Client configuration
+
+For local evaluation, use `http://127.0.0.1:8090/v1`. For remote access,
+configure an HTTPS reverse proxy on your own domain with the loopback origin
+as its upstream. Keep the Docker origin bound to host loopback.
 
 ```text
-Gateway
-  |
-  v
-Extract Google session token
-  |
-  v
-Call undocumented backend directly
+Base URL: https://ai.example.com/v1
+API key: the key generated for that client
+Model: an ID returned by GET /v1/models
 ```
 
-Using the official client as the boundary keeps the system substantially easier to maintain and limits the amount of authentication logic handled by the gateway.
+The gateway listens on `0.0.0.0:8080` inside its container; Compose publishes
+only `127.0.0.1:8090` on the host. `AI_ROUTER_PORT` selects a different host port.
+Port availability must be checked separately before future server integration.
 
-## Request Flow
+For the n8n Assistant, set the custom model endpoint and API key according to
+[its configuration guide](https://docs.n8n.io/deploy/host-n8n/configure-n8n/set-up-n8n-assistant).
+Its separate assistant sandbox is still required. For Hermes, select its
+OpenAI-compatible/custom endpoint provider and a discovered model ID.
 
-A typical request would look like this:
+The gateway rejects active sampling/token-budget controls that AGY cannot
+honour. Configure clients without `temperature`, `top_p`, `max_tokens`,
+`max_completion_tokens`, or `max_output_tokens`. Null SDK defaults are accepted.
+Parallel tool calls are permitted in requests, but this adapter returns at most
+one call per turn. Forced/required tool selection is currently unsupported.
 
-### 1. Client Request
+## HTTP API
+
+Every `/v1` route requires `Authorization: Bearer <client-key>`.
+
+| Route | Behaviour |
+| --- | --- |
+| `GET /health` | Minimal public liveness, no provider details |
+| `GET /ready` | Minimal readiness; 503 when CLI/auth probe is unavailable |
+| `GET /v1/models` | Discovered catalogue from the pinned official CLI |
+| `GET /v1/capabilities` | Adapter capabilities, limitations, quota freshness, verification gates |
+| `POST /v1/chat/completions` | Text, streaming, client tools, final structured output |
+| `POST /v1/responses` | Same runner, Responses objects and typed SSE events |
+| `POST /v1/agy/runs` | Owner-scoped asynchronous native run; disabled by default |
+| `GET /v1/agy/runs/{id}` | Run status and result |
+| `DELETE /v1/agy/runs/{id}` | Cancel an active run; delete a terminal run and its workspace |
+| `GET /v1/agy/runs/{id}/events` | Bounded SSE event replay; `Last-Event-ID` supported |
+| `GET /v1/agy/runs/{id}/artifacts` | List safe files after a successful run |
+| `GET /v1/agy/runs/{id}/artifacts/{path}` | Download a safe, bounded artifact |
+
+Responses are stateless and use `store:false`; retrieval, background Responses,
+and raw provider conversation resumption are unsupported. Streaming preserves
+stable completion/item/call IDs, terminal status, and cancellation. Before SSE
+starts, failures use ordinary HTTP error responses. After SSE starts, failures
+use terminal error events and never transparently retry a run.
+
+Native request shape, available only after operator verification:
 
 ```json
 {
-  "model": "antigravity",
-  "messages": [
-    {
-      "role": "user",
-      "content": "Refactor this Python function."
-    }
-  ]
+  "model": "a-discovered-model-id",
+  "prompt": "Summarise input/notes.txt and write summary.txt",
+  "mode": "plan",
+  "effort": "medium",
+  "files": [{"path":"notes.txt","data_base64":"U3ludGhldGljIG5vdGVz"}]
 }
 ```
 
-### 2. Gateway Translation
+`mode` may be `plan` or `accept-edits`; omit it for the CLI default. `effort` is
+model-dependent. `json_schema` accepts a validated schema object. Uploads are
+staged under `input/`; generated artifacts must remain in the workspace.
+Protected file names, hidden configuration, traversal, symlinks and hardlinks
+are not served. Caller-provided URLs are never fetched for inputs.
 
-The gateway converts the OpenAI message structure into the input format expected by the Antigravity CLI.
+Native history is limited to 16 retained runs, 2 MiB of events and 4096 events
+per run, two event subscribers per run, and eight simultaneous native response
+bodies. Workspaces expire after one hour by default or disappear on restart.
+The completed native API does not establish that every built-in tool or media
+feature works headlessly; use the [capability matrix](docs/capabilities.md).
 
-Conceptually:
+## Security and storage
 
-```python
-process = await asyncio.create_subprocess_exec(
-    "agy",
-    "...",
-    stdin=asyncio.subprocess.PIPE,
-    stdout=asyncio.subprocess.PIPE,
-)
+- Each API key contains 64 cryptographically random bytes. Configuration stores
+  SHA-256 digests only; comparisons use constant-time digest comparison.
+- Global/IP admission runs before key lookup; per-key limits and scopes follow.
+  Authentication precedes body parsing, schema checks and generation.
+- Body/header/output bounds, a ten-second body deadline, bounded read slots,
+  concurrency, queue limits and run deadlines prevent unbounded backend work.
+- Forwarded IPs are ignored unless `AI_ROUTER_TRUSTED_PROXIES` lists the exact
+  connecting proxy IP. That proxy must overwrite `X-Real-IP`; arbitrary
+  forwarding chains are not trusted.
+- CLI workers use a clean service home and cleared environment, fixed policy,
+  separate private workspaces, and the official sandbox flag. Provider stdout,
+  stderr and tool handoffs are bounded. Cancellation kills the process group.
+- Model tool inventory is checked before the prompt is sent. Unexpected native
+  tools fail the run. A real version-specific isolation check is still needed.
+- Named volumes preserve AGY state and monitor metadata. Temporary workspaces
+  use tmpfs. AGY itself can persist conversations/logs in its state home: the
+  AGY volume is sensitive, not a promise of login-only storage.
+- Router telemetry contains request IDs, client IDs, models, timings, errors
+  and observed usage, never prompts, completions, arguments or auth headers.
+  Incomplete usage is marked partial; missing usage is null, not invented zero.
+- Rejection counters count attempts since startup. Detailed preflight rejection
+  records are sampled at 30 per minute, keeping sustained rejected traffic from
+  overwhelming the monitor history or forcing expensive persistence work.
+  Authenticated handler failures follow the normal per-key/global limits.
+- The monitor uses a mode-0600 Unix socket inside the container. No public
+  administration or provider-management endpoint exists.
+
+Default limits: 60 pre-auth requests per IP/minute, 600 globally/minute,
+30 per key/minute, 2 active generations, 8 waiting, a 1 MiB body, 8 MiB provider
+output, and a 120-second run deadline. Limits are configurable and validated.
+Native stays off in the shipped Compose file. Docker's default seccomp may
+prevent the CLI sandbox from starting; do not solve that by granting unrestricted
+privileges. See the native verification gate in the operations guide.
+
+## Testing
+
+```sh
+./scripts/test-local.sh
 ```
 
-The exact arguments depend on the supported Antigravity CLI interface.
-
-### 3. Antigravity Execution
-
-The Antigravity CLI executes the task using the Google account already authenticated on the host.
-
-### 4. Output Translation
-
-The gateway converts Antigravity output into an OpenAI-compatible response.
-
-For non-streaming requests:
-
-```json
-{
-  "id": "chatcmpl-local-123",
-  "object": "chat.completion",
-  "choices": [
-    {
-      "index": 0,
-      "message": {
-        "role": "assistant",
-        "content": "Here is the refactored function..."
-      },
-      "finish_reason": "stop"
-    }
-  ]
-}
-```
-
-For streaming requests, the gateway can emit Server-Sent Events:
-
-```text
-data: {"choices":[{"delta":{"content":"Here"}}]}
-
-data: {"choices":[{"delta":{"content":" is"}}]}
-
-data: {"choices":[{"delta":{"content":" the"}}]}
-
-data: [DONE]
-```
-
-## Suggested Project Structure
-
-```text
-antigravity-openai/
-|
-|-- docker-compose.yml
-|-- .env
-|
-|-- gateway/
-|   |-- Dockerfile
-|   |-- requirements.txt
-|   |
-|   |-- app/
-|       |-- main.py
-|       |-- auth.py
-|       |-- config.py
-|       |-- models.py
-|       |-- openai_api.py
-|       |-- antigravity.py
-|       |-- streaming.py
-|       `-- logging.py
-|
-`-- state/
-    `-- antigravity/
-```
-
-## Example `/v1/models`
-
-The gateway could expose one or more logical models:
-
-```json
-{
-  "object": "list",
-  "data": [
-    {
-      "id": "antigravity",
-      "object": "model",
-      "owned_by": "local"
-    },
-    {
-      "id": "antigravity-auto",
-      "object": "model",
-      "owned_by": "local"
-    }
-  ]
-}
-```
-
-The model names do not necessarily need to map directly to Google's internal model names.
-
-They can instead represent gateway routing policies.
-
-For example:
-
-```text
-antigravity
-    -> normal Antigravity session
-
-antigravity-fast
-    -> lightweight task profile
-
-antigravity-code
-    -> coding-oriented prompt / tool profile
-
-antigravity-auto
-    -> gateway decides which profile to use
-```
-
-## Authentication
-
-The public-facing endpoint should have its own authentication layer.
-
-For example:
-
-```text
-Authorization: Bearer sk-local-xxxxxxxxxxxxxxxx
-```
-
-API keys should be independent from Google credentials.
-
-The gateway should never expose the user's Google authentication details to API clients.
-
-A simple first implementation can store hashed local API keys in configuration.
-
-A more mature version could support:
-
-- multiple API keys
-- per-key quotas
-- expiration
-- revocation
-- usage tracking
-- IP restrictions
-
-## Docker Considerations
-
-The primary complication is authentication state.
-
-If Antigravity requires an authenticated local user session, the container needs access to the relevant CLI configuration or authentication state.
-
-Possible approaches include:
-
-### Option A — Run Antigravity on the Host
-
-```text
-Docker gateway
-      |
-      v
-host-side Antigravity service
-```
-
-The gateway communicates with a small host-side daemon.
-
-This isolates Google authentication from the container.
-
-### Option B — Mount Authentication State
-
-```yaml
-volumes:
-  - ./state/antigravity:/home/app/.config/antigravity
-```
-
-This is simpler, but credentials or session state may become accessible inside the container.
-
-### Option C — Run the Entire Gateway Outside Docker
-
-For an initial prototype, running FastAPI directly on the server may be easier.
-
-Docker can be added after the behaviour of the CLI and authentication mechanism is well understood.
-
-## Security
-
-Because this gateway may expose an AI agent capable of executing commands or interacting with files, it should be treated as a privileged service.
-
-Recommended safeguards include:
-
-- HTTPS only
-- strong gateway API keys
-- firewall restrictions
-- rate limiting
-- request-size limits
-- command timeouts
-- maximum concurrent jobs
-- process isolation
-- structured logging
-- no arbitrary shell interpolation
-- restricted filesystem permissions
-- separate service account on the host
-- optional VPN-only exposure
-
-If only personal remote access is required, exposing the service through a VPN such as Tailscale or WireGuard is preferable to exposing it directly to the public internet.
-
-## Command Execution Safety
-
-Never construct shell commands using unescaped user input.
-
-Avoid:
-
-```python
-os.system(f"agy --prompt '{prompt}'")
-```
-
-Prefer direct process arguments:
-
-```python
-await asyncio.create_subprocess_exec(
-    "agy",
-    "--prompt",
-    prompt,
-)
-```
-
-Even better, use standard input if the CLI supports it.
-
-## Concurrency
-
-A coding agent may maintain state between messages.
-
-The gateway therefore needs to decide whether each request should:
-
-1. create a completely new Antigravity process, or
-2. attach to an existing session.
-
-A simple first version should use one process per request.
-
-Later versions can implement session mapping:
-
-```text
-OpenAI conversation
-        |
-        v
-gateway session ID
-        |
-        v
-Antigravity session
-```
-
-This can substantially improve multi-turn coding workflows.
-
-## Streaming
-
-Streaming support is important because many OpenAI-compatible applications expect token-like incremental responses.
-
-The gateway can:
-
-1. read stdout from the Antigravity process,
-2. parse structured output,
-3. convert content events into OpenAI delta events,
-4. send them using Server-Sent Events.
-
-Conceptually:
-
-```python
-async for event in antigravity_stream:
-    chunk = convert_to_openai_chunk(event)
-    yield f"data: {json.dumps(chunk)}\n\n"
-
-yield "data: [DONE]\n\n"
-```
-
-## Tool Calling
-
-OpenAI tool calling and an agent CLI do not necessarily share the same abstraction.
-
-For the first version, it may be better to support:
-
-```text
-messages -> text response
-```
-
-before attempting full compatibility with:
-
-```text
-tools
-tool_choice
-function calls
-structured output
-parallel tool calls
-```
-
-Once basic chat compatibility works, these capabilities can be added selectively.
-
-## Responses API
-
-Supporting `/v1/responses` may eventually be more useful than implementing every historical Chat Completions feature.
-
-A minimal first implementation could support:
-
-```text
-POST /v1/chat/completions
-GET  /v1/models
-```
-
-Then add:
-
-```text
-POST /v1/responses
-```
-
-after the translation layer is stable.
-
-## Routing Multiple Providers
-
-The gateway can eventually become more than an Antigravity adapter.
-
-For example:
-
-```text
-                     +-> Antigravity
-                     |
-OpenAI client -> Gateway -> Ollama
-                     |
-                     +-> Gemini API
-                     |
-                     +-> OpenAI
-                     |
-                     +-> Anthropic
-```
-
-Logical models could then represent providers:
-
-```text
-google-subscription
-local-llama
-openai
-anthropic
-auto
-```
-
-An `auto` model could choose a provider based on task characteristics, cost, quotas, privacy, or availability.
-
-## Example Use Case
-
-A coding tool could be configured as:
-
-```text
-Provider: OpenAI Compatible
-
-Base URL:
-https://ai.example.com/v1
-
-API key:
-sk-local-xxxxxxxx
-
-Model:
-antigravity
-```
-
-The coding tool would believe it is using a standard OpenAI-compatible service.
-
-The gateway would transparently route the work through Antigravity.
-
-## Limitations
-
-This approach is an adapter, not a true implementation of the OpenAI API.
-
-Differences may include:
-
-- different context handling
-- different system prompt behaviour
-- different model capabilities
-- incomplete tool-calling compatibility
-- usage accounting differences
-- different error semantics
-- different streaming behaviour
-- different cancellation behaviour
-- possible Antigravity CLI interface changes
-
-Applications that only depend on basic chat completions are therefore likely to be easier to support than applications that rely on every OpenAI API feature.
-
-## Terms and Service Considerations
-
-The intent of this design is to invoke official Google tooling through the user's own authenticated environment.
-
-It should not depend on:
-
-- reverse-engineering private endpoints
-- extracting authentication tokens
-- impersonating Google services
-- reselling subscription capacity
-- sharing personal subscription access with unrelated users
-
-Because subscription products and their terms can change, the current Google documentation and applicable terms should be reviewed before relying on the gateway for production or multi-user use.
-
-## Recommended MVP
-
-A useful first milestone would include only:
-
-```text
-GET  /health
-GET  /v1/models
-POST /v1/chat/completions
-```
-
-with support for:
-
-- local API-key authentication
-- non-streaming responses
-- streaming responses
-- one Antigravity process per request
-- configurable command timeout
-- basic logging
-- Docker deployment
-
-Avoid initially implementing:
-
-- embeddings
-- image generation
-- fine-tuning
-- assistants
-- batch API
-- complex tool calling
-- persistent conversation state
-
-The goal of the MVP is simply to prove:
-
-```text
-OpenAI-compatible client
-        ->
-local gateway
-        ->
-Antigravity CLI
-        ->
-Google AI Pro usage
-        ->
-OpenAI-compatible response
-```
-
-Once that path is reliable, the gateway can be expanded incrementally.
-
-## Summary
-
-The project is effectively an **OpenAI-compatible facade over the official Antigravity client**.
-
-Its value is not in reproducing the OpenAI platform. Instead, it provides a compatibility layer that lets existing OpenAI-oriented applications make use of AI capacity already available through the user's Google AI Pro subscription.
-
-The cleanest implementation keeps three responsibilities separate:
-
-```text
-Client compatibility
-        |
-        v
-OpenAI translation gateway
-        |
-        v
-Official Antigravity client
-        |
-        v
-Google authentication and subscription
-```
-
-This separation keeps the gateway relatively simple, avoids embedding Google credentials into client applications, and makes it possible to add additional AI providers later.
+The local suite builds and tests in Docker, uses an explicit synthetic fake AGY,
+exercises the actual Rust MCP relay, runs network/client contract checks, and
+uses disposable test state separate from the login volume. Fixtures never
+fall back to the signed-in host CLI. See [validation evidence](docs/validation.md)
+for the commands/results and the remaining authenticated checks.
+
+Local fixture and SDK tests establish adapter behaviour. Running the complete
+installed n8n/Hermes applications, Google subscription generation, login
+persistence, and the native sandbox require operator-assisted validation.
+
+The secret-file policy applies to every tool and build context: `.env*`, `.pem`,
+`.key`, and contents of `secrets` or `credentials` directories are excluded.
+Policy tests use synthetic files only; credentials are never copied or examined.
