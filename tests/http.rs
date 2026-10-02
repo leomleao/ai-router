@@ -700,6 +700,18 @@ async fn invalid_keys_and_unsupported_inputs_never_start_generation() {
         assert_eq!(value["error"]["code"], "unsupported_parameter");
         assert!(harness.workspaces().is_empty());
     }
+    for verbosity in [json!("low"), json!("high"), json!("invalid"), json!(1)] {
+        let mut body = response("hello");
+        body["text"] = json!({"format":{"type":"text"}, "verbosity":verbosity});
+        let (status, value) = harness.post("/v1/responses", body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(value["error"]["code"], "unsupported_parameter");
+        assert_eq!(
+            value["error"]["message"],
+            "text.verbosity is not supported by the AGY adapter"
+        );
+        assert!(harness.workspaces().is_empty());
+    }
     let mut body = response("hello");
     body["previous_response_id"] = json!("resp_foreign");
     assert_eq!(

@@ -63,6 +63,9 @@ Protocol types derive serde where appropriate:
   and none tool choice, disable parallel calls; do not silently ignore forced
   tool choices or sampling controls. Accept benign SDK defaults only with
   documented equivalence. Preserve tool-call IDs/history exactly.
+  Responses `text.verbosity` and Chat `verbosity` accept absent/null/`medium`
+  as equivalent defaults without changing the normalized request. Reject all
+  other verbosity values; answer detail is independent of reasoning effort.
 
 ## P2 owner: runner.rs, relay.rs, tests/fixtures/fake-agy (and runner unit tests)
 

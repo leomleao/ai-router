@@ -490,6 +490,7 @@ fn validate_common(root: &Map<String, Value>, responses: bool) -> Result<(), Api
             "top_logprobs" => value.as_u64() == Some(0),
             "include" | "stop" => value.as_array().is_some_and(Vec::is_empty),
             "truncation" => responses && value.as_str() == Some("disabled"),
+            "verbosity" => !responses && value.as_str() == Some("medium"),
             _ => false,
         };
         if !benign {
@@ -687,7 +688,13 @@ fn response_schema(value: Option<&Value>) -> Result<Option<Value>, ApiError> {
         return Ok(None);
     };
     let text = object(value, "text")?;
-    allowed_fields(text, &["format"], "text")?;
+    allowed_fields(text, &["format", "verbosity"], "text")?;
+    // n8n sends OpenAI's neutral verbosity default. Accept it as equivalent
+    // to omission; AGY has no verified answer-verbosity control. In particular,
+    // verbosity must never change reasoning effort or the selected model.
+    if nonnull(text.get("verbosity")).is_some_and(|v| v.as_str() != Some("medium")) {
+        return Err(ApiError::unsupported("text.verbosity"));
+    }
     let Some(format) = nonnull(text.get("format")) else {
         return Ok(None);
     };
@@ -1028,6 +1035,88 @@ mod tests {
         input["frequency_penalty"] = json!(0);
         input["logprobs"] = json!(false);
         assert!(normalize_chat(input, "req".to_owned()).is_ok());
+    }
+    #[test]
+    fn neutral_verbosity_preserves_the_entire_normalized_request() {
+        let input = json!({"model":"gemini-test", "input":"hello",
+            "instructions":"Answer carefully", "reasoning":{"effort":"high"},
+            "text":{"format":{"type":"text"}}, "store":false});
+        let expected =
+            serde_json::to_value(normalize_response(input.clone(), "req".to_owned()).unwrap())
+                .unwrap();
+        for verbosity in [Value::Null, json!("medium")] {
+            let mut value = input.clone();
+            value["text"]["verbosity"] = verbosity.clone();
+            let request = normalize_response(value, "req".to_owned()).unwrap();
+            assert_eq!(serde_json::to_value(request).unwrap(), expected);
+
+            let mut value = chat();
+            let expected =
+                serde_json::to_value(normalize_chat(value.clone(), "req".to_owned()).unwrap())
+                    .unwrap();
+            value["verbosity"] = verbosity;
+            let request = normalize_chat(value, "req".to_owned()).unwrap();
+            assert_eq!(serde_json::to_value(request).unwrap(), expected);
+        }
+        let request = normalize_response(
+            json!({"model":"gemini-test", "input":"hello", "text":{"verbosity":"medium"}}),
+            "req".to_owned(),
+        )
+        .unwrap();
+        assert!(request.schema.is_none());
+        assert!(request.effort.is_none());
+    }
+    #[test]
+    fn neutral_verbosity_preserves_output_schema_constraints() {
+        let schema = json!({"type":"object", "properties":{"count":{"type":"integer"}},
+            "required":["count"], "additionalProperties":false});
+        let input = json!({"model":"gemini-test", "input":"schema", "text":{
+            "verbosity":"medium", "format":{"type":"json_schema", "name":"answer",
+                "schema":schema, "strict":true}}});
+        let request = normalize_response(input, "req".to_owned()).unwrap();
+        assert_eq!(request.schema, Some(schema));
+    }
+    #[test]
+    fn rejects_active_or_malformed_verbosity_and_unknown_text_controls() {
+        for verbosity in [
+            json!("low"),
+            json!("high"),
+            json!("invalid"),
+            json!(1),
+            json!({}),
+        ] {
+            let input = json!({"model":"gemini-test", "input":"hello",
+                "text":{"verbosity":verbosity}});
+            let error = normalize_response(input, "req".to_owned()).unwrap_err();
+            assert_eq!(error.code, "unsupported_parameter");
+            assert!(error.message.starts_with("text.verbosity "));
+            let mut input = chat();
+            input["verbosity"] = verbosity;
+            assert_eq!(
+                normalize_chat(input, "req".to_owned()).unwrap_err().code,
+                "unsupported_parameter"
+            );
+        }
+        for text in [
+            json!({"verbosity":"medium", "unknown":true}),
+            json!({"verbosity":"medium", "format":{"type":"text", "unknown":true}}),
+        ] {
+            let input = json!({"model":"gemini-test", "input":"hello", "text":text});
+            assert_eq!(
+                normalize_response(input, "req".to_owned())
+                    .unwrap_err()
+                    .code,
+                "unsupported_parameter"
+            );
+        }
+        // Responses verbosity belongs inside text, never at the request root.
+        let input = json!({"model":"gemini-test", "input":"hello", "verbosity":"medium"});
+        assert_eq!(
+            normalize_response(input, "req".to_owned())
+                .unwrap_err()
+                .code,
+            "unsupported_parameter"
+        );
     }
     #[test]
     fn tool_choice_none_removes_inventory_and_forced_choice_is_explicit_error() {

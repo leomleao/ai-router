@@ -264,13 +264,20 @@ def sdk_contracts():
 
     response = client.responses.create(model=MODEL, input="Hello", store=False)
     check(response.output_text == "Hello from fixture", "SDK Responses nonstream text")
-    events = list(client.responses.create(model=MODEL, input="Hello", stream=True, store=False))
+    # n8n includes OpenAI's neutral default even when no answer control was chosen.
+    default_text = {"format": {"type": "text"}, "verbosity": "medium"}
+    response = client.responses.create(model=MODEL, input="Hello", store=False, text=default_text)
+    check(response.output_text == "Hello from fixture", "n8n default verbosity Responses text")
+    completion = client.chat.completions.create(model=MODEL,
+        messages=[{"role": "user", "content": "Hello"}], verbosity="medium")
+    check(completion.choices[0].message.content == "Hello from fixture", "Chat neutral verbosity default")
+    events = list(client.responses.create(model=MODEL, input="Hello", stream=True, store=False, text=default_text))
     check(events[0].type == "response.created" and events[-1].type == "response.completed", "Responses lifecycle events")
     check([event.sequence_number for event in events] == list(range(len(events))), "Responses event sequence")
     check("".join(event.delta for event in events if event.type == "response.output_text.delta") == "Hello from fixture",
           "SDK Responses text deltas")
     # The SDK's own accumulator checks output-item/content-part bookkeeping.
-    with client.responses.stream(model=MODEL, input="Hello", store=False) as stream:
+    with client.responses.stream(model=MODEL, input="Hello", store=False, text=default_text) as stream:
         list(stream)
         check(stream.get_final_response().output_text == "Hello from fixture", "Responses SDK stream accumulator")
 
@@ -296,8 +303,14 @@ def sdk_contracts():
         response_format={"type": "json_schema", "json_schema": {"name": "answer", "schema": SCHEMA, "strict": True}})
     check(json.loads(chat_schema.choices[0].message.content) == {"count": 1}, "Chat JSON schema output")
     response_schema = client.responses.create(model=MODEL, input="schema", store=False,
-        text={"format": {"type": "json_schema", "name": "answer", "schema": SCHEMA, "strict": True}})
+        text={"format": {"type": "json_schema", "name": "answer", "schema": SCHEMA, "strict": True}, "verbosity": "medium"})
     check(json.loads(response_schema.output_text) == {"count": 1}, "Responses JSON schema output")
+    for verbosity in ("low", "high"):
+        try:
+            client.responses.create(model=MODEL, input="Hello", store=False, text={"verbosity": verbosity})
+            raise AssertionError("Unimplemented answer verbosity was accepted")
+        except openai.BadRequestError as error:
+            check(error.code == "unsupported_parameter", f"Responses rejects active verbosity {verbosity}")
     try:
         client.chat.completions.create(model=MODEL, messages=[{"role": "user", "content": "Hello"}], temperature=0.5)
         raise AssertionError("Unsupported sampling was accepted")

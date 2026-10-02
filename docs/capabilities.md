@@ -17,6 +17,7 @@ verification status. Fixture/SDK tests prove the adapter, not Google inference.
 | Parallel client tools | Request permission accepted | Produces one call per turn; never claims parallel execution |
 | Forced/required tool choice | None | Rejected; no proven CLI enforcement |
 | Effort/model selection | OpenAI reasoning effort/native effort | Official flags passed through; acceptance depends on the selected model |
+| Answer verbosity | Responses `text.verbosity`, Chat `verbosity` | Absent, null and `medium` are equivalent: the neutral OpenAI/n8n default is accepted without changing the prompt, model or reasoning effort. `low`/`high` and malformed values are rejected; no AGY answer-detail control is promised |
 | Native execution modes | Native `mode` | `plan` / `accept-edits` select the official CLI flag; profile gated by sandbox verification |
 | Built-in tools/subagents | Native run/event API | Tool/agent steps retained; only built-ins allowed by fixed policy and sandbox, profile off until verified |
 | Input files | Native uploads | Explicit base64 uploads into `input/`; modality interpretation depends on CLI/model/tool support |
@@ -40,6 +41,8 @@ endpoint only. SDK-shaped compatibility probes are separate from exercising
 the complete n8n/Hermes apps with their installed versions.
 
 Sources: [AGY headless](https://www.antigravity.google/docs/cli/headless/),
+[OpenAI answer verbosity and reasoning effort](https://help.openai.com/en/articles/5072518-controlling-the-length-of-openai-model-responses),
+[n8n OpenAI node defaults](https://github.com/n8n-io/n8n/blob/master/packages/%40n8n/nodes-langchain/nodes/llms/LMChatOpenAi/LmChatOpenAi.node.ts),
 [AGY permissions](https://www.antigravity.google/docs/permissions?tab=cli),
 [CLI custom agents](https://www.antigravity.google/docs/subagents/),
 [n8n Assistant](https://docs.n8n.io/deploy/host-n8n/configure-n8n/set-up-n8n-assistant),
