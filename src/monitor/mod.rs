@@ -17,6 +17,8 @@ use tokio_util::sync::CancellationToken;
 const MAX_STORE_BYTES: u64 = 64 * 1024 * 1024;
 const PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 
+mod ui;
+
 /// Unsampled rejection counters for this process only. Neither the retained
 /// history window nor the monitor client's range filter changes these totals.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -754,31 +756,26 @@ fn fmt_metric(value: Option<u64>) -> String {
 }
 
 pub async fn client(socket: &Path, args: MonitorArgs) -> Result<(), String> {
-    let interactive = !args.json && !args.text && std::io::stdout().is_terminal();
-    loop {
-        let snapshot = get_snapshot(socket, args.range_seconds).await?;
-        if args.json {
-            println!(
-                "{}",
-                serde_json::to_string(&snapshot).map_err(|_| "cannot encode snapshot")?
-            );
-        } else {
-            if interactive {
-                print!("\x1b[2J\x1b[H");
-            }
-            print!("{}", render(&snapshot));
-            std::io::stdout()
-                .flush()
-                .map_err(|_| "cannot write monitor output")?;
-        }
-        if !interactive {
-            return Ok(());
-        }
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => return Ok(()),
-            _ = tokio::time::sleep(Duration::from_secs(2)) => {},
-        }
+    let interactive = !args.json
+        && !args.text
+        && std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal();
+    let snapshot = get_snapshot(socket, args.range_seconds).await?;
+    if interactive {
+        return ui::run(socket, args.range_seconds, snapshot).await;
     }
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string(&snapshot).map_err(|_| "cannot encode snapshot")?
+        );
+    } else {
+        print!("{}", render(&snapshot));
+        std::io::stdout()
+            .flush()
+            .map_err(|_| "cannot write monitor output")?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

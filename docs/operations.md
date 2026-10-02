@@ -120,7 +120,20 @@ Compose file keeps native execution disabled.
 ./scripts/monitor.sh --json --range 1h
 ```
 
-The default terminal view refreshes every two seconds. Text and JSON modes
+The default terminal view is a full-screen dashboard with coloured panels,
+a request-volume chart, latency percentiles, and scrollable tables. Its pages
+are Overview, Usage, Provider (including quota bars), Errors, Events, and Help.
+It refreshes every two seconds and adapts to the terminal size.
+
+Use **Tab**, **←/→**, or **1–6** to change pages, **r** to cycle through
+1h/24h/7d/30d, **↑/↓** to scroll, and **Space** to pause or resume refresh.
+**t** cycles warm/cool/mono colours; **Ctrl+T** switches light/dark colours.
+**q**, **Esc**, or **Ctrl+C** exits and restores the terminal. Over SSH,
+allocate a terminal with `ssh -t leo@server '~/home-server-docker/ai-router/monitor.sh'`.
+If the private socket disconnects, the dashboard keeps the last snapshot visible
+and retries with a clear disconnected status.
+
+Text and JSON modes
 return one snapshot, suitable for pipes or local scheduled checks. The monitor
 uses a read-only Unix socket; it has no HTTP admin endpoint or public port.
 It reports active/queued work, cached AGY authentication/model/quota status,

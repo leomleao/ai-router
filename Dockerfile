@@ -39,13 +39,13 @@ USER root
 RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-venv \
     && rm -rf /var/lib/apt/lists/* \
     && python3 -m venv /opt/test-venv \
-    && /opt/test-venv/bin/pip install --no-cache-dir openai==3.24.0 \
+    && /opt/test-venv/bin/pip install --no-cache-dir openai==3.24.0 pyte==0.8.2 \
     && mkdir -p /var/lib/ai-router/auth /var/lib/ai-router/telemetry /run/ai-router \
     && chown -R 10001:10001 /var/lib/ai-router /run/ai-router \
     && chmod 0700 /var/lib/ai-router/auth /var/lib/ai-router/telemetry /run/ai-router
 ENV PATH=/opt/test-venv/bin:$PATH
 COPY tests ./tests
-RUN cargo test --locked
+RUN cargo test --locked && python3 tests/monitor_tui.py
 
 FROM agy-runtime AS gateway
 COPY --from=builder /build/target/release/ai-router /usr/local/bin/ai-router
