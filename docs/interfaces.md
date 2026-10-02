@@ -80,8 +80,19 @@ Cancel/timeout kills the complete child process group, drains/waits, and emits
 one terminal event. AGY is invoked by argument vector, never a shell. Capture
 bounded stderr privately; sanitised provider error codes go to HTTP/telemetry.
 Use real CLI `--input-format stream-json --output-format stream-json`, disable
-slash expansion on model requests, and select an excludeDefaultComponents /
-inheritMcp:false fixed custom agent. Unknown built-in model tools are fatal.
+slash expansion on model requests, and select a fixed custom agent with
+tools:[], excludeDefaultComponents:true and inheritMcp:false. In AGY 1.2.15,
+init.tools advertises the global registry rather than the selected agent's
+effective tools; init.agent echoes the requested name. Before launching the
+conversation process, run the fixed `/agents` JSON management command in the
+owned workspace and require the parsed agent name, zero turns/usage, and no
+errors or denied actions. Then verify the initial exact pinned public registry
+and requested identity before supplying the prompt. The agent has no built-ins; client tools come
+only from the fixed inert MCP server with its workspace cwd. Every actual
+native tool or subagent step in a model run is fatal. Model schema output uses
+an owned raw-JSON instruction and independent final-value validation. The
+pinned CLI's `--json-schema` flag repeats answers in this isolated profile,
+so that flag is reserved for the separately gated native profile.
 
 `relay::serve_stdio(...)` supports MCP initialise, tools/list and tools/call.
 Launch relay via the current ai-router executable subcommand `mcp-relay` with

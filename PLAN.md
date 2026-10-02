@@ -1,8 +1,7 @@
 # Implementation plan
 
-Status: local implementation and automated acceptance complete; authenticated
-provider/client/sandbox acceptance awaits operator login. Implementation
-authorised on 2026-10-02.
+Status: local implementation, automated acceptance and authenticated SDK
+acceptance complete. Full n8n/Hermes apps and native sandbox remain gated.
 The implementation and validation use local Docker.
 
 ## Outcome
@@ -91,7 +90,7 @@ access by an agent. Work independent of L1 continues while that gate is pending.
 | P4 | `/health`, `/ready`, `/v1/models`, `/v1/capabilities`, `/v1/chat/completions`, `/v1/responses`, `/v1/agy/runs` and artifact routes | Streaming and nonstreaming contracts, ownership, bounded async jobs, cancellation, cleanup and honest usage |
 | P5 | Rust and HTTP acceptance tests in local Docker, client compatibility probes | Both API styles complete a tool result/final answer loop; stable SSE IDs/events; saturation, isolation and failure cases pass |
 | P6 | Independent security/protocol review | Findings fixed and relevant checks rerun |
-| L1/L2 | Real authenticated CLI probes, restart/login persistence and native isolation evidence | Requires operator login; report unverified capabilities clearly until completed |
+| L1/L2 | Real authenticated CLI probes, restart/login persistence and native isolation evidence | Model/login checks completed in local Docker; full apps/native remain gated, with evidence in docs/validation.md |
 | P7 | Working README, API examples, capability matrix, operations guide and local commits | Commands are reproducible; report tests and remaining operator gates accurately |
 
 ## Local tests and rollout gates
@@ -135,7 +134,7 @@ compatibility. Official headless transport currently accepts text blocks only.
 - P0 complete: initial plan/interfaces committed before implementation.
 - P1–P4 implemented: Rust validation/security, runner/relay, monitor/container,
   both API styles, async native jobs and safe artifact transport.
-- P5 complete locally: fresh Docker build passed 67 Rust tests and 76 network /
+- P5 complete locally: fresh Docker build passed 70 Rust tests and 76 network /
   OpenAI Python SDK 3.24.0 / policy checks. Test state is separate from real login.
 - The actual production image passed 13 unauthenticated smoke checks with
   disposable synthetic state and the pinned official Linux ARM64 CLI.
@@ -144,10 +143,17 @@ compatibility. Official headless transport currently accepts text blocks only.
   hardlinks, early provider errors, MCP capture ordering, rejection-history
   load, preparation ownership and shutdown telemetry/cleanup. Focused final
   review approved the fixes; evidence is recorded in `docs/validation.md`.
-- P7 local documentation/commits delivered; its final live handoff still
-  depends on the L1/L2 operator gates. No live
-  Linux subscription inference, real n8n/Hermes app or native sandbox success
-  is claimed before these gates pass.
+- L1 complete: operator logged in using the official CLI inside local Docker.
+- L2 model acceptance: 15 real OpenAI SDK 3.24.0 checks passed on Linux AGY
+  1.2.15 / gemini-3.8-flash-low, including text, both streams/schemas, both
+  client-tool loops and startup disconnect. Login survives restart/recreation;
+  fresh Claude Sonnet text passed after restart. No auth files were examined.
+- Live testing and review corrected global init-registry semantics, added
+  zero-token parsed-agent preflight before user input, and replaced unreliable
+  CLI model-schema behavior with independently validated generated JSON.
+- P7 local documentation/commits delivered. Full installed n8n/Hermes apps and
+  native OS containment remain unverified; native stays disabled under the
+  current Docker restrictions.
 
 Implementation refinements: native events are bounded to 2 MiB/4096 per run,
 16 retained runs, two subscribers per run and eight heavy response streams.

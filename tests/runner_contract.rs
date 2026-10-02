@@ -95,9 +95,41 @@ async fn provider_discovery_checks_pin_and_sanitizes_quota() {
         Some(&json!(0.75))
     );
     config.expected_agy_version = "9.9.9".into();
-    let status = runner(config).probe().await;
+    let provider = runner(config);
+    let status = provider.probe().await;
     assert!(!status.authenticated);
     assert_eq!(status.error.as_deref(), Some("provider_version_mismatch"));
+    let error = provider
+        .start(
+            request("future pins need a verified contract"),
+            CancellationToken::new(),
+        )
+        .await
+        .err()
+        .expect("an unsupported future pin must fail closed");
+    assert_eq!(error.code, "provider_version_mismatch");
+}
+
+#[tokio::test]
+async fn unauthenticated_model_probe_classifies_stdout_without_exposing_diagnostics() {
+    let root = tempfile::tempdir().unwrap();
+    let config = config(root.path());
+    std::fs::create_dir_all(&config.state_dir).unwrap();
+    std::fs::write(
+        config.state_dir.join("synthetic-unauthenticated"),
+        b"synthetic",
+    )
+    .unwrap();
+    let status = runner(config).probe().await;
+    assert_eq!(status.version, "1.2.15");
+    assert!(!status.authenticated);
+    assert!(status.models.is_empty());
+    assert_eq!(status.error.as_deref(), Some("provider_auth_required"));
+    assert!(
+        !serde_json::to_string(&status)
+            .unwrap()
+            .contains("Please sign in")
+    );
 }
 
 #[tokio::test]
@@ -141,6 +173,69 @@ async fn text_deltas_result_only_and_schema_use_official_envelopes() {
             .iter()
             .any(|event| matches!(event, RunEvent::TextDelta { .. }))
     );
+}
+
+#[tokio::test]
+async fn schema_echo_requires_entire_valid_json_and_structured_output_agreement() {
+    let root = tempfile::tempdir().unwrap();
+    let runner = runner(config(root.path()));
+    let schema = json!({
+        "type":"object", "properties":{"count":{"type":"integer"}},
+        "required":["count"], "additionalProperties":false
+    });
+    for prompt in [
+        "schema text output",
+        "__fake_schema_echo__",
+        "__fake_structured__",
+    ] {
+        let mut input = request(prompt);
+        input.schema = Some(schema.clone());
+        let events = collect(&runner, input).await;
+        let result = completed(&events);
+        assert_eq!(result.structured_output, Some(json!({"count":1})));
+        assert_eq!(result.text, "{\"count\":1}");
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| {
+                    if let RunEvent::TextDelta { delta } = event {
+                        Some(delta.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<String>(),
+            result.text
+        );
+    }
+    for (prompt, expected) in [
+        ("__fake_schema_fenced__", "provider_schema_violation"),
+        ("__fake_schema_prose__", "provider_schema_violation"),
+        ("__fake_schema_invalid_json__", "provider_schema_violation"),
+        ("__fake_bad_schema__", "provider_schema_violation"),
+        (
+            "__fake_bad_schema__ __fake_schema_echo__",
+            "provider_schema_violation",
+        ),
+        ("__fake_schema_disagree__", "provider_protocol_error"),
+    ] {
+        let mut input = request(prompt);
+        input.schema = Some(schema.clone());
+        let events = collect(&runner, input).await;
+        assert_eq!(error(&events), expected, "{prompt}");
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, RunEvent::TextDelta { .. } | RunEvent::Completed(_)))
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, RunEvent::Error(_)))
+                .count(),
+            1
+        );
+    }
 }
 
 #[tokio::test]
@@ -219,12 +314,48 @@ async fn provider_failures_have_safe_codes_and_one_terminal_event() {
 async fn fallback_inventory_is_rejected_before_any_prompt_is_supplied() {
     let root = tempfile::tempdir().unwrap();
     let runner = runner(config(root.path()));
-    let mut input = request("this input must never reach a fallback agent");
-    input.model = "fake-fallback".into();
-    let workspace = root.path().join("workspaces").join(&input.request_id);
-    let events = collect(&runner, input).await;
-    assert_eq!(error(&events), "provider_agent_not_loaded");
-    assert!(!workspace.join("prompt-received.txt").exists());
+    for model in [
+        "fake-fallback",
+        "fake-malformed-agent",
+        "fake-wrong-agent-name",
+        "fake-preflight-wrong-command",
+        "fake-preflight-generation",
+        "fake-preflight-malformed",
+        "fake-preflight-duplicate",
+        "fake-preflight-stderr",
+        "fake-preflight-error",
+        "fake-preflight-denied",
+        "fake-preflight-malformed-denied",
+        "fake-unexpected-registry",
+        "fake-missing-registry",
+        "fake-duplicate-registry",
+    ] {
+        let mut input = request("this input must never reach an unverified provider");
+        input.model = model.into();
+        let workspace = root.path().join("workspaces").join(&input.request_id);
+        let stream_marker = root
+            .path()
+            .join("auth")
+            .join(format!("synthetic-stream-start-{}", input.request_id));
+        let prompt_marker = root
+            .path()
+            .join("auth")
+            .join(format!("synthetic-prompt-read-{}", input.request_id));
+        let preflight_marker = root
+            .path()
+            .join("auth")
+            .join(format!("synthetic-agent-preflight-{}", input.request_id));
+        let events = collect(&runner, input).await;
+        assert_eq!(error(&events), "provider_agent_not_loaded", "{model}");
+        assert!(preflight_marker.exists(), "{model}");
+        assert!(!prompt_marker.exists(), "{model}");
+        if !model.contains("registry") {
+            assert!(!stream_marker.exists(), "{model}");
+        } else {
+            assert!(stream_marker.exists(), "{model}");
+        }
+        assert!(!workspace.join("prompt-received.txt").exists(), "{model}");
+    }
     let mut input = request("expired authentication never receives a prompt");
     input.model = "fake-auth-before-init".into();
     let events = collect(&runner, input).await;
@@ -238,6 +369,11 @@ async fn assert_descendant_dead(workspace: &Path) {
         .unwrap()
         .parse()
         .unwrap();
+    assert_pid_dead(pid).await;
+}
+
+#[cfg(unix)]
+async fn assert_pid_dead(pid: libc::pid_t) {
     for _ in 0..100 {
         let live = unsafe { libc::kill(pid, 0) == 0 };
         // Linux PID1 can leave a dead grandchild as a zombie. It cannot execute.
@@ -254,6 +390,82 @@ async fn assert_descendant_dead(workspace: &Path) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("descendant survived process-group cancellation");
+}
+
+#[tokio::test]
+async fn preflight_deadline_cancellation_and_disconnect_reap_without_user_input() {
+    for action in ["deadline", "cancel", "disconnect"] {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = config(root.path());
+        config.request_timeout_secs = if action == "deadline" { 1 } else { 3 };
+        let runner = runner(config);
+        let cancel = CancellationToken::new();
+        let mut input = request("preflight must never receive this conversation");
+        input.model = "fake-preflight-blocking".into();
+        let pid_marker = root.path().join("auth").join(format!(
+            "synthetic-preflight-descendant-{}",
+            input.request_id
+        ));
+        let stream_marker = root
+            .path()
+            .join("auth")
+            .join(format!("synthetic-stream-start-{}", input.request_id));
+        let prompt_marker = root
+            .path()
+            .join("auth")
+            .join(format!("synthetic-prompt-read-{}", input.request_id));
+        let mut stream = runner.start(input, cancel.clone()).await.unwrap();
+        for _ in 0..100 {
+            if pid_marker.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(pid_marker.exists(), "{action}: preflight did not start");
+        let pid: libc::pid_t = std::fs::read_to_string(&pid_marker)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let workspace = stream.workspace.clone();
+        let finished = stream.finished.clone();
+        let ownership = stream.workspace_owned.clone();
+        if action == "disconnect" {
+            drop(stream.events);
+        } else {
+            if action == "cancel" {
+                cancel.cancel();
+            }
+            let mut events = Vec::new();
+            while let Some(event) = stream.events.recv().await {
+                events.push(event);
+            }
+            assert_eq!(
+                error(&events),
+                if action == "deadline" {
+                    "provider_timeout"
+                } else {
+                    "request_cancelled"
+                }
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, RunEvent::Init { .. } | RunEvent::Completed(_)))
+            );
+        }
+        tokio::time::timeout(Duration::from_secs(4), finished.cancelled())
+            .await
+            .unwrap();
+        #[cfg(unix)]
+        assert_pid_dead(pid).await;
+        assert!(!workspace.exists(), "{action}");
+        assert!(
+            !ownership.load(std::sync::atomic::Ordering::Acquire),
+            "{action}"
+        );
+        assert!(!stream_marker.exists(), "{action}");
+        assert!(!prompt_marker.exists(), "{action}");
+    }
 }
 
 #[tokio::test]

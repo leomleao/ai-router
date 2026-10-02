@@ -23,7 +23,8 @@ flowchart LR
 
 Both OpenAI API styles share one runner. Model requests replay submitted
 history in a fresh workspace, use a fixed agent without default components,
-and disable slash expansion. A private inert MCP relay offers client-supplied
+and disable slash expansion. A zero-token CLI management check verifies the
+parsed custom agent before user prompts are sent. A private inert MCP relay offers client-supplied
 tools: it captures one validated call, stops AGY, and returns `tool_calls` or a
 Responses `function_call`. The client executes the tool and sends its result
 with the full history. No client tool runs on this server.
@@ -130,6 +131,11 @@ stable completion/item/call IDs, terminal status, and cancellation. Before SSE
 starts, failures use ordinary HTTP error responses. After SSE starts, failures
 use terminal error events and never transparently retry a run.
 
+Model JSON Schema requests instruct the model to return raw JSON, then validate
+the complete final value in Rust. Invalid JSON or schema failures return an
+error; provisional schema output is withheld. This is validated generated text,
+without a guarantee of provider constrained decoding.
+
 Native request shape, available only after operator verification:
 
 ```json
@@ -168,8 +174,10 @@ feature works headlessly; use the [capability matrix](docs/capabilities.md).
 - CLI workers use a clean service home and cleared environment, fixed policy,
   separate private workspaces, and the official sandbox flag. Provider stdout,
   stderr and tool handoffs are bounded. Cancellation kills the process group.
-- Model tool inventory is checked before the prompt is sent. Unexpected native
-  tools fail the run. A real version-specific isolation check is still needed.
+- Model requests use a fixed custom agent with no built-ins and at most the
+  inert client-tool relay. AGY's initial tool list is its global registry:
+  the adapter checks the exact pinned inventory, and rejects every actual
+  native tool or subagent step. Live canaries verify the effective isolation.
 - Named volumes preserve AGY state and monitor metadata. Temporary workspaces
   use tmpfs. AGY itself can persist conversations/logs in its state home: the
   AGY volume is sensitive, not a promise of login-only storage.
@@ -202,9 +210,12 @@ uses disposable test state separate from the login volume. Fixtures never
 fall back to the signed-in host CLI. See [validation evidence](docs/validation.md)
 for the commands/results and the remaining authenticated checks.
 
-Local fixture and SDK tests establish adapter behaviour. Running the complete
-installed n8n/Hermes applications, Google subscription generation, login
-persistence, and the native sandbox require operator-assisted validation.
+The local suite passes 70 Rust tests and 76 HTTP/SDK checks. Authenticated
+acceptance also passes 15 live SDK checks for Gemini text, both API styles,
+streams, JSON Schema and client-owned tool loops. AGY login survives restart
+and container recreation; Claude text also passes after restart. Running the
+complete installed n8n/Hermes applications and enabling the native sandbox
+remain separate operator validation gates.
 
 The secret-file policy applies to every tool and build context: `.env*`, `.pem`,
 `.key`, and contents of `secrets` or `credentials` directories are excluded.

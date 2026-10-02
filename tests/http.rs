@@ -614,22 +614,46 @@ async fn schema_output_and_provider_errors_are_consistent_across_api_styles() {
             .unwrap(),
         json!({"count":1})
     );
-    body["input"] = json!("__fake_bad_schema__");
-    body["stream"] = json!(true);
-    let stream = harness
-        .send(Method::POST, "/v1/responses", Some(body), Some("test-key"))
-        .await;
-    let frames = frames(&read_bytes(stream).await);
-    assert_eq!(frames.last().unwrap().event, "response.failed");
-    assert!(
-        !frames
-            .iter()
-            .any(|frame| frame.event == "response.output_text.delta")
-    );
-    assert_eq!(
-        event_json(frames.last().unwrap())["response"]["error"]["code"],
-        "provider_schema_violation"
-    );
+    for prompt in [
+        "__fake_bad_schema__",
+        "__fake_schema_fenced__",
+        "__fake_schema_prose__",
+        "__fake_schema_invalid_json__",
+    ] {
+        let mut chat_body = chat(prompt);
+        chat_body["response_format"] = json!({"type":"json_schema","json_schema":{"name":"count","strict":true,"schema":schema}});
+        let (status, value) = harness.post("/v1/chat/completions", chat_body).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(value["error"]["code"], "provider_schema_violation");
+        body["input"] = json!(prompt);
+        body["stream"] = json!(true);
+        let stream = harness
+            .send(
+                Method::POST,
+                "/v1/responses",
+                Some(body.clone()),
+                Some("test-key"),
+            )
+            .await;
+        let frames = frames(&read_bytes(stream).await);
+        assert_eq!(frames.last().unwrap().event, "response.failed");
+        assert!(
+            !frames
+                .iter()
+                .any(|frame| frame.event == "response.output_text.delta")
+        );
+        assert_eq!(
+            event_json(frames.last().unwrap())["response"]["error"]["code"],
+            "provider_schema_violation"
+        );
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| frame.event == "response.failed")
+                .count(),
+            1
+        );
+    }
     let (status, value) = harness
         .post("/v1/chat/completions", chat("__fake_auth__"))
         .await;

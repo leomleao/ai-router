@@ -24,6 +24,11 @@ if args == ["--version"]:
     print("1.2.15")
     sys.exit(0)
 if args == ["models"]:
+    if (Path(os.environ["HOME"]) / "synthetic-unauthenticated").exists():
+        # Reproduce the official CLI's unauthenticated models command,
+        # including its diagnostic on stdout rather than stderr.
+        print("Fetching available models...\nError: Please sign in to view available models. Launch the CLI without arguments to sign in.")
+        sys.exit(1)
     print("ID                         Name\ngemini-3-pro               Gemini 3 Pro\nclaude-sonnet-4            Claude Sonnet 4")
     sys.exit(0)
 if flag("-p") == "/quota":
@@ -33,6 +38,62 @@ if flag("-p") == "/quota":
             "remaining_fraction": 0.75, "reset_time": "2026-10-07T17:22:30Z"
         }]}]}}})
     sys.exit(0)
+
+def synthetic_marker(name, data="synthetic fixture marker"):
+    # Only the fixture's configured synthetic HOME; no saved login is read.
+    home = Path(os.environ["HOME"])
+    home.mkdir(parents=True, exist_ok=True)
+    (home / ("synthetic-" + name + "-" + Path.cwd().name)).write_text(data)
+
+if flag("-p") == "/agents":
+    assert flag("--output-format") == "json"
+    assert flag("--agent") == "router-model"
+    assert "--sandbox" in args
+    assert "--disable-slash-commands" not in args
+    assert Path(os.environ["TMPDIR"]) == Path.cwd() / "tmp"
+    assert Path(os.environ["TMPDIR"]).is_dir()
+    synthetic_marker("agent-preflight")
+    model = flag("--model")
+    agent_path = Path(".agents/agents/router-model/agent.md")
+    if model == "fake-fallback":
+        agent_path.unlink()
+    elif model == "fake-malformed-agent":
+        agent_path.write_text("---\nname: router-model\ntools: [\n---\n# System Prompt\n")
+    elif model == "fake-wrong-agent-name":
+        agent_path.write_text(agent_path.read_text().replace("name: router-model\n", "name: different-agent\n", 1))
+    names = []
+    if agent_path.exists() and model != "fake-malformed-agent":
+        header = agent_path.read_text().split("---", 2)[1]
+        names = [line.split(":", 1)[1].strip() for line in header.splitlines() if line.startswith("name:")]
+    if model == "fake-preflight-blocking":
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+        synthetic_marker("preflight-descendant", str(child.pid))
+        time.sleep(300)
+    if model == "fake-preflight-malformed":
+        print("{invalid-json", flush=True)
+        sys.exit(0)
+    if model == "fake-preflight-duplicate":
+        names.append("router-model")
+    if model == "fake-preflight-stderr":
+        print("synthetic unclassified preflight warning", file=sys.stderr, flush=True)
+    generated = model == "fake-preflight-generation"
+    result = {"status":"SUCCESS", "response":"\n".join(names) + "\n", "num_turns":1 if generated else 0,
+          "usage":{"input_tokens":1 if generated else 0,"output_tokens":0,"thinking_tokens":0,
+                   "cache_read_tokens":0,"total_tokens":1 if generated else 0},
+          "command":{"name":"usage" if model == "fake-preflight-wrong-command" else "agents",
+                     "data":{"agents":names}}}
+    if model == "fake-preflight-error":
+        result["error"] = "synthetic contradictory success"
+    if model == "fake-preflight-denied":
+        result["denied_actions"] = [{"action":"synthetic"}]
+    if model == "fake-preflight-malformed-denied":
+        result["denied_actions"] = None
+    emit(result)
+    sys.exit(0)
+
+synthetic_marker("stream-start")
 
 assert "--dangerously-skip-permissions" not in args
 assert flag("--input-format") == "stream-json"
@@ -52,6 +113,7 @@ if model_only:
     # Read only the router-created synthetic agent/catalogue, never glob a home.
     agent = Path(".agents/agents/router-model/agent.md").read_text()
     header = agent.split("---", 2)[1]
+    assert "tools: []" in header
     assert "excludeDefaultComponents: true" in header
     assert "inheritMcp: false" in header
     for line in header.splitlines():
@@ -59,6 +121,8 @@ if model_only:
             command = json.loads(line.split(":", 1)[1])
         if line.strip().startswith("args:"):
             relay_args = json.loads(line.split(":", 1)[1])
+        if line.strip().startswith("cwd:"):
+            assert json.loads(line.split(":", 1)[1]) == str(Path.cwd())
     if command:
         assert relay_args[0] == "mcp-relay"
         assert Path(relay_args[1]).name == "router-tools.json"
@@ -70,20 +134,33 @@ conversation_id = "fixture-" + Path.cwd().name
 if flag("--model") == "fake-auth-before-init":
     emit({"event":"result", "result":{"status":"ERROR", "error":"authentication required"}})
     sys.exit(1)
+# Real 1.2.15 emits the global advertised registry, even for a custom agent
+# with no built-in tools. The fixed public snapshot is shared with the adapter.
+registry = json.loads((Path(__file__).resolve().parents[2] / "src/agy-init-tools-1.2.15.json").read_text())
+assert registry["version"] == "1.2.15"
+inventory = list(registry["tools"])
+if flag("--model") == "fake-unexpected-registry":
+    inventory.append("unverified_tool")
+if flag("--model") == "fake-missing-registry":
+    inventory.pop()
+if flag("--model") == "fake-duplicate-registry":
+    inventory.append(inventory[0])
 emit({"event": "init", "conversation_id": conversation_id, "init": {
     "cwd": str(Path.cwd()), "model": flag("--model"),
+    # Real AGY reports the requested name even if discovery would fail.
     "agent": "router-model" if model_only else "default",
-    "tools": ["run_command"] if flag("--model") == "fake-fallback" else (["call_mcp_tool"] if tools else ([] if model_only else ["run_command", "write_to_file"])),
+    "tools": inventory,
     "permission_mode": "request-review"
 }})
 
 # The fixture emits init before reading input, to prove the router checks the
-# tool inventory before allowing a prompt into a possibly fallback agent.
+# pinned registry and agent identity before allowing a prompt into a fallback.
 line = sys.stdin.readline()
 if not line:
     sys.exit(2)
 message = json.loads(line)
 Path("prompt-received.txt").write_text("synthetic fixture input was supplied")
+synthetic_marker("prompt-read")
 assert message["event"] == "user"
 prompt = message["message"]["content"]
 assert isinstance(prompt, str)
@@ -179,18 +256,41 @@ if not model_only:
 
 output = "Fixture final answer" if has_tool_result or "__fake_final__" in prompt else "Hello from fixture"
 structured = None
-if "--json-schema" in args:
+schema = None
+if model_only:
+    # The isolated model profile deliberately omits the CLI flag: live
+    # 1.2.15 retries and concatenates four answers when it is supplied.
+    assert "--json-schema" not in args
+    if "\nRouter output contract:" in agent:
+        assert "Return raw JSON only, with no Markdown fences, explanation, or other text." in agent
+        schema = json.loads(agent.rsplit("JSON Schema:\n", 1)[1])
+elif "--json-schema" in args:
     schema = json.loads(flag("--json-schema"))
+if schema is not None:
     structured = {name: 1 if item.get("type") == "integer" else "fixture"
                   for name, item in schema.get("properties", {}).items()}
     if "__fake_bad_schema__" in prompt:
         structured = {name: "wrong-type" for name in structured}
     output = json.dumps(structured, separators=(",", ":"))
+    if "__fake_schema_fenced__" in prompt:
+        output = "```json\n" + output + "\n```"
+    if "__fake_schema_prose__" in prompt:
+        output += "\nThe task is complete."
+    if "__fake_schema_invalid_json__" in prompt:
+        output = "{not-json}"
+    if "__fake_schema_disagree__" in prompt:
+        structured = {name: 2 if item.get("type") == "integer" else "different"
+                      for name, item in schema.get("properties", {}).items()}
 if "__fake_result_only__" not in prompt:
     middle = len(output) // 2
     step(state="ACTIVE", text_delta=output[:middle])
     step(text_delta=output[middle:], usage=usage)
 result = {"conversation_id":conversation_id, "status":"SUCCESS", "response":output, "usage":usage}
 if structured is not None:
-    result["structured_output"] = structured
+    # Model schema support validates generated text independently. Also retain
+    # the observed echo-only and future structured-output protocol scenarios.
+    if "__fake_schema_echo__" in prompt or not model_only:
+        result["json_schema"] = schema
+    if "__fake_structured__" in prompt or "__fake_schema_disagree__" in prompt:
+        result["structured_output"] = structured
 emit({"event":"result", "result":result})

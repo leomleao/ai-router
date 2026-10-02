@@ -178,6 +178,14 @@ AGY authentication, subscriptions, CLI streaming/schema/tool handoffs, n8n and
 Hermes application behaviour, and native containment are distinct acceptance
 checks. Until each real check passes, capabilities must identify it as pending.
 
+The authenticated local evaluation now passes both API styles, both streams,
+both schema formats and client-tool loops on Gemini, plus Claude text after
+restart. Login survives restart and container recreation. Full n8n/Hermes app
+configuration and native
+containment remain separate gates. See [validation](validation.md) for results
+and the opt-in live SDK command. The evaluation key is temporary; configure
+operator-owned client keys using the procedure above.
+
 Sources: [official installation and authentication](https://www.antigravity.google/docs/cli/install/),
 [official terminal sandbox](https://www.antigravity.google/docs/sandbox?tab=cli),
 [official self-updater troubleshooting](https://www.antigravity.google/docs/cli/troubleshooting/),

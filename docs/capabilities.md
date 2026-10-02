@@ -7,13 +7,13 @@ verification status. Fixture/SDK tests prove the adapter, not Google inference.
 
 | Feature | HTTP surface | Current evidence / boundary |
 | --- | --- | --- |
-| Model catalogue | `/v1/models` | Real macOS CLI catalogue and pinned Linux binary version verified; Linux account catalogue requires login |
-| Quota/reset windows | Capabilities/private monitor | Real macOS headless `/quota` JSON verified; cached Linux probe uses same contract |
-| Text generation | Chat and Responses | Official headless transport, deterministic fixture and SDK contract checks; authenticated Linux generation gate remains |
-| Incremental output | Chat/Responses SSE | NDJSON adapter with stable IDs and terminal events; actual CLI may emit short answers only on completion |
-| JSON Schema | Chat `response_format`, Responses `text.format`, native `json_schema` | Terminal `structured_output` validated independently; provisional text withheld for schema requests |
-| Client tools | Chat `tool_calls`, Responses `function_call` | Inert MCP relay, original schema validation, client-owned execution, full history replay; one call per turn |
-| Multiple tool rounds | Stateless replay of complete history | Contract tests; preserve call/result IDs and roles |
+| Model catalogue | `/v1/models` | Authenticated Linux AGY 1.2.15 exposes 14 account model IDs; discovered catalogue is not proof every model supports every feature |
+| Quota/reset windows | Capabilities/private monitor | Authenticated Linux `/quota` metadata verified; cached freshness and reset windows reported |
+| Text generation | Chat and Responses | Real SDK checks passed on gemini-3.8-flash-low; claude-sonnet-4-6 Chat text passed after restart |
+| Incremental output | Chat/Responses SSE | Real SDK content and terminal events passed on Gemini; actual CLI may emit short answers only on completion |
+| JSON Schema | Chat `response_format`, Responses `text.format`, native `json_schema` | Model profile requests raw JSON and validates the complete final value independently; invalid JSON/schema fails the request and provisional text is withheld. No provider constrained decoding is promised; native schema support remains unverified |
+| Client tools | Chat `tool_calls`, Responses `function_call` | Both real Gemini handoff/result/final-answer loops passed through the inert MCP relay and original schema validation; one call per turn |
+| Multiple tool rounds | Stateless replay of complete history | Live result continuation and automated multi-round contracts; preserve call/result IDs and roles |
 | Parallel client tools | Request permission accepted | Produces one call per turn; never claims parallel execution |
 | Forced/required tool choice | None | Rejected; no proven CLI enforcement |
 | Effort/model selection | OpenAI reasoning effort/native effort | Official flags passed through; acceptance depends on the selected model |
