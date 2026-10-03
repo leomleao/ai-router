@@ -32,11 +32,18 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 RUN cargo build --locked --release
 
+# n8n's pinned Vercel SDK contract runs only in the isolated test image.
+FROM node:24.10.0-bookworm-slim AS n8n-contract-deps
+WORKDIR /opt/n8n-contract
+RUN npm install --ignore-scripts --no-audit --no-fund --save-exact \
+    ai@7.0.66 @ai-sdk/openai@4.0.20 zod@4.1.8
+COPY tests/n8n_contract.mjs ./n8n_contract.mjs
+
 # Local deterministic tests only. Python executes the synthetic fake provider;
-# the production gateway stage contains no Python runtime.
+# the production gateway stage contains neither Python nor Node.
 FROM builder AS test
 USER root
-RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-venv \
+RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-venv libatomic1 \
     && rm -rf /var/lib/apt/lists/* \
     && python3 -m venv /opt/test-venv \
     && /opt/test-venv/bin/pip install --no-cache-dir openai==3.24.0 pyte==0.8.2 \
@@ -44,6 +51,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends python3 python3
     && chown -R 10001:10001 /var/lib/ai-router /run/ai-router \
     && chmod 0700 /var/lib/ai-router/auth /var/lib/ai-router/telemetry /run/ai-router
 ENV PATH=/opt/test-venv/bin:$PATH
+COPY --from=n8n-contract-deps /usr/local/bin/node /usr/local/bin/node
+COPY --from=n8n-contract-deps /opt/n8n-contract /opt/n8n-contract
 COPY tests ./tests
 RUN cargo test --locked && python3 tests/monitor_tui.py
 

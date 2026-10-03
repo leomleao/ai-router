@@ -285,7 +285,8 @@ pub fn normalize_chat(value: Value, request_id: String) -> Result<RunRequest, Ap
             "At least one conversation message is required",
         ));
     }
-    make_request(request_id, model, transcript, system, tools, schema, effort)
+    let request = make_request(request_id, model, transcript, system, tools, schema, effort)?;
+    apply_output_token_hint(request, root, false)
 }
 
 pub fn normalize_response(value: Value, request_id: String) -> Result<RunRequest, ApiError> {
@@ -408,7 +409,43 @@ pub fn normalize_response(value: Value, request_id: String) -> Result<RunRequest
             "At least one conversation input item is required",
         ));
     }
-    make_request(request_id, model, transcript, system, tools, schema, effort)
+    let request = make_request(request_id, model, transcript, system, tools, schema, effort)?;
+    apply_output_token_hint(request, root, true)
+}
+
+fn apply_output_token_hint(
+    mut request: RunRequest,
+    root: &Map<String, Value>,
+    responses: bool,
+) -> Result<RunRequest, ApiError> {
+    let fields: &[&str] = if responses {
+        &["max_output_tokens"]
+    } else {
+        &["max_tokens", "max_completion_tokens"]
+    };
+    let mut budget = None;
+    for field in fields {
+        if let Some(value) = nonnull(root.get(*field)) {
+            let value = value.as_u64().filter(|value| *value > 0).ok_or_else(|| {
+                ApiError::bad_request(format!("{field} must be a positive integer"))
+            })?;
+            if budget.replace(value).is_some() {
+                return Err(ApiError::bad_request(
+                    "Choose either max_tokens or max_completion_tokens, not both",
+                ));
+            }
+        }
+    }
+    if let Some(budget) = budget {
+        // The CLI has no verified generation-token cap. Numeric budgets are
+        // translated to visible-answer guidance, never claimed as enforced
+        // usage limits and never used to truncate text, JSON or tool calls.
+        request.system.push_str(&format!(
+            "\n\nRouter answer-length guidance (best effort): Aim for an approximate visible answer length of at most {budget} tokens. Keep the answer concise. Preserve correctness, complete JSON matching any required schema, and complete tool-call arguments even if they require a longer answer. This is length guidance only; do not change reasoning effort.\n"
+        ));
+        bounded_text(&request.system)?;
+    }
+    Ok(request)
 }
 
 fn make_request(
@@ -462,6 +499,7 @@ fn validate_common(root: &Map<String, Value>, responses: bool) -> Result<(), Api
             "stream",
             "reasoning",
             "text",
+            "max_output_tokens",
         ]
     } else {
         vec![
@@ -475,6 +513,8 @@ fn validate_common(root: &Map<String, Value>, responses: bool) -> Result<(), Api
             "response_format",
             "reasoning_effort",
             "modalities",
+            "max_tokens",
+            "max_completion_tokens",
         ]
     };
     for (field, value) in root {
@@ -1017,8 +1057,7 @@ mod tests {
         for field in [
             "temperature",
             "top_p",
-            "max_tokens",
-            "max_completion_tokens",
+            "max_output_tokens",
             "seed",
             "previous_response_id",
         ] {
@@ -1035,6 +1074,106 @@ mod tests {
         input["frequency_penalty"] = json!(0);
         input["logprobs"] = json!(false);
         assert!(normalize_chat(input, "req".to_owned()).is_ok());
+    }
+    #[test]
+    fn token_budgets_add_only_best_effort_answer_length_guidance() {
+        let schema = json!({"type":"object", "properties":{"count":{"type":"integer"}},
+            "required":["count"], "additionalProperties":false});
+        for (responses, field) in [
+            (true, "max_output_tokens"),
+            (false, "max_tokens"),
+            (false, "max_completion_tokens"),
+        ] {
+            let input = if responses {
+                json!({"model":"gemini-test", "input":"hello", "instructions":"Be accurate",
+                    "reasoning":{"effort":"high"}, "tools":[{"type":"function", "name":"weather", "parameters":{"type":"object"}}],
+                    "text":{"verbosity":"medium", "format":{"type":"json_schema", "name":"answer", "schema":schema, "strict":true}}})
+            } else {
+                json!({"model":"gemini-test", "messages":[{"role":"system", "content":"Be accurate"}, {"role":"user", "content":"hello"}],
+                    "reasoning_effort":"high", "tools":[tool()], "verbosity":"medium",
+                    "response_format":{"type":"json_schema", "json_schema":{"name":"answer", "schema":schema, "strict":true}}})
+            };
+            let normalize = if responses {
+                normalize_response
+            } else {
+                normalize_chat
+            };
+            let expected = normalize(input.clone(), "req".to_owned()).unwrap();
+            for budget in [8, 16, 4096] {
+                let mut value = input.clone();
+                value[field] = json!(budget);
+                let mut request = normalize(value, "req".to_owned()).unwrap();
+                assert!(request.system.starts_with(&expected.system));
+                assert!(request.system.contains(&format!("at most {budget} tokens")));
+                assert!(request.system.contains("best effort"));
+                assert!(request.system.contains("complete tool-call arguments"));
+                request.system = expected.system.clone();
+                assert_eq!(
+                    serde_json::to_value(request).unwrap(),
+                    serde_json::to_value(&expected).unwrap()
+                );
+            }
+            let mut value = input;
+            value[field] = Value::Null;
+            assert_eq!(
+                serde_json::to_value(normalize(value, "req".to_owned()).unwrap()).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+        }
+    }
+    #[test]
+    fn token_budgets_reject_malformed_conflicting_and_misplaced_values() {
+        for (responses, field) in [
+            (true, "max_output_tokens"),
+            (false, "max_tokens"),
+            (false, "max_completion_tokens"),
+        ] {
+            for budget in [
+                json!(0),
+                json!(-1),
+                json!(1.5),
+                json!("16"),
+                json!(true),
+                json!([]),
+                json!({}),
+            ] {
+                let mut value = if responses {
+                    json!({"model":"gemini-test", "input":"hello"})
+                } else {
+                    chat()
+                };
+                value[field] = budget;
+                let normalize = if responses {
+                    normalize_response
+                } else {
+                    normalize_chat
+                };
+                let error = normalize(value, "req".to_owned()).unwrap_err();
+                assert_eq!(error.code, "invalid_request");
+                assert_eq!(error.message, format!("{field} must be a positive integer"));
+            }
+        }
+        let mut value = chat();
+        value["max_tokens"] = json!(8);
+        value["max_completion_tokens"] = json!(16);
+        assert_eq!(
+            normalize_chat(value.clone(), "req".to_owned())
+                .unwrap_err()
+                .code,
+            "invalid_request"
+        );
+        value["max_tokens"] = Value::Null;
+        assert!(normalize_chat(value, "req".to_owned()).is_ok());
+        for field in ["max_tokens", "max_completion_tokens"] {
+            let mut value = json!({"model":"gemini-test", "input":"hello"});
+            value[field] = json!(16);
+            assert_eq!(
+                normalize_response(value, "req".to_owned())
+                    .unwrap_err()
+                    .code,
+                "unsupported_parameter"
+            );
+        }
     }
     #[test]
     fn neutral_verbosity_preserves_the_entire_normalized_request() {

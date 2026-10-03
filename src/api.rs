@@ -500,7 +500,8 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> Json<Value> {
     let provider = state.provider.read().await;
     Json(
         json!({"provider":"agy", "cli_version":provider.version, "expected_cli_version":state.config.expected_agy_version, "provider_ready":provider.authenticated,
-        "profiles":{"model":{"chat_completions":true,"responses":true,"streaming":true,"text":true,"json_schema":true,"client_tools":true,"max_tool_calls_per_turn":1,"parallel_tool_execution":false,"media_input":false},
+        "profiles":{"model":{"chat_completions":true,"responses":true,"streaming":true,"text":true,"json_schema":true,"client_tools":true,"max_tool_calls_per_turn":1,"parallel_tool_execution":false,"media_input":false,
+                    "output_token_budget":{"mode":"prompt_guidance","hard_limit":false,"limits_reasoning_tokens":false,"parameters":["max_output_tokens","max_tokens","max_completion_tokens"]}},
                     "native":{"enabled":state.config.native_enabled,"requires_operator_sandbox_verification":true,"runs":true,"uploaded_files":true,"artifacts":true,"continuation":false}},
         "unsupported":["sampling_controls","forced_tool_choice","embeddings","audio","image_generation_api","realtime","batches","fine_tuning","provider_management"],
         "verification":{"adapter_contract":"automated_fixtures","real_model_and_client_loops":"operator_gate","native_sandbox":"operator_gate"},
@@ -540,6 +541,9 @@ async fn generate(
         )
     })?;
     let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let has_token_budget = ["max_output_tokens", "max_tokens", "max_completion_tokens"]
+        .iter()
+        .any(|field| body.get(*field).is_some_and(|value| !value.is_null()));
     let include_usage = body
         .pointer("/stream_options/include_usage")
         .and_then(Value::as_bool)
@@ -555,6 +559,15 @@ async fn generate(
     let admission = state.admit().await?;
     let cancel = state.shutdown.child_token();
     let model = request.model.clone();
+    eprintln!(
+        "{}",
+        json!({
+            "event":"model_request", "request_id":id,
+            "endpoint":if responses { "responses" } else { "chat" }, "model":model,
+            "client_tool_count":request.tools.len(),
+            "client_tool_names":request.tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>()
+        })
+    );
     let mut run = state.runner.start(request, cancel.clone()).await?;
     context.recorded.store(true, Ordering::Relaxed);
     let mut guard = CompletionGuard::new(
@@ -582,7 +595,10 @@ async fn generate(
                     } else {
                         chat_object(&completion_id, created, &model, &result)
                     };
-                    return Ok(Json(output).into_response());
+                    return Ok(token_budget_response(
+                        Json(output).into_response(),
+                        has_token_budget,
+                    ));
                 }
                 RunEvent::Error(e) => return Err(e),
                 _ => {}
@@ -618,7 +634,17 @@ async fn generate(
     response
         .headers_mut()
         .insert("cache-control", "no-cache, no-transform".parse().unwrap());
-    Ok(response)
+    Ok(token_budget_response(response, has_token_budget))
+}
+
+fn token_budget_response(mut response: Response, has_budget: bool) -> Response {
+    if has_budget {
+        response.headers_mut().insert(
+            "x-ai-router-token-budget-mode",
+            "prompt-guidance".parse().unwrap(),
+        );
+    }
+    response
 }
 
 pub fn chat_usage(usage: &Option<Usage>) -> Value {

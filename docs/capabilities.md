@@ -26,7 +26,8 @@ verification status. Fixture/SDK tests prove the adapter, not Google inference.
 | Audio | None advertised | Voice UI/microphone facilities do not establish a headless audio API; no fabricated speech/transcription endpoint |
 | Persistent conversation resume | None | Raw AGY IDs and global `--continue` would violate ownership isolation; request history replay supported |
 | Custom agents/skills/MCP installation | Operator configuration only | Caller definitions/servers/slash expansion rejected; no remote configuration/auth endpoint |
-| Sampling/token limits | None | Non-null unsupported controls rejected instead of silently ignored |
+| Output-token budgets | Responses `max_output_tokens`, Chat `max_tokens` / `max_completion_tokens` | Positive integers become best-effort visible-answer length instructions; no hard output, reasoning-token or usage cap. Complete JSON/tool arguments and actual usage are preserved. Capability metadata and a response header disclose prompt guidance |
+| Sampling controls | None | Non-null unsupported controls rejected instead of silently ignored |
 | Embeddings/Realtime/batches/fine-tuning | None | No demonstrated CLI backend; unsupported endpoint errors |
 
 Native limitations: its API is implemented and fixture-tested, but public
@@ -43,6 +44,7 @@ the complete n8n/Hermes apps with their installed versions.
 Sources: [AGY headless](https://www.antigravity.google/docs/cli/headless/),
 [OpenAI answer verbosity and reasoning effort](https://help.openai.com/en/articles/5072518-controlling-the-length-of-openai-model-responses),
 [n8n OpenAI node defaults](https://github.com/n8n-io/n8n/blob/master/packages/%40n8n/nodes-langchain/nodes/llms/LMChatOpenAi/LmChatOpenAi.node.ts),
+[n8n Assistant connection probe](https://github.com/n8n-io/n8n/blob/master/packages/cli/src/modules/instance-ai/instance-ai-verification.service.ts),
 [AGY permissions](https://www.antigravity.google/docs/permissions?tab=cli),
 [CLI custom agents](https://www.antigravity.google/docs/subagents/),
 [n8n Assistant](https://docs.n8n.io/deploy/host-n8n/configure-n8n/set-up-n8n-assistant),

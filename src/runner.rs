@@ -375,14 +375,16 @@ impl Runner {
             // as a built-in frontmatter component is invalid in AGY 1.2.15.
             agent.push_str("---\n# System Prompt\nYou are the assistant in the supplied complete conversation. Never perform native file, command, web or agent operations.\n");
             agent.push_str(&request.system);
+            agent.push_str("\nThe current client tool catalogue below is the authoritative tool inventory for this request. It is supplied anew on every request. Ignore historical claims about which tools were available; they may be obsolete. When asked which tools you can see or use, answer directly from this catalogue using the client tool names and descriptions. Do not report internal dispatchers, native tools, or a global tool registry as available client tools. An inventory question does not require a tool call.\n");
             if request.tools.is_empty() {
-                agent.push_str("\nNo tools are available. Answer directly.\n");
+                agent.push_str("\nCurrent client tool catalogue:\n[]\nNo client tools are available for this request. Answer directly; if asked about available tools, state that no client tools were supplied.\n");
             } else {
-                agent.push_str("\nClient tools are exposed through the ai-router MCP server. Make a real call_mcp_tool function call for one selected tool. Never simulate a call as text. The client owns execution; do not invent a tool result. Available catalogue:\n");
+                agent.push_str("\nClient tools are exposed through the ai-router MCP server. When a client tool is needed to fulfill the request, make a real call_mcp_tool function call for one selected tool. Never simulate a call as text. The client owns execution; do not invent a tool result.\nCurrent client tool catalogue:\n");
                 agent.push_str(
                     &serde_json::to_string(&request.tools)
                         .map_err(|_| internal("invalid_tool_catalogue"))?,
                 );
+                agent.push('\n');
             }
             if let Some(schema) = &request.schema {
                 // The pinned CLI's --json-schema retries and concatenates

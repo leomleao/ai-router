@@ -1,6 +1,9 @@
 use ai_router::{
     config::Config,
-    protocol::{RunEvent, RunProfile, RunRequest, RunResult, ToolDefinition},
+    protocol::{
+        RunEvent, RunProfile, RunRequest, RunResult, ToolDefinition, normalize_chat,
+        normalize_response,
+    },
     runner::Runner,
 };
 use serde_json::json;
@@ -274,6 +277,81 @@ async fn inert_mcp_handoff_and_followup_preserve_client_execution_boundary() {
             .iter()
             .any(|event| matches!(event, RunEvent::ToolCall(_)))
     );
+}
+
+#[tokio::test]
+async fn current_client_catalogue_refreshes_for_chat_and_responses_without_execution() {
+    let root = tempfile::tempdir().unwrap();
+    let runner = runner(config(root.path()));
+    let history = json!([
+        {"role":"user","content":"Which tools can you see?"},
+        {"role":"assistant","content":"I can only see manage_task with list, status, send_input and kill."},
+        {"role":"user","content":"__fake_catalogue__ I changed the tools. Which client tools are available now?"}
+    ]);
+    for responses in [false, true] {
+        for (revision, names) in [
+            vec![],
+            vec!["CodeTool"],
+            vec!["CodeTool", "Wikipedia"],
+            vec!["HTTPRequest"],
+            vec![],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let tools = names
+                .iter()
+                .map(|name| {
+                    let function = json!({
+                        "name":name,
+                        "description":format!("Synthetic {name} revision {revision}"),
+                        "parameters":{
+                            "type":"object",
+                            "properties":{"query":{"type":"string","minLength":revision}},
+                            "required":["query"],
+                            "additionalProperties":false
+                        }
+                    });
+                    if responses {
+                        let mut tool = function;
+                        tool["type"] = json!("function");
+                        tool
+                    } else {
+                        json!({"type":"function","function":function})
+                    }
+                })
+                .collect::<Vec<_>>();
+            let request_id = uuid::Uuid::new_v4().simple().to_string();
+            let input =
+                if responses {
+                    normalize_response(json!({
+                    "model":"gemini-3-pro", "input":history, "tools":tools,
+                    "instructions":"Report only the currently supplied client tool inventory."
+                }), request_id).unwrap()
+                } else {
+                    normalize_chat(
+                        json!({
+                            "model":"gemini-3-pro", "messages":history, "tools":tools
+                        }),
+                        request_id,
+                    )
+                    .unwrap()
+                };
+            let events = collect(&runner, input).await;
+            let result = completed(&events);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&result.text).unwrap(),
+                json!({"tools":names})
+            );
+            assert!(result.tool_calls.is_empty());
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, RunEvent::ToolCall(_) | RunEvent::Native(_)))
+            );
+            assert!(events.iter().any(|event| matches!(event, RunEvent::Init { tools, .. } if tools.iter().any(|name| name == "manage_task"))));
+        }
+    }
 }
 
 #[tokio::test]

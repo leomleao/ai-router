@@ -286,6 +286,13 @@ async fn model_discovery_readiness_and_explicit_capabilities_use_cached_probe() 
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(caps["profiles"]["model"]["max_tool_calls_per_turn"], 1);
+    assert_eq!(
+        caps["profiles"]["model"]["output_token_budget"],
+        json!({
+            "mode":"prompt_guidance", "hard_limit":false, "limits_reasoning_tokens":false,
+            "parameters":["max_output_tokens", "max_tokens", "max_completion_tokens"]
+        })
+    );
     assert_eq!(caps["profiles"]["native"]["enabled"], false);
     assert_eq!(
         caps["verification"]["real_model_and_client_loops"],
@@ -692,7 +699,7 @@ async fn invalid_keys_and_unsupported_inputs_never_start_generation() {
         assert_eq!(value["error"]["code"], "invalid_api_key");
         assert!(harness.workspaces().is_empty());
     }
-    for field in ["temperature", "max_tokens", "seed", "top_p"] {
+    for field in ["temperature", "seed", "top_p"] {
         let mut body = chat("hello");
         body[field] = json!(1);
         let (status, value) = harness.post("/v1/chat/completions", body).await;
@@ -700,6 +707,38 @@ async fn invalid_keys_and_unsupported_inputs_never_start_generation() {
         assert_eq!(value["error"]["code"], "unsupported_parameter");
         assert!(harness.workspaces().is_empty());
     }
+    for (path, field) in [
+        ("/v1/responses", "max_output_tokens"),
+        ("/v1/chat/completions", "max_tokens"),
+        ("/v1/chat/completions", "max_completion_tokens"),
+    ] {
+        for budget in [
+            json!(0),
+            json!(-1),
+            json!(1.5),
+            json!("16"),
+            json!(true),
+            json!([]),
+            json!({}),
+        ] {
+            let mut body = if path == "/v1/responses" {
+                response("hello")
+            } else {
+                chat("hello")
+            };
+            body[field] = budget;
+            let (status, value) = harness.post(path, body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(value["error"]["code"], "invalid_request");
+            assert!(harness.workspaces().is_empty());
+        }
+    }
+    let mut body = chat("hello");
+    body["max_tokens"] = json!(8);
+    body["max_completion_tokens"] = json!(16);
+    let (status, value) = harness.post("/v1/chat/completions", body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(value["error"]["code"], "invalid_request");
     for verbosity in [json!("low"), json!("high"), json!("invalid"), json!(1)] {
         let mut body = response("hello");
         body["text"] = json!({"format":{"type":"text"}, "verbosity":verbosity});

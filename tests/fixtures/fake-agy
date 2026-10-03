@@ -174,6 +174,47 @@ def step(**fields):
 usage = {"input_tokens": 20, "output_tokens": 3, "thinking_tokens": 0,
          "cache_read_tokens": 0, "total_tokens": 23}
 
+def relay_rpc(relay, request, expect_reply=True):
+    relay.stdin.write(json.dumps(request) + "\n")
+    relay.stdin.flush()
+    if expect_reply:
+        response = json.loads(relay.stdout.readline())
+        assert response.get("id") == request["id"]
+        assert "error" not in response
+        return response
+
+def discover_relay():
+    relay = subprocess.Popen([command] + relay_args, stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    relay_rpc(relay, {"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{
+        "protocolVersion":"2025-03-26", "capabilities":{},
+        "clientInfo":{"name":"fake-agy", "version":"1"}}})
+    listed = relay_rpc(relay, {"jsonrpc":"2.0", "id":2, "method":"tools/list"})
+    return relay, listed["result"]["tools"]
+
+if "__fake_catalogue__" in prompt:
+    # Observe the request's real owned manifest and MCP catalogue rather than
+    # infer available tools from conversation history or the broad init list.
+    assert model_only
+    embedded = json.loads(agent.split("\nCurrent client tool catalogue:\n", 1)[1].split("\n", 1)[0])
+    assert embedded == tools
+    if tools:
+        relay, listed = discover_relay()
+        expected = [{"name":tool["name"], "description":tool["description"],
+                     "inputSchema":tool["parameters"]} for tool in embedded]
+        assert listed == expected
+        relay.stdin.close()
+        assert relay.wait(timeout=2) == 0
+    else:
+        assert command is None and relay_args is None
+        assert not Path("router-tools.json").exists()
+    assert not Path("router-handoff.json").exists()
+    output = json.dumps({"tools":[tool["name"] for tool in embedded]}, separators=(",", ":"))
+    step(text_delta=output, usage=usage)
+    emit({"event":"result", "result":{"conversation_id":conversation_id,
+          "status":"SUCCESS", "response":output, "usage":usage}})
+    sys.exit(0)
+
 if "__fake_descendant__" in prompt or "__fake_timeout__" in prompt:
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"],
                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -224,20 +265,9 @@ if tools and select_tool:
          tool_info={"name":"call_mcp_tool", "parameters":{
              "ServerName":"ai-router", "ToolName":tool["name"], "Arguments":arguments}})
     # Real MCP handshake and catalogue request, followed by a call with no reply.
-    relay = subprocess.Popen([command] + relay_args, stdin=subprocess.PIPE,
-                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    def rpc(request, expect_reply=True):
-        relay.stdin.write(json.dumps(request) + "\n")
-        relay.stdin.flush()
-        if expect_reply:
-            response = json.loads(relay.stdout.readline())
-            assert response.get("id") == request["id"]
-            assert "error" not in response
-            return response
-    rpc({"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{"protocolVersion":"2025-03-26", "capabilities":{}, "clientInfo":{"name":"fake-agy", "version":"1"}}})
-    listed = rpc({"jsonrpc":"2.0", "id":2, "method":"tools/list"})
-    assert listed["result"]["tools"][0]["inputSchema"] == tool["parameters"]
-    rpc({"jsonrpc":"2.0", "id":3, "method":"tools/call", "params":{"name":tool["name"], "arguments":arguments}}, False)
+    relay, listed = discover_relay()
+    assert listed[0]["inputSchema"] == tool["parameters"]
+    relay_rpc(relay, {"jsonrpc":"2.0", "id":3, "method":"tools/call", "params":{"name":tool["name"], "arguments":arguments}}, False)
     time.sleep(300)
 
 if not model_only:

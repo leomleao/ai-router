@@ -66,6 +66,12 @@ Protocol types derive serde where appropriate:
   Responses `text.verbosity` and Chat `verbosity` accept absent/null/`medium`
   as equivalent defaults without changing the normalized request. Reject all
   other verbosity values; answer detail is independent of reasoning effort.
+  Responses `max_output_tokens` and Chat `max_tokens` / `max_completion_tokens`
+  accept positive integers as best-effort visible-answer length instructions
+  in the normalized system prompt. Omission/null add nothing; reject malformed
+  budgets or both non-null Chat fields. No hard output/reasoning/usage cap or
+  truncated JSON/tool call is promised. Capabilities and successful responses
+  disclose `prompt_guidance` / `X-AI-Router-Token-Budget-Mode: prompt-guidance`.
 
 ## P2 owner: runner.rs, relay.rs, tests/fixtures/fake-agy (and runner unit tests)
 
@@ -147,6 +153,9 @@ sandbox verification and never accept caller-supplied raw provider IDs. Chat
 workspaces deleted on completion/cancellation; native workspaces on TTL/delete.
 Metrics never include event payloads. Tests use explicit fake provider path and
 synthetic keys; fixtures cannot launch signed-in host AGY.
+Model request logs include the router request ID, endpoint, model, and current
+client-tool names/count for inventory diagnostics. Prompts, tool descriptions,
+schemas, arguments and authentication values are not logged.
 `AppState::drain(Duration) -> bool` waits for admission cleanup and telemetry
 recording before shutdown flush. `native::shutdown(&AppState) -> bool` cancels
 jobs and reports whether ownership-aware workspace cleanup completed. Failed

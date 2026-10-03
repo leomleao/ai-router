@@ -324,6 +324,84 @@ def sdk_contracts():
     client.close()
 
 
+def token_budget_contracts():
+    client = OpenAI(api_key=MODEL_KEY, base_url=BASE + "/v1", max_retries=0, timeout=8)
+    status, _, body = http("/v1/capabilities")
+    budget = json.loads(body)["profiles"]["model"]["output_token_budget"]
+    check(status == 200 and budget == {"mode": "prompt_guidance", "hard_limit": False,
+          "limits_reasoning_tokens": False, "parameters": ["max_output_tokens", "max_tokens", "max_completion_tokens"]},
+          "Capabilities describe approximate visible-answer guidance without a reasoning/spending cap")
+    for field in ("max_tokens", "max_completion_tokens", "max_output_tokens"):
+        responses = field == "max_output_tokens"
+        create = client.responses.with_raw_response.create if responses else client.chat.completions.with_raw_response.create
+        base = ({"model": MODEL, "input": "Reply with OK.", "store": False,
+                 "text": {"format": {"type": "text"}, "verbosity": "medium"}} if responses else
+                {"model": MODEL, "messages": [{"role": "user", "content": "Reply with OK."}], "verbosity": "medium"})
+        for value in (1, 8, 16):
+            raw = create(**base, **{field: value})
+            result = raw.parse()
+            check(raw.headers.get("x-ai-router-token-budget-mode") == "prompt-guidance", f"{field}={value} advertises best-effort mode")
+            text = result.output_text if responses else result.choices[0].message.content
+            check(text == "Hello from fixture" and result.usage.total_tokens == 23, f"{field}={value} preserves full output and observed usage")
+            check(result.status == "completed" if responses else result.choices[0].finish_reason == "stop",
+                  f"{field}={value} does not fabricate length/incomplete completion")
+            if value == 1:
+                observed_output = result.usage.output_tokens if responses else result.usage.completion_tokens
+                check(observed_output > value, f"{field}: observed usage may exceed the length hint")
+
+        # Budget-bearing streaming and strict schema requests retain their
+        # existing wire contract and never truncate JSON to satisfy guidance.
+        raw = create(**base, **{field: 8, "stream": True}, **({} if responses else {"stream_options": {"include_usage": True}}))
+        events = list(raw.parse())
+        check(raw.headers.get("x-ai-router-token-budget-mode") == "prompt-guidance", f"{field} SSE advertises best-effort mode")
+        if responses:
+            final = events[-1].response
+            check(events[-1].type == "response.completed" and final.status == "completed" and final.usage.total_tokens == 23,
+                  "Budgeted Responses stream preserves successful terminal usage")
+            check("".join(event.delta for event in events if event.type == "response.output_text.delta") == "Hello from fixture",
+                  "Budgeted Responses stream preserves every text delta")
+            schema = {"text": {"format": {"type": "json_schema", "name": "answer", "schema": SCHEMA, "strict": True}, "verbosity": "medium"}}
+        else:
+            check(events[-1].usage.total_tokens == 23 and any(chunk.choices and chunk.choices[0].finish_reason == "stop" for chunk in events),
+                  f"{field} stream retains observed usage and stop reason")
+            check("".join(chunk.choices[0].delta.content or "" for chunk in events if chunk.choices) == "Hello from fixture",
+                  f"{field} stream preserves every text delta")
+            schema = {"response_format": {"type": "json_schema", "json_schema": {"name": "answer", "schema": SCHEMA, "strict": True}}}
+        raw = create(**(base | schema | {field: 16}))
+        result = raw.parse()
+        text = result.output_text if responses else result.choices[0].message.content
+        check(json.loads(text) == {"count": 1} and result.usage.total_tokens == 23,
+              f"{field} guidance preserves valid strict JSON and usage")
+        check(raw.headers.get("x-ai-router-token-budget-mode") == "prompt-guidance", f"{field} schema advertises best-effort mode")
+
+        raw = create(**base, **{field: None})
+        check(raw.headers.get("x-ai-router-token-budget-mode") is None, f"Null {field} remains equivalent to omission")
+        for malformed in (0, -1, 1.0, 1.5, "8", True, [], {}):
+            try:
+                create(**base, **{field: malformed})
+                raise AssertionError(f"Malformed {field} accepted: {malformed!r}")
+            except openai.BadRequestError as error:
+                check(error.status_code == 400 and error.code == "invalid_request", f"Malformed {field} yields SDK BadRequestError")
+
+    result = client.responses.create(model=MODEL, input="Reply with OK.", store=False, max_output_tokens=1)
+    check(result.usage.output_tokens == 3 and result.status == "completed" and result.output_text == "Hello from fixture",
+          "One-token guidance does not clamp actual three-token fixture usage or truncate output")
+    try:
+        client.chat.completions.create(model=MODEL, messages=[{"role": "user", "content": "Reply with OK."}],
+                                       max_tokens=8, max_completion_tokens=16)
+        raise AssertionError("Conflicting Chat budgets accepted")
+    except openai.BadRequestError as error:
+        check(error.status_code == 400 and error.code == "invalid_request", "Non-null Chat budget aliases are mutually exclusive")
+    client.close()
+
+
+def n8n_sdk_contracts():
+    result = subprocess.run(["/usr/local/bin/node", "/opt/n8n-contract/n8n_contract.mjs"],
+                            text=True, capture_output=True, timeout=40)
+    check(result.returncode == 0, "n8n Vercel SDK contract failed:\n" + result.stdout + result.stderr)
+    print(result.stdout.strip())
+
+
 def policy_contracts():
     before = wait_idle()
     status, _, _ = http("/v1/chat/completions", b"{malformed", key="wrong-key")
@@ -413,6 +491,8 @@ def main():
     server = start()
     try:
         sdk_contracts()
+        token_budget_contracts()
+        n8n_sdk_contracts()
         policy_contracts()
     finally:
         stop(server)

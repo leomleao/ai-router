@@ -100,11 +100,27 @@ For the n8n Assistant, set the custom model endpoint and API key according to
 Its separate assistant sandbox is still required. For Hermes, select its
 OpenAI-compatible/custom endpoint provider and a discovered model ID.
 
-The gateway rejects active sampling/token-budget controls that AGY cannot
-honour. Configure clients without `temperature`, `top_p`, `max_tokens`,
-`max_completion_tokens`, or `max_output_tokens`. Null SDK defaults are accepted.
+The gateway rejects active sampling controls such as `temperature` and `top_p`.
+Responses `max_output_tokens` and Chat `max_tokens` or `max_completion_tokens`
+accept positive integer budgets as **best-effort answer-length instructions**.
+AGY has no verified hard generation-token cap: answers may exceed the requested
+budget, and these fields do not cap reasoning tokens or account usage. Output,
+JSON and tool calls are never cut to fit the hint, and reported usage remains
+the actual provider usage. Successful budget-bearing responses include
+`X-AI-Router-Token-Budget-Mode: prompt-guidance`; `/v1/capabilities` reports the
+same limitation. Omitted/null budgets add no instructions. Supplying both Chat
+budget fields is rejected. This allows n8n's built-in connection probe, which
+always sets a token budget, to reach the provider.
 Parallel tool calls are permitted in requests, but this adapter returns at most
 one call per turn. Forced/required tool selection is currently unsupported.
+
+In n8n Chat, select tools for the current conversation; creating a tool in the
+library alone does not attach it to an existing chat. Each gateway request
+uses its current supplied client-tool catalogue, including an empty catalogue.
+AGY native tools such as `manage_task` are not available client tools. The
+model is instructed to answer tool-inventory questions from the current
+catalogue. Container `model_request` logs record client-tool names/count so
+missing selections can be diagnosed without logging prompts or tool arguments.
 
 ## HTTP API
 
