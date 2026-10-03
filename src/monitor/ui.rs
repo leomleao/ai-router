@@ -1,5 +1,5 @@
 //! Interactive presentation of the same private snapshots used by --text/--json.
-use super::{Snapshot, get_snapshot};
+use super::{RequestRecord, Snapshot, get_snapshot};
 use chrono::{DateTime, Utc};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
@@ -9,8 +9,7 @@ use ratatui::{
     symbols::Marker,
     text::{Line, Span},
     widgets::{
-        Axis, Block, BorderType, Chart, Dataset, GraphType, Paragraph, Row, Table, TableState,
-        Tabs, Wrap,
+        Axis, Block, BorderType, Chart, Dataset, GraphType, Paragraph, Row, Table, TableState, Tabs,
     },
 };
 use std::{
@@ -29,6 +28,8 @@ struct App {
     light: bool,
     paused: bool,
     offset: usize,
+    expanded_request: bool,
+    detail_scroll: u16,
     refresh: bool,
     error: Option<String>,
 }
@@ -42,20 +43,31 @@ impl App {
             light: false,
             paused: false,
             offset: 0,
+            expanded_request: false,
+            detail_scroll: 0,
             refresh: false,
             error: None,
         }
     }
 
-    fn key(&mut self, key: KeyEvent, records: usize) -> bool {
+    fn key(&mut self, key: KeyEvent, records: usize, detail_scroll_limit: u16) -> bool {
         if key.kind != KeyEventKind::Press {
             return false;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return true;
         }
+        let previous_page = self.page;
+        let previous_offset = self.offset;
         match key.code {
+            KeyCode::Esc if self.expanded_request => self.expanded_request = false,
             KeyCode::Char('q') | KeyCode::Esc => return true,
+            KeyCode::Enter
+                if matches!(self.page, 0 | 3 | 4) && (records > 0 || self.expanded_request) =>
+            {
+                self.expanded_request = !self.expanded_request;
+                self.detail_scroll = 0;
+            }
             KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.light = !self.light
             }
@@ -80,6 +92,7 @@ impl App {
                 let current = RANGES.iter().position(|&v| v == self.range);
                 self.range = RANGES[current.map_or(0, |i| (i + 1) % RANGES.len())];
                 self.offset = 0;
+                self.detail_scroll = 0;
                 self.refresh = true;
             }
             KeyCode::Char(' ') => {
@@ -90,10 +103,26 @@ impl App {
                 self.offset = (self.offset + 1).min(records.saturating_sub(1))
             }
             KeyCode::Up | KeyCode::Char('k') => self.offset = self.offset.saturating_sub(1),
+            KeyCode::PageDown if self.expanded_request => {
+                self.detail_scroll = self
+                    .detail_scroll
+                    .saturating_add(5)
+                    .min(detail_scroll_limit);
+            }
+            KeyCode::PageUp if self.expanded_request => {
+                self.detail_scroll = self.detail_scroll.saturating_sub(5)
+            }
+            KeyCode::Home if self.expanded_request => self.detail_scroll = 0,
             KeyCode::PageDown => self.offset = (self.offset + 10).min(records.saturating_sub(1)),
             KeyCode::PageUp => self.offset = self.offset.saturating_sub(10),
             KeyCode::Home => self.offset = 0,
             _ => {}
+        }
+        if self.page != previous_page {
+            self.expanded_request = false;
+        }
+        if self.page != previous_page || self.offset != previous_offset {
+            self.detail_scroll = 0;
         }
         false
     }
@@ -227,7 +256,18 @@ pub(super) async fn run(socket: &Path, range: u64, mut snapshot: Snapshot) -> Re
                         .count(),
                     _ => snapshot.records.len(),
                 };
-                if app.key(key, rows) {
+                let size = terminal
+                    .size()
+                    .map_err(|e| format!("cannot inspect terminal: {e}"))?;
+                let detail_scroll_limit = selected_request(&snapshot, app.offset, app.page == 3)
+                    .map(|r| {
+                        request_detail_lines(r, size.width.saturating_sub(2), Palette::new(&app))
+                            .len()
+                            .saturating_sub(size.height.saturating_sub(7) as usize)
+                            .min(u16::MAX as usize) as u16
+                    })
+                    .unwrap_or(0);
+                if app.key(key, rows, detail_scroll_limit) {
                     return Ok(());
                 }
             }
@@ -315,13 +355,26 @@ fn draw(f: &mut Frame, app: &App, s: &Snapshot) {
         .divider("│"),
         tabs,
     );
-    match app.page {
-        0 => overview(f, body, s, app, p),
-        1 => usage(f, body, s, app, p),
-        2 => provider(f, body, s, app, p),
-        3 => errors(f, body, s, app, p),
-        4 => requests(f, body, s, app.offset, false, p),
-        _ => help(f, body, p),
+    if app.expanded_request {
+        if let Some(record) = selected_request(s, app.offset, app.page == 3) {
+            request_detail(f, body, record, app.detail_scroll, true, p);
+        } else {
+            f.render_widget(
+                Paragraph::new("No request in this range. Enter returns to the list.")
+                    .style(Style::default().fg(p.muted))
+                    .block(p.block(" Selected request ")),
+                body,
+            );
+        }
+    } else {
+        match app.page {
+            0 => overview(f, body, s, app, p),
+            1 => usage(f, body, s, app, p),
+            2 => provider(f, body, s, app, p),
+            3 => errors(f, body, s, app, p),
+            4 => requests(f, body, s, app.offset, false, p),
+            _ => help(f, body, p),
+        }
     }
     let message = if let Some(error) = &app.error {
         format!(" {error} · showing last snapshot; retrying every 2s")
@@ -351,10 +404,12 @@ fn draw(f: &mut Frame, app: &App, s: &Snapshot) {
         )),
         status,
     );
-    let keys = if area.width < 95 {
+    let keys = if app.expanded_request {
+        " ↑↓ request  PgUp/PgDn details  Enter/Esc collapse  q quit"
+    } else if area.width < 95 {
         " 1–6 pages  r range  ↑↓ scroll  Space pause  ? help  q quit"
     } else {
-        " Tab/1–6 pages  r range  ↑↓ scroll  Space pause  t theme  Ctrl+T light/dark  q quit"
+        " Tab/1–6 pages  r range  ↑↓ scroll  Enter details  Space pause  t theme  ? help  q quit"
     };
     f.render_widget(
         Paragraph::new(keys).style(Style::default().fg(p.border)),
@@ -363,15 +418,10 @@ fn draw(f: &mut Frame, app: &App, s: &Snapshot) {
 }
 
 fn overview(f: &mut Frame, area: Rect, s: &Snapshot, app: &App, p: Palette) {
+    let compact = area.height < 22;
     let [metrics, middle, recent] = Layout::vertical([
         Constraint::Length(4),
-        Constraint::Length(if area.height >= 22 {
-            9
-        } else if area.height < 15 {
-            6
-        } else {
-            7
-        }),
+        Constraint::Length(if compact { 0 } else { 7 }),
         Constraint::Min(3),
     ])
     .areas(area);
@@ -416,10 +466,13 @@ fn overview(f: &mut Frame, area: Rect, s: &Snapshot, app: &App, p: Palette) {
             *cell,
         );
     }
-    let [traffic, latency] =
-        Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)]).areas(middle);
-    traffic_chart(f, traffic, s, app.range, false, p);
-    latency_panel(f, latency, s, p);
+    if !compact {
+        let [traffic, latency] =
+            Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
+                .areas(middle);
+        traffic_chart(f, traffic, s, app.range, false, p);
+        latency_panel(f, latency, s, p);
+    }
     requests(f, recent, s, app.offset, false, p);
 }
 
@@ -766,9 +819,10 @@ fn provider(f: &mut Frame, area: Rect, s: &Snapshot, app: &App, p: Palette) {
 }
 
 fn errors(f: &mut Frame, area: Rect, s: &Snapshot, app: &App, p: Palette) {
+    let compact = area.height < 22;
     let [counters, middle, recent] = Layout::vertical([
         Constraint::Length(5),
-        Constraint::Length(7),
+        Constraint::Length(if compact { 0 } else { 7 }),
         Constraint::Min(3),
     ])
     .areas(area);
@@ -792,17 +846,20 @@ fn errors(f: &mut Frame, area: Rect, s: &Snapshot, app: &App, p: Palette) {
         .block(p.block(" Rejections since process start ")),
         counters,
     );
-    let [chart, codes] =
-        Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(middle);
-    traffic_chart(f, chart, s, app.range, true, p);
-    ranked(
-        f,
-        codes,
-        "Retained failure codes",
-        &s.aggregate.by_error,
-        0,
-        p,
-    );
+    if !compact {
+        let [chart, codes] =
+            Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
+                .areas(middle);
+        traffic_chart(f, chart, s, app.range, true, p);
+        ranked(
+            f,
+            codes,
+            "Retained failure codes",
+            &s.aggregate.by_error,
+            0,
+            p,
+        );
+    }
     requests(f, recent, s, app.offset, true, p);
 }
 
@@ -838,27 +895,16 @@ fn requests(f: &mut Frame, area: Rect, s: &Snapshot, offset: usize, failures: bo
     let offset = offset.min(records.len() - 1);
     let selected = records[offset];
     let [table_area, detail] = Layout::vertical([
-        Constraint::Min(0),
-        Constraint::Length(if area.height >= 10 { 4 } else { 0 }),
+        Constraint::Min(4),
+        Constraint::Length(if area.height >= 8 {
+            area.height.saturating_sub(4).min(12)
+        } else {
+            0
+        }),
     ])
     .areas(area);
     if detail.height > 0 {
-        f.render_widget(
-            Paragraph::new(vec![
-                Line::from(format!("{} · {}", selected.request_id, selected.endpoint))
-                    .style(Style::default().fg(p.info)),
-                Line::from(format!(
-                    "{} · {} · ready {} · first output {}",
-                    selected.client_id,
-                    selected.model,
-                    duration(selected.startup_ms),
-                    duration(selected.first_output_ms)
-                )),
-            ])
-            .wrap(Wrap { trim: true })
-            .block(p.block(" Selected request ")),
-            detail,
-        );
+        request_detail(f, detail, selected, 0, false, p);
     }
     let wide = area.width >= 100;
     let mut headers = vec!["Time UTC", "Client", "Model", "Duration", "Status"];
@@ -918,6 +964,144 @@ fn requests(f: &mut Frame, area: Rect, s: &Snapshot, offset: usize, failures: bo
     );
 }
 
+fn selected_request(s: &Snapshot, offset: usize, failures: bool) -> Option<&RequestRecord> {
+    let mut records = s
+        .records
+        .iter()
+        .rev()
+        .filter(|r| !failures || r.error_code.is_some());
+    records.nth(offset).or_else(|| {
+        s.records
+            .iter()
+            .find(|r| !failures || r.error_code.is_some())
+    })
+}
+
+fn request_detail_lines(record: &RequestRecord, width: u16, p: Palette) -> Vec<Line<'static>> {
+    let started = DateTime::parse_from_rfc3339(&record.started_at)
+        .map(|d| {
+            d.with_timezone(&Utc)
+                .format("%Y-%m-%d %H:%M:%S%.3f UTC")
+                .to_string()
+        })
+        .unwrap_or_else(|_| "unknown".into());
+    let ms = |value: Option<u64>| {
+        value
+            .map(|n| format!("{n}ms"))
+            .unwrap_or_else(|| "unknown".into())
+    };
+    let mut fields = vec![
+        (format!("Request ID: {}", record.request_id), p.info),
+        (
+            format!("Client: {} · Model: {}", record.client_id, record.model),
+            p.text,
+        ),
+        (format!("Endpoint:   {}", record.endpoint), p.text),
+        (format!("Started:    {started}"), p.muted),
+        (
+            format!(
+                "Status:     {} · Error: {}",
+                record.status,
+                record.error_code.as_deref().unwrap_or("none")
+            ),
+            if record.error_code.is_some() {
+                p.bad
+            } else {
+                p.good
+            },
+        ),
+        (
+            format!(
+                "Latency: total {} · AGY ready {} · first output {}",
+                ms(Some(record.duration_ms)),
+                ms(record.startup_ms),
+                ms(record.first_output_ms)
+            ),
+            p.text,
+        ),
+    ];
+    if let Some(usage) = &record.usage {
+        fields.extend([
+            (
+                format!(
+                    "Usage:      {}",
+                    if record.usage_partial {
+                        "partial (totals may omit tokens)"
+                    } else {
+                        "complete"
+                    }
+                ),
+                if record.usage_partial {
+                    p.warn
+                } else {
+                    p.muted
+                },
+            ),
+            (
+                format!(
+                    "Tokens: input {} · output {} · total {}",
+                    usage.input_tokens, usage.output_tokens, usage.total_tokens
+                ),
+                p.accent,
+            ),
+            (
+                format!(
+                    "        thinking {} · cache read {}",
+                    usage.thinking_tokens, usage.cache_read_tokens
+                ),
+                p.accent,
+            ),
+        ]);
+    } else {
+        fields.push((
+            "Usage:      not reported · token counts unknown".into(),
+            p.muted,
+        ));
+    }
+    // Telemetry identifiers are ASCII. Wrap them explicitly so even long IDs can
+    // be read in full and expanded-view scrolling has an exact line count.
+    fields
+        .into_iter()
+        .flat_map(|(text, colour)| {
+            text.chars()
+                .collect::<Vec<_>>()
+                .chunks(width.max(1) as usize)
+                .map(|chunk| {
+                    Line::from(chunk.iter().collect::<String>()).style(Style::default().fg(colour))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn request_detail(
+    f: &mut Frame,
+    area: Rect,
+    record: &RequestRecord,
+    scroll: u16,
+    expanded: bool,
+    p: Palette,
+) {
+    let title = if expanded {
+        " Selected request · Enter/Esc collapse · PgUp/PgDn scroll "
+    } else {
+        " Selected request · Enter expand "
+    };
+    let block = p.block(title);
+    let inner = block.inner(area);
+    let lines = request_detail_lines(record, inner.width, p);
+    let max_scroll = lines
+        .len()
+        .saturating_sub(inner.height as usize)
+        .min(u16::MAX as usize) as u16;
+    f.render_widget(
+        Paragraph::new(lines)
+            .scroll((scroll.min(max_scroll), 0))
+            .block(block),
+        area,
+    );
+}
+
 fn help(f: &mut Frame, area: Rect, p: Palette) {
     f.render_widget(
         Paragraph::new(vec![
@@ -925,6 +1109,7 @@ fn help(f: &mut Frame, area: Rect, p: Palette) {
             Line::from("  Tab / ← → / 1–6   Switch pages"),
             Line::from("  ↑ ↓ / j k          Scroll events, failures, usage, or quota"),
             Line::from("  PgUp / PgDn / Home Jump through lists"),
+            Line::from("  Enter               Expand / collapse selected request details"),
             Line::from("  r                   Cycle 1h → 24h → 7d → 30d"),
             Line::from("  Space               Pause / resume automatic refresh"),
             Line::from("  t / Ctrl+T          Warm, cool, mono theme / light or dark colours"),
@@ -1043,16 +1228,132 @@ mod tests {
             KeyCode::Char('t'),
             KeyCode::PageDown,
         ] {
-            assert!(!app.key(KeyEvent::new(code, KeyModifiers::NONE), 3));
+            assert!(!app.key(KeyEvent::new(code, KeyModifiers::NONE), 3, 0));
         }
         assert_eq!(
             (app.page, app.range, app.theme, app.offset),
             (1, 604800, 1, 2)
         );
         assert!(app.paused);
-        assert!(!app.key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL), 3));
+        assert!(!app.key(
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            3,
+            0
+        ));
         assert!(app.light);
-        assert!(app.key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE), 3));
+        assert!(app.key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE), 3, 0));
+    }
+
+    #[tokio::test]
+    async fn selected_request_shows_full_metadata_and_honest_usage_with_expandable_details() {
+        let mut snapshot = fixture().await;
+        let record = snapshot.records.last_mut().unwrap();
+        record.error_code = Some("provider_timeout".into());
+        record.status = "failed".into();
+        record.usage = Some(crate::protocol::Usage {
+            input_tokens: 12000,
+            output_tokens: 345,
+            total_tokens: 12345,
+            thinking_tokens: 67,
+            cache_read_tokens: 890,
+        });
+        let mut app = App::new(86400);
+        for partial in [false, true] {
+            snapshot.records.last_mut().unwrap().usage_partial = partial;
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            terminal.draw(|f| draw(f, &app, &snapshot)).unwrap();
+            let screen = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
+            for value in [
+                "Request ID: req-29",
+                "Client: demo-client",
+                "Model: gemini-demo",
+                "/v1/responses",
+                "Started:",
+                "failed",
+                "provider_timeout",
+                "total 1234ms",
+                "AGY ready 80ms",
+                "first output 130ms",
+                "input 12000",
+                "output 345",
+                "total 12345",
+                "thinking 67",
+                "cache read 890",
+            ] {
+                assert!(screen.contains(value), "missing {value}");
+            }
+            assert!(screen.contains(if partial {
+                "partial (totals may omit tokens)"
+            } else {
+                "complete"
+            }));
+        }
+        let record = snapshot.records.last_mut().unwrap();
+        record.request_id = "r".repeat(80);
+        record.client_id = "c".repeat(64);
+        record.model = "m".repeat(128);
+        record.endpoint = format!("/{}", "e".repeat(79));
+        record.error_code = Some("x".repeat(80));
+        record.usage = None;
+        record.startup_ms = None;
+        record.first_output_ms = None;
+        let lines = request_detail_lines(record, 58, Palette::new(&app));
+        assert!(lines.iter().all(|line| line.width() <= 58));
+        let text = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(text.contains(&record.request_id) && text.contains(&record.model));
+        assert!(text.contains("token counts unknown") && text.contains("AGY ready unknown"));
+        assert!(!text.contains("input 0"));
+        let max_scroll = lines.len().saturating_sub(11) as u16;
+        assert!(max_scroll > 0);
+        assert!(!app.key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            30,
+            max_scroll
+        ));
+        assert!(app.expanded_request);
+        for _ in 0..5 {
+            app.key(
+                KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+                30,
+                max_scroll,
+            );
+        }
+        assert_eq!(app.detail_scroll, max_scroll);
+        let mut terminal = Terminal::new(TestBackend::new(60, 18)).unwrap();
+        terminal.draw(|f| draw(f, &app, &snapshot)).unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(screen.contains("token counts unknown"));
+        app.key(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            30,
+            max_scroll,
+        );
+        assert_eq!(app.detail_scroll, 0);
+        assert!(!app.key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            30,
+            max_scroll
+        ));
+        assert!(!app.expanded_request);
+        app.expanded_request = true;
+        assert!(!app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), 0, 0));
+        assert!(!app.expanded_request);
     }
 
     #[tokio::test]

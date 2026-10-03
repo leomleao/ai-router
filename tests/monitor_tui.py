@@ -126,6 +126,13 @@ def main():
                 assert "AI ROUTER" in "\n".join(screen.display) and "Requests over time" in "\n".join(screen.display)
                 os.write(master, b"j")
                 assert "demo-request-028" in receive().split("Selected request", 1)[1]
+                os.write(master, b"\r")
+                expanded = receive()
+                for value in ("demo-request-028", "Client:", "Model:", "Endpoint:", "Started:", "Status:",
+                              "Latency:", "Usage:", "input 800", "output 320", "total 1120", "thinking 20", "cache read 100"):
+                    assert value in expanded, value
+                os.write(master, b"\x1b")
+                assert "Recent requests" in receive()
                 for key, label in [(b"2", "Token usage"), (b"3", "Quota remaining"),
                                    (b"4", "Rejections since process start"), (b"5", "Selected request"), (b"6", "Navigate")]:
                     os.write(master, key)
@@ -148,6 +155,8 @@ def main():
                 fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
                 screen.resize(lines=24, columns=80)
                 assert "q quit" in receive()
+                os.write(master, b"\r")
+                assert "thinking 20" in receive()
                 os.write(master, exit_key)
                 receive()
                 assert process.wait(timeout=5) == 0

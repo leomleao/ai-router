@@ -128,7 +128,16 @@ It refreshes every two seconds and adapts to the terminal size.
 Use **Tab**, **←/→**, or **1–6** to change pages, **r** to cycle through
 1h/24h/7d/30d, **↑/↓** to scroll, and **Space** to pause or resume refresh.
 **t** cycles warm/cool/mono colours; **Ctrl+T** switches light/dark colours.
-**q**, **Esc**, or **Ctrl+C** exits and restores the terminal. Over SSH,
+
+The selected-request panel shows full identifiers, endpoint, UTC start time,
+status/error code, exact latency values, and observed token counts, with complete,
+partial, or unknown usage clearly labelled. **Enter** expands the panel;
+**PgUp/PgDn** scroll long details, **↑/↓** selects another request, and
+**Enter/Esc** returns to the request list. Short terminals prioritise the request
+list and details over the overview charts.
+
+**q** or **Ctrl+C** exits and restores the terminal; **Esc** also exits from
+the normal dashboard. Over SSH,
 allocate a terminal with `ssh -t leo@server '~/home-server-docker/ai-router/monitor.sh'`.
 If the private socket disconnects, the dashboard keeps the last snapshot visible
 and retries with a clear disconnected status.
