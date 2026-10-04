@@ -136,6 +136,21 @@ partial, or unknown usage clearly labelled. **Enter** expands the panel;
 **Enter/Esc** returns to the request list. Short terminals prioritise the request
 list and details over the overview charts.
 
+The expanded view includes the original request JSON (messages/input, tools,
+schemas, and parameters) and response JSON, including returned text and tool-call
+arguments. Streaming calls show the assembled final response; native calls show
+the final provider result. **a** shows all data, **i** the request, and **o** the
+response. **PgUp/PgDn** scrolls the selected view. The selected request stays
+selected while new calls arrive.
+
+Call data is retained for the latest 100 authenticated JSON calls in memory,
+up to 64 KiB per request and response; larger bodies are marked truncated.
+Restarting clears it. Older requests show their saved metadata with an explicit
+data-unavailable message. HTTP authentication headers are excluded; known
+credential fields (including JSON-encoded tool arguments) are redacted, and
+uploaded file bytes are omitted. These call bodies are retrieved on demand over
+the same private socket and are absent from telemetry files and `--json` snapshots.
+
 **q** or **Ctrl+C** exits and restores the terminal; **Esc** also exits from
 the normal dashboard. Over SSH,
 allocate a terminal with `ssh -t leo@server '~/home-server-docker/ai-router/monitor.sh'`.
@@ -160,7 +175,7 @@ is sampled to at most 30 records per minute. Retained-history request/failure
 aggregates therefore describe stored events, while these rejection counters
 include floods that are omitted from the history.
 
-Router telemetry does not include prompts, generated text, tool arguments,
+Persisted router telemetry does not include prompts, generated text, tool arguments,
 headers, credentials, or arbitrary provider error payloads. Records and
 aggregates use bounded identifiers/error codes. Persistence uses atomic mode
 0600 snapshots and batches updates every second so HTTP admission does not

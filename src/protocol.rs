@@ -39,11 +39,7 @@ impl ApiError {
             format!("{field} is not supported by the AGY adapter"),
         )
     }
-}
-
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        let status = StatusCode::from_u16(self.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    pub fn response_body(&self) -> Value {
         let error_type = match self.status {
             400 => "invalid_request_error",
             401 => "authentication_error",
@@ -51,13 +47,14 @@ impl IntoResponse for ApiError {
             429 => "rate_limit_error",
             _ => "server_error",
         };
-        (
-            status,
-            Json(
-                json!({"error": {"message": self.message, "type": error_type, "code": self.code}}),
-            ),
-        )
-            .into_response()
+        json!({"error":{"message":self.message,"type":error_type,"code":self.code}})
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let status = StatusCode::from_u16(self.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        (status, Json(self.response_body())).into_response()
     }
 }
 

@@ -1,5 +1,5 @@
 //! Interactive presentation of the same private snapshots used by --text/--json.
-use super::{RequestRecord, Snapshot, get_snapshot};
+use super::{CapturedPayload, RequestDetail, RequestRecord, Snapshot, get_detail, get_snapshot};
 use chrono::{DateTime, Utc};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
@@ -17,6 +17,7 @@ use std::{
     path::Path,
     time::{Duration, Instant},
 };
+use unicode_width::UnicodeWidthChar;
 
 const PAGES: [&str; 6] = ["Overview", "Usage", "Provider", "Errors", "Events", "Help"];
 const RANGES: [u64; 4] = [3600, 86400, 604800, 2592000];
@@ -30,6 +31,10 @@ struct App {
     offset: usize,
     expanded_request: bool,
     detail_scroll: u16,
+    call_data: Option<RequestDetail>,
+    loaded_request: Option<String>,
+    call_error: Option<String>,
+    data_view: usize,
     refresh: bool,
     error: Option<String>,
 }
@@ -45,6 +50,10 @@ impl App {
             offset: 0,
             expanded_request: false,
             detail_scroll: 0,
+            call_data: None,
+            loaded_request: None,
+            call_error: None,
+            data_view: 0,
             refresh: false,
             error: None,
         }
@@ -66,6 +75,16 @@ impl App {
                 if matches!(self.page, 0 | 3 | 4) && (records > 0 || self.expanded_request) =>
             {
                 self.expanded_request = !self.expanded_request;
+                self.detail_scroll = 0;
+                self.loaded_request = None;
+                self.data_view = 0;
+            }
+            KeyCode::Char('a' | 'i' | 'o') if self.expanded_request => {
+                self.data_view = match key.code {
+                    KeyCode::Char('i') => 1,
+                    KeyCode::Char('o') => 2,
+                    _ => 0,
+                };
                 self.detail_scroll = 0;
             }
             KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -226,13 +245,46 @@ pub(super) async fn run(socket: &Path, range: u64, mut snapshot: Snapshot) -> Re
         if app.refresh || (!app.paused && last_refresh.elapsed() >= Duration::from_secs(2)) {
             match get_snapshot(socket, app.range).await {
                 Ok(next) => {
+                    if app.expanded_request {
+                        if let Some(selected) =
+                            selected_request(&snapshot, app.offset, app.page == 3)
+                        {
+                            if let Some(offset) = next
+                                .records
+                                .iter()
+                                .rev()
+                                .filter(|r| app.page != 3 || r.error_code.is_some())
+                                .position(|r| r.request_id == selected.request_id)
+                            {
+                                app.offset = offset;
+                            }
+                        }
+                    }
                     snapshot = next;
                     app.error = None;
+                    if app.call_error.is_some() {
+                        app.loaded_request = None;
+                    }
                 }
                 Err(error) => app.error = Some(error),
             }
             app.refresh = false;
             last_refresh = Instant::now();
+        }
+        if app.expanded_request {
+            if let Some(record) = selected_request(&snapshot, app.offset, app.page == 3) {
+                if app.loaded_request.as_deref() != Some(&record.request_id) {
+                    app.call_data = None;
+                    match get_detail(socket, &record.request_id).await {
+                        Ok(detail) => {
+                            app.call_data = detail;
+                            app.call_error = None;
+                        }
+                        Err(error) => app.call_error = Some(error),
+                    }
+                    app.loaded_request = Some(record.request_id.clone());
+                }
+            }
         }
         terminal
             .draw(|f| draw(f, &app, &snapshot))
@@ -261,10 +313,15 @@ pub(super) async fn run(socket: &Path, range: u64, mut snapshot: Snapshot) -> Re
                     .map_err(|e| format!("cannot inspect terminal: {e}"))?;
                 let detail_scroll_limit = selected_request(&snapshot, app.offset, app.page == 3)
                     .map(|r| {
-                        request_detail_lines(r, size.width.saturating_sub(2), Palette::new(&app))
-                            .len()
-                            .saturating_sub(size.height.saturating_sub(7) as usize)
-                            .min(u16::MAX as usize) as u16
+                        expanded_detail_lines(
+                            r,
+                            &app,
+                            size.width.saturating_sub(2),
+                            Palette::new(&app),
+                        )
+                        .len()
+                        .saturating_sub(size.height.saturating_sub(7) as usize)
+                        .min(u16::MAX as usize) as u16
                     })
                     .unwrap_or(0);
                 if app.key(key, rows, detail_scroll_limit) {
@@ -357,7 +414,19 @@ fn draw(f: &mut Frame, app: &App, s: &Snapshot) {
     );
     if app.expanded_request {
         if let Some(record) = selected_request(s, app.offset, app.page == 3) {
-            request_detail(f, body, record, app.detail_scroll, true, p);
+            let lines = expanded_detail_lines(record, app, body.width.saturating_sub(2), p);
+            let max_scroll = lines
+                .len()
+                .saturating_sub(body.height.saturating_sub(2) as usize)
+                .min(u16::MAX as usize) as u16;
+            f.render_widget(
+                Paragraph::new(lines)
+                    .scroll((app.detail_scroll.min(max_scroll), 0))
+                    .block(p.block(
+                        " Call details · a all · i request · o response · PgUp/PgDn scroll ",
+                    )),
+                body,
+            );
         } else {
             f.render_widget(
                 Paragraph::new("No request in this range. Enter returns to the list.")
@@ -405,7 +474,7 @@ fn draw(f: &mut Frame, app: &App, s: &Snapshot) {
         status,
     );
     let keys = if app.expanded_request {
-        " ↑↓ request  PgUp/PgDn details  Enter/Esc collapse  q quit"
+        " ↑↓ request  a/i/o data  PgUp/PgDn scroll  Enter back  q quit"
     } else if area.width < 95 {
         " 1–6 pages  r range  ↑↓ scroll  Space pause  ? help  q quit"
     } else {
@@ -1102,6 +1171,76 @@ fn request_detail(
     );
 }
 
+fn wrap_data(text: &str, width: u16, colour: Color) -> Vec<Line<'static>> {
+    let width = width.max(1) as usize;
+    let mut lines = Vec::new();
+    for source in text.lines() {
+        let mut line = String::new();
+        let mut used = 0;
+        for c in source.chars().filter(|c| !c.is_control()) {
+            let cells = c.width().unwrap_or(0);
+            if used + cells > width && !line.is_empty() {
+                lines
+                    .push(Line::from(std::mem::take(&mut line)).style(Style::default().fg(colour)));
+                used = 0;
+            }
+            line.push(c);
+            used += cells;
+        }
+        lines.push(Line::from(line).style(Style::default().fg(colour)));
+    }
+    lines
+}
+
+fn expanded_detail_lines(
+    record: &RequestRecord,
+    app: &App,
+    width: u16,
+    p: Palette,
+) -> Vec<Line<'static>> {
+    let mut lines = request_detail_lines(record, width, p);
+    lines.push(Line::from(""));
+    let Some(detail) = app
+        .call_data
+        .as_ref()
+        .filter(|d| d.request_id == record.request_id)
+    else {
+        let message = app.call_error.as_ref().map(|e| format!("Call data unavailable: {e}"))
+            .unwrap_or_else(|| "Call data was not retained. Capture covers the latest 100 calls in this server process; older calls and calls before a restart have metadata only.".into());
+        lines.extend(wrap_data(&message, width, p.warn));
+        return lines;
+    };
+    let append =
+        |lines: &mut Vec<Line<'static>>, title: String, payload: &CapturedPayload, colour| {
+            lines.extend(wrap_data(&title, width, p.border));
+            lines.extend(wrap_data(&payload.json, width, colour));
+            if payload.truncated {
+                lines.extend(wrap_data("[Truncated after 64 KiB]", width, p.warn));
+            }
+            lines.push(Line::from(""));
+        };
+    if app.data_view != 2 {
+        append(
+            &mut lines,
+            format!("REQUEST · POST {}", detail.endpoint),
+            &detail.request,
+            p.info,
+        );
+    }
+    if app.data_view != 1 {
+        if let Some(response) = &detail.response {
+            append(&mut lines, "RESPONSE · final data".into(), response, p.text);
+        } else {
+            lines.extend(wrap_data(
+                "RESPONSE · no final response was captured",
+                width,
+                p.muted,
+            ));
+        }
+    }
+    lines
+}
+
 fn help(f: &mut Frame, area: Rect, p: Palette) {
     f.render_widget(
         Paragraph::new(vec![
@@ -1110,6 +1249,7 @@ fn help(f: &mut Frame, area: Rect, p: Palette) {
             Line::from("  ↑ ↓ / j k          Scroll events, failures, usage, or quota"),
             Line::from("  PgUp / PgDn / Home Jump through lists"),
             Line::from("  Enter               Expand / collapse selected request details"),
+            Line::from("  a / i / o           All data / request JSON / response JSON"),
             Line::from("  r                   Cycle 1h → 24h → 7d → 30d"),
             Line::from("  Space               Pause / resume automatic refresh"),
             Line::from("  t / Ctrl+T          Warm, cool, mono theme / light or dark colours"),
@@ -1370,5 +1510,41 @@ mod tests {
                 .sum::<f64>()
                 > total
         );
+    }
+
+    #[tokio::test]
+    async fn expanded_view_shows_real_json_and_switches_data_without_stale_requests() {
+        let snapshot = fixture().await;
+        let record = snapshot.records.last().unwrap();
+        let mut app = App::new(86400);
+        app.call_data = Some(RequestDetail {
+            request_id: record.request_id.clone(),
+            endpoint: "/v1/responses".into(),
+            request: CapturedPayload::capture(
+                &serde_json::json!({"input":"Weather in London?", "tools":[{"name":"weather"}]}),
+            ),
+            response: Some(CapturedPayload::capture(
+                &serde_json::json!({"output":"晴天", "tool_calls":[{"name":"weather","arguments":{"city":"London"}}]}),
+            )),
+        });
+        let text = |lines: Vec<Line<'static>>| {
+            lines
+                .into_iter()
+                .flat_map(|l| l.spans.into_iter())
+                .map(|s| s.content.into_owned())
+                .collect::<String>()
+        };
+        let p = Palette::new(&app);
+        let all = text(expanded_detail_lines(record, &app, 58, p));
+        assert!(all.contains("POST /v1/responses") && all.contains("Weather in London?"));
+        assert!(all.contains("tool_calls") && all.contains("晴天"));
+        app.data_view = 2;
+        let output = expanded_detail_lines(record, &app, 58, p);
+        assert!(output.iter().all(|line| line.width() <= 58));
+        let output = text(output);
+        assert!(!output.contains("Weather in London?") && output.contains("arguments"));
+        let another = &snapshot.records[0];
+        let missing = text(expanded_detail_lines(another, &app, 58, p));
+        assert!(missing.contains("Call data was not retained") && !missing.contains("晴天"));
     }
 }

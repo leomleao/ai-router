@@ -25,6 +25,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tower = { version = "0.5", features = ["util"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+unicode-width = "0.2"
 
 [dev-dependencies]
 http-body-util = "0.1"

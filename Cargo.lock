@@ -49,6 +49,7 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "tower",
+ "unicode-width 0.2.0",
  "uuid",
 ]
 

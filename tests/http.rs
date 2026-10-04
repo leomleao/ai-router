@@ -27,6 +27,66 @@ use tower::ServiceExt;
 
 const MODEL: &str = "gemini-3-pro";
 
+#[tokio::test]
+async fn monitor_captures_actual_call_json_and_streamed_final_output_without_persisting_bodies() {
+    let harness = Harness::new(|_| {}).await;
+    for streaming in [false, true] {
+        for path in ["/v1/chat/completions", "/v1/responses"] {
+            let body = if path.ends_with("completions") {
+                json!({"model":MODEL,"messages":[{"role":"user","content":"Synthetic monitor input"}],"stream":streaming})
+            } else {
+                json!({"model":MODEL,"input":"Synthetic monitor input","stream":streaming})
+            };
+            let response = harness
+                .send(Method::POST, path, Some(body.clone()), Some("test-key"))
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let id = response.headers()["x-request-id"]
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let wire = response.into_body().collect().await.unwrap().to_bytes();
+            assert!(harness.state.drain(Duration::from_secs(5)).await);
+            let detail = harness.state.telemetry.request_detail(&id).await.unwrap();
+            assert_eq!(detail.endpoint, path);
+            assert_eq!(
+                serde_json::from_str::<Value>(&detail.request.json).unwrap(),
+                body
+            );
+            let output = detail.response.unwrap();
+            assert!(!output.truncated && !output.json.contains("test-key"));
+            let captured: Value = serde_json::from_str(&output.json).unwrap();
+            assert_eq!(captured["model"], MODEL);
+            if !streaming {
+                assert_eq!(captured, serde_json::from_slice::<Value>(&wire).unwrap());
+            } else {
+                assert!(captured.get("choices").is_some() || captured.get("output").is_some());
+            }
+        }
+    }
+    harness.state.telemetry.flush().await;
+    let metadata =
+        std::fs::read_to_string(harness.state.config.telemetry_dir.join("telemetry.json")).unwrap();
+    assert!(!metadata.contains("Synthetic monitor input"));
+    let response = harness
+        .send(
+            Method::POST,
+            "/v1/responses",
+            Some(json!({"model":MODEL,"input":"bad","unknown":true})),
+            Some("test-key"),
+        )
+        .await;
+    let id = response.headers()["x-request-id"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let detail = harness.state.telemetry.request_detail(&id).await.unwrap();
+    let wire = response.into_body().collect().await.unwrap().to_bytes();
+    let captured: Value = serde_json::from_str(&detail.response.unwrap().json).unwrap();
+    assert_eq!(captured, serde_json::from_slice::<Value>(&wire).unwrap());
+    assert_eq!(captured["error"]["code"], "unsupported_parameter");
+}
+
 struct Harness {
     root: tempfile::TempDir,
     state: Arc<AppState>,

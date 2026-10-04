@@ -203,6 +203,10 @@ pub async fn create(
         files,
     };
     let task_state = state.clone();
+    state
+        .telemetry
+        .capture_request(&job.id, "/v1/agy/runs", &body)
+        .await;
     let task_job = job.clone();
     tokio::spawn(async move {
         execute(task_state, task_job, key, request, admission).await;

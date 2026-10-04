@@ -9,7 +9,7 @@ synthetic keys/state.
 | --- | --- |
 | P0 plan before implementation | Initial plan/interface commit |
 | Official Linux CLI pin | Google download SHA512 checked; Linux ARM64 binary reports 1.2.15 |
-| Rust/runner/monitor/HTTP fixtures | Docker suite: 73 passed (43 unit, 20 HTTP, 10 runner), 0 failed |
+| Rust/runner/monitor/HTTP fixtures | Docker suite: 83 passed (51 unit, 21 HTTP, 11 runner), 0 failed |
 | Interactive monitor | All six pages at four terminal sizes; synthetic PTY checks for navigation, pause/range, disconnect/recovery, themes, resize, q/Ctrl+C cleanup, text/JSON |
 | Local Docker restrictions | Nonroot UID 10001, read-only root, loopback origin, separate named volumes/tmpfs verified |
 | Secret-path build policy | Synthetic banned paths excluded before context transfer |

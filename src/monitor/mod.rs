@@ -1,4 +1,4 @@
-//! Private, read-only operational telemetry. Payloads never enter this module.
+//! Private operational telemetry. Call payloads stay in a bounded memory-only store.
 use crate::protocol::{ProviderStatus, Usage};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -17,7 +17,9 @@ use tokio_util::sync::CancellationToken;
 const MAX_STORE_BYTES: u64 = 64 * 1024 * 1024;
 const PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 
+mod payload;
 mod ui;
+pub use payload::{CapturedPayload, RequestDetail};
 
 /// Unsampled rejection counters for this process only. Neither the retained
 /// history window nor the monitor client's range filter changes these totals.
@@ -112,6 +114,7 @@ impl Default for State {
 }
 
 pub struct Telemetry {
+    details: Mutex<VecDeque<RequestDetail>>,
     state: Arc<Mutex<State>>,
     store: PathBuf,
     retention_days: u64,
@@ -171,6 +174,7 @@ impl Telemetry {
         }
         prune(&mut state.records, retention_days, max_events);
         Ok(Self {
+            details: Mutex::new(VecDeque::new()),
             state: Arc::new(Mutex::new(state)),
             store,
             retention_days,
@@ -229,6 +233,42 @@ impl Telemetry {
             busy,
             other,
         }
+    }
+
+    pub async fn capture_request(&self, id: &str, endpoint: &str, body: &serde_json::Value) {
+        let detail = RequestDetail {
+            request_id: identifier(id, 80),
+            endpoint: identifier(endpoint, 80),
+            request: CapturedPayload::capture(body),
+            response: None,
+        };
+        let mut details = self.details.lock().await;
+        details.retain(|existing| existing.request_id != detail.request_id);
+        details.push_back(detail);
+        if details.len() > payload::MAX_DETAILS {
+            details.pop_front();
+        }
+    }
+
+    pub async fn finish_detail(&self, id: &str, response: Option<CapturedPayload>) {
+        if let Some(detail) = self
+            .details
+            .lock()
+            .await
+            .iter_mut()
+            .find(|d| d.request_id == id)
+        {
+            detail.response = response;
+        }
+    }
+
+    pub async fn request_detail(&self, id: &str) -> Option<RequestDetail> {
+        self.details
+            .lock()
+            .await
+            .iter()
+            .find(|d| d.request_id == id)
+            .cloned()
     }
 
     pub async fn record(&self, record: RequestRecord) {
@@ -637,11 +677,16 @@ pub async fn serve(
                         loop {
                             let byte = stream.read_u8().await?;
                             if byte == b'\n' { break }
-                            if command.len() >= 16 { return Ok::<_, std::io::Error>(()) }
+                            if command.len() >= 96 { return Ok::<_, std::io::Error>(()) }
                             command.push(byte);
                         }
                         if command == b"snapshot" {
                             let mut json = serde_json::to_vec(&telemetry.snapshot().await).map_err(std::io::Error::other)?;
+                            json.push(b'\n');
+                            stream.write_all(&json).await?;
+                        } else if let Some(id) = command.strip_prefix(b"detail ").and_then(|id| std::str::from_utf8(id).ok()) {
+                            if id.is_empty() || identifier(id, 80) != id { return Ok(()) }
+                            let mut json = serde_json::to_vec(&telemetry.request_detail(id).await).map_err(std::io::Error::other)?;
                             json.push(b'\n');
                             stream.write_all(&json).await?;
                         }
@@ -657,6 +702,34 @@ pub struct MonitorArgs {
     pub json: bool,
     pub text: bool,
     pub range_seconds: u64,
+}
+
+async fn get_detail(socket: &Path, id: &str) -> Result<Option<RequestDetail>, String> {
+    validate_path(socket)?;
+    if id.is_empty() || identifier(id, 80) != id {
+        return Err("invalid request ID".into());
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut stream = UnixStream::connect(socket)
+            .await
+            .map_err(|_| "monitor is unavailable".to_string())?;
+        stream
+            .write_all(format!("detail {id}\n").as_bytes())
+            .await
+            .map_err(|_| "detail write failed".to_string())?;
+        let mut data = Vec::new();
+        stream
+            .take(1024 * 1024 + 1)
+            .read_to_end(&mut data)
+            .await
+            .map_err(|_| "detail read failed".to_string())?;
+        if data.len() > 1024 * 1024 {
+            return Err("request detail exceeds limit".into());
+        }
+        serde_json::from_slice(&data).map_err(|_| "invalid request detail".into())
+    })
+    .await
+    .map_err(|_| "request detail timed out".to_string())?
 }
 
 async fn get_snapshot(socket: &Path, range_seconds: u64) -> Result<Snapshot, String> {
@@ -927,7 +1000,7 @@ mod tests {
         telemetry.record(record("test")).await;
         let socket = dir.path().join("monitor.sock");
         let cancel = CancellationToken::new();
-        let server = tokio::spawn(serve(telemetry, socket.clone(), cancel.clone()));
+        let server = tokio::spawn(serve(telemetry.clone(), socket.clone(), cancel.clone()));
         for _ in 0..50 {
             if socket.exists() {
                 break;
@@ -946,6 +1019,23 @@ mod tests {
                 .requests,
             1
         );
+        telemetry
+            .capture_request(
+                "test",
+                "/v1/responses",
+                &serde_json::json!({"input":"synthetic call"}),
+            )
+            .await;
+        assert!(
+            get_detail(&socket, "test")
+                .await
+                .unwrap()
+                .unwrap()
+                .request
+                .json
+                .contains("synthetic call")
+        );
+        assert!(get_detail(&socket, "missing").await.unwrap().is_none());
         let mut stream = UnixStream::connect(&socket).await.unwrap();
         stream.write_all(b"delete\n").await.unwrap();
         let mut data = Vec::new();

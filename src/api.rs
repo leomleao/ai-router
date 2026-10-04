@@ -1,7 +1,7 @@
 use crate::{
     auth::{self, RateLimiter},
     config::{Config, KeyConfig},
-    monitor::{RequestRecord, Telemetry},
+    monitor::{CapturedPayload, RequestRecord, Telemetry},
     native::{self, RunStore},
     protocol::*,
     runner::Runner,
@@ -540,6 +540,38 @@ async fn generate(
             "Expected a bounded JSON request body",
         )
     })?;
+    state
+        .telemetry
+        .capture_request(
+            &context.id,
+            if responses {
+                "/v1/responses"
+            } else {
+                "/v1/chat/completions"
+            },
+            &body,
+        )
+        .await;
+    let result = generate_body(state.clone(), key, context.clone(), body, responses).await;
+    if let Err(error) = &result {
+        state
+            .telemetry
+            .finish_detail(
+                &context.id,
+                Some(CapturedPayload::capture(&error.response_body())),
+            )
+            .await;
+    }
+    result
+}
+
+async fn generate_body(
+    state: Arc<AppState>,
+    key: KeyConfig,
+    context: Arc<RequestContext>,
+    body: Value,
+    responses: bool,
+) -> Result<Response, ApiError> {
     let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let has_token_budget = ["max_output_tokens", "max_tokens", "max_completion_tokens"]
         .iter()
@@ -595,6 +627,7 @@ async fn generate(
                     } else {
                         chat_object(&completion_id, created, &model, &result)
                     };
+                    guard.capture_response(&output);
                     return Ok(token_budget_response(
                         Json(output).into_response(),
                         has_token_budget,
@@ -614,11 +647,16 @@ async fn generate(
     }
     let stream = async_stream::stream! {
         let mut guard = guard;
-        let mut render = StreamRenderer::new(responses, completion_id, model, created, include_usage);
+        let mut render = StreamRenderer::new(responses, completion_id.clone(), model.clone(), created, include_usage);
         for item in render.begin() { yield Ok::<Event,Infallible>(item); }
         let mut terminal = false;
         while let Some(event) = run.events.recv().await {
             guard.observe(&event);
+            if let RunEvent::Completed(result) = &event {
+                let output = if responses { response_object(&completion_id, created, &model, result) }
+                    else { chat_object(&completion_id, created, &model, result) };
+                guard.capture_response(&output);
+            }
             terminal = matches!(&event, RunEvent::Completed(_) | RunEvent::Error(_));
             for item in render.event(event) { yield Ok(item); }
             if terminal { break; }
@@ -676,6 +714,7 @@ pub fn response_object(id: &str, created: i64, model: &str, result: &RunResult) 
 }
 
 pub struct CompletionGuard {
+    response: Option<CapturedPayload>,
     state: Arc<AppState>,
     record: RequestRecord,
     started: Instant,
@@ -700,6 +739,7 @@ impl CompletionGuard {
         admission: Admission,
     ) -> Self {
         Self {
+            response: None,
             state,
             record: RequestRecord {
                 request_id,
@@ -726,6 +766,9 @@ impl CompletionGuard {
     pub fn preserve_workspace(&mut self) {
         self.workspace = None;
     }
+    pub fn capture_response(&mut self, value: &Value) {
+        self.response = Some(CapturedPayload::capture(value));
+    }
     pub fn observe(&mut self, event: &RunEvent) {
         if matches!(event, RunEvent::Init { .. }) && self.record.startup_ms.is_none() {
             self.record.startup_ms = Some(self.started.elapsed().as_millis() as u64);
@@ -737,12 +780,14 @@ impl CompletionGuard {
         }
         match event {
             RunEvent::Completed(result) => {
+                self.capture_response(&json!(result));
                 self.record.status = "success".into();
                 self.record.error_code = None;
                 self.record.usage = result.usage.clone();
                 self.record.usage_partial = result.usage_partial;
             }
             RunEvent::Error(e) => {
+                self.capture_response(&e.response_body());
                 self.record.status = if e.code == "request_cancelled" {
                     "cancelled"
                 } else {
@@ -761,6 +806,7 @@ impl Drop for CompletionGuard {
         self.cancel.cancel();
         self.record.duration_ms = self.started.elapsed().as_millis() as u64;
         let record = self.record.clone();
+        let response = self.response.take();
         let state = self.state.clone();
         let workspace = self.workspace.take();
         let workspace_owned = self.workspace_owned.clone();
@@ -770,6 +816,10 @@ impl Drop for CompletionGuard {
             let stopped = tokio::time::timeout(Duration::from_secs(30), finished.cancelled())
                 .await
                 .is_ok();
+            state
+                .telemetry
+                .finish_detail(&record.request_id, response)
+                .await;
             state.telemetry.record(record).await;
             if stopped && workspace_owned.load(Ordering::Acquire) {
                 if let Some(workspace) = workspace {

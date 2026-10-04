@@ -197,8 +197,10 @@ feature works headlessly; use the [capability matrix](docs/capabilities.md).
 - Named volumes preserve AGY state and monitor metadata. Temporary workspaces
   use tmpfs. AGY itself can persist conversations/logs in its state home: the
   AGY volume is sensitive, not a promise of login-only storage.
-- Router telemetry contains request IDs, client IDs, models, timings, errors
-  and observed usage, never prompts, completions, arguments or auth headers.
+- Persisted telemetry contains request IDs, client IDs, models, timings, errors
+  and observed usage. The private monitor also retains request/response JSON for
+  the latest 100 calls in memory, up to 64 KiB per body, cleared on restart.
+  Authentication headers are excluded; known credential fields are redacted.
   Incomplete usage is marked partial; missing usage is null, not invented zero.
 - Rejection counters count attempts since startup. Detailed preflight rejection
   records are sampled at 30 per minute, keeping sustained rejected traffic from

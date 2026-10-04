@@ -80,6 +80,8 @@ def main():
         server.settimeout(.1)
         stop = threading.Event()
         disconnected = threading.Event()
+        detail_retry = threading.Event()
+        detail_retry.set()
         served = []
         snapshot = fixture()
 
@@ -90,10 +92,22 @@ def main():
                 except socket.timeout:
                     continue
                 with conn:
-                    assert conn.recv(32) == b"snapshot\n"
-                    served.append(time.monotonic())
-                    if not disconnected.is_set():
-                        conn.sendall(json.dumps(snapshot).encode())
+                    command = conn.recv(128)
+                    if command == b"snapshot\n":
+                        served.append(time.monotonic())
+                        if not disconnected.is_set():
+                            conn.sendall(json.dumps(snapshot).encode())
+                    elif command.startswith(b"detail "):
+                        if detail_retry.is_set():
+                            detail_retry.clear()
+                            continue
+                        request_id = command.decode().strip().removeprefix("detail ")
+                        detail = {"request_id": request_id, "endpoint": "/v1/responses",
+                                  "request": {"json": json.dumps({"model": "gemini-3-pro", "input": "Synthetic call input: London weather"}, indent=2), "truncated": False},
+                                  "response": {"json": json.dumps({"output": "Synthetic call output: sunny", "tool_calls": [{"name": "weather", "arguments": {"city": "London"}}]}, indent=2), "truncated": False}}
+                        conn.sendall(json.dumps(detail).encode())
+                    else:
+                        raise AssertionError(command)
 
         worker = threading.Thread(target=serve, daemon=True)
         worker.start()
@@ -108,11 +122,11 @@ def main():
 
         for exit_key in (b"q", b"\x03"):
             master, slave = pty.openpty()
-            fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 36, 120, 0, 0))
+            fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 44, 120, 0, 0))
             original = termios.tcgetattr(slave)
             process = subprocess.Popen([binary, "monitor"], env=env, stdin=slave, stdout=slave, stderr=slave)
             transcript = bytearray()
-            screen = pyte.Screen(120, 36)
+            screen = pyte.Screen(120, 44)
             stream = pyte.Stream(screen)
             def receive(seconds=.3):
                 data = read_terminal(master, seconds)
@@ -127,10 +141,18 @@ def main():
                 os.write(master, b"j")
                 assert "demo-request-028" in receive().split("Selected request", 1)[1]
                 os.write(master, b"\r")
-                expanded = receive()
+                expanded = receive(2.5)
                 for value in ("demo-request-028", "Client:", "Model:", "Endpoint:", "Started:", "Status:",
                               "Latency:", "Usage:", "input 800", "output 320", "total 1120", "thinking 20", "cache read 100"):
                     assert value in expanded, value
+                assert "Synthetic call input: London weather" in expanded
+                preview_transcript = bytes(transcript)
+                os.write(master, b"o")
+                output = receive()
+                assert "Synthetic call output: sunny" in output and "tool_calls" in output
+                assert "Synthetic call input: London weather" not in output
+                os.write(master, b"i")
+                assert "Synthetic call input: London weather" in receive()
                 os.write(master, b"\x1b")
                 assert "Recent requests" in receive()
                 for key, label in [(b"2", "Token usage"), (b"3", "Quota remaining"),
@@ -164,7 +186,7 @@ def main():
                 assert b"\x1b[?1049h" in transcript and b"\x1b[?1049l" in transcript
                 preview = os.environ.get("AI_ROUTER_MONITOR_PREVIEW")
                 if exit_key == b"q" and preview:
-                    pathlib.Path(preview).write_bytes(initial)
+                    pathlib.Path(preview).write_bytes(preview_transcript)
             finally:
                 if process.poll() is None:
                     process.kill()
