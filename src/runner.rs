@@ -28,10 +28,10 @@ use tokio_util::sync::CancellationToken;
 
 const AGENT_NAME: &str = "router-model";
 const SERVER_NAME: &str = "ai-router";
-const VERIFIED_AGY_VERSION: &str = "1.2.15";
+const VERIFIED_AGY_VERSION: &str = "1.3.5";
 const STDERR_LIMIT: usize = 64 * 1024;
 
-/// AGY 1.2.15 advertises its global CLI registry in init.tools, not the
+/// AGY 1.3.5 advertises its global CLI registry in init.tools, not the
 /// selected custom agent's effective tools. Its buildInitPayload calls
 /// advertisedTools with only the backend kind; the latter reads a global map.
 /// Verify that pinned protocol inventory before sending any user prompt.
@@ -46,7 +46,7 @@ fn verified_init_registry(tools: &[String]) -> bool {
     }
     static REGISTRY: std::sync::OnceLock<Registry> = std::sync::OnceLock::new();
     let registry = REGISTRY.get_or_init(|| {
-        serde_json::from_str(include_str!("agy-init-tools-1.2.15.json"))
+        serde_json::from_str(include_str!("agy-init-tools-1.3.5.json"))
             .expect("the compiled public AGY registry snapshot must be valid")
     });
     let expected: HashSet<_> = registry.tools.iter().map(String::as_str).collect();
@@ -133,11 +133,11 @@ impl Runner {
             return Err(internal("invalid_provider_path"));
         }
         if let Some(mode) = &request.mode {
-            if !matches!(mode.as_str(), "plan" | "accept-edits") {
+            if !matches!(mode.as_str(), "plan" | "accept-edits" | "auto") {
                 return Err(ApiError::new(
                     400,
                     "invalid_mode",
-                    "Native mode must be plan or accept-edits",
+                    "Native mode must be plan, accept-edits or auto",
                 ));
             }
         }

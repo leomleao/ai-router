@@ -4,7 +4,7 @@ Run the gateway in Docker with a loopback-only origin at `127.0.0.1:8090`.
 For remote access, configure an HTTPS reverse proxy on your own domain.
 Change the loopback port with `AI_ROUTER_PORT`.
 
-The image contains the official Linux AGY **1.2.15** executable. Installation
+The image contains the official Linux AGY **1.3.5** executable. Installation
 uses immutable release URLs and SHA-512 values from the official installer’s
 Linux ARM64/AMD64 manifests, then checks `agy --version`. The documented
 `AGY_CLI_DISABLE_AUTO_UPDATE=true` setting prevents background updates from

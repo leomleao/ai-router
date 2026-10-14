@@ -88,7 +88,7 @@ async fn provider_discovery_checks_pin_and_sanitizes_quota() {
     let mut config = config(root.path());
     let status = runner(config.clone()).probe().await;
     assert!(status.authenticated, "{:?}", status.error);
-    assert_eq!(status.version, "1.2.15");
+    assert_eq!(status.version, "1.3.5");
     assert_eq!(status.models.len(), 2);
     assert_eq!(
         status
@@ -124,7 +124,7 @@ async fn unauthenticated_model_probe_classifies_stdout_without_exposing_diagnost
     )
     .unwrap();
     let status = runner(config).probe().await;
-    assert_eq!(status.version, "1.2.15");
+    assert_eq!(status.version, "1.3.5");
     assert!(!status.authenticated);
     assert!(status.models.is_empty());
     assert_eq!(status.error.as_deref(), Some("provider_auth_required"));
@@ -133,6 +133,36 @@ async fn unauthenticated_model_probe_classifies_stdout_without_exposing_diagnost
             .unwrap()
             .contains("Please sign in")
     );
+}
+
+#[tokio::test]
+async fn native_auto_mode_reaches_the_sandboxed_provider_and_invalid_modes_fail_closed() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = config(root.path());
+    config.native_enabled = true;
+    let mut input = request("native auto fixture");
+    input.profile = RunProfile::Native;
+    input.mode = Some("auto".into());
+    let workspace = config.workspace_dir.join(&input.request_id);
+    let provider = runner(config);
+    let events = collect(&provider, input).await;
+    assert_eq!(completed(&events).text, "Hello from fixture");
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("mode.txt")).unwrap(),
+        "auto"
+    );
+
+    for mode in ["", "dangerously-skip-permissions", "AUTO"] {
+        let mut input = request("invalid native mode");
+        input.profile = RunProfile::Native;
+        input.mode = Some(mode.into());
+        let error = provider
+            .start(input, CancellationToken::new())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.code, "invalid_mode");
+    }
 }
 
 #[tokio::test]

@@ -951,6 +951,60 @@ async fn queue_saturation_is_bounded_and_shutdown_releases_waiters() {
 }
 
 #[tokio::test]
+async fn native_execution_modes_are_validated_and_forwarded_without_requiring_effort() {
+    let harness = Harness::new(|config| config.native_enabled = true).await;
+    for mode in [
+        json!(null),
+        json!("plan"),
+        json!("accept-edits"),
+        json!("auto"),
+    ] {
+        let (status, value) = harness
+            .post(
+                "/v1/agy/runs",
+                json!({"model":MODEL,"prompt":"native mode fixture","mode":mode}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{mode}");
+        let id = value["id"].as_str().unwrap();
+        harness.wait_job(id, "completed").await;
+        let workspace = harness.state.config.workspace_dir.join(id);
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("mode.txt")).unwrap(),
+            mode.as_str().unwrap_or("default")
+        );
+    }
+    for mode in [
+        json!(""),
+        json!("AUTO"),
+        json!("dangerously-skip-permissions"),
+        json!(true),
+        json!(1),
+    ] {
+        let (status, value) = harness
+            .post(
+                "/v1/agy/runs",
+                json!({"model":MODEL,"prompt":"invalid native mode","mode":mode}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{mode}");
+        assert_eq!(value["error"]["code"], "invalid_request");
+    }
+    let disabled = Harness::new(|_| {}).await;
+    assert_eq!(
+        disabled
+            .post(
+                "/v1/agy/runs",
+                json!({"model":MODEL,"prompt":"native auto fixture","mode":"auto"})
+            )
+            .await
+            .0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert!(disabled.workspaces().is_empty());
+}
+
+#[tokio::test]
 async fn native_gate_ownership_artifacts_and_synthetic_links_are_enforced() {
     let disabled = Harness::new(|_| {}).await;
     assert_eq!(

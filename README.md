@@ -14,7 +14,7 @@ flowchart LR
     P --> R[127.0.0.1:8090 → Rust gateway]
     R --> A[Authentication, limits, validation]
     A --> M[Shared AGY subprocess supervisor]
-    M --> G[Official AGY 1.2.15]
+    M --> G[Official AGY 1.3.5]
     G --> S[Google subscription]
     M --> T[Private monitor socket]
     G --> V[Named AGY state volume]
@@ -164,7 +164,7 @@ Native request shape, available only after operator verification:
 }
 ```
 
-`mode` may be `plan` or `accept-edits`; omit it for the CLI default. `effort` is
+`mode` may be `plan`, `accept-edits` or `auto`; omit it for the CLI default. `effort` is
 model-dependent. `json_schema` accepts a validated schema object. Uploads are
 staged under `input/`; generated artifacts must remain in the workspace.
 Protected file names, hidden configuration, traversal, symlinks and hardlinks

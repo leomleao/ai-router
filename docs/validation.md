@@ -3,6 +3,38 @@
 All automated tests run in local Docker with explicit fake AGY paths and
 synthetic keys/state.
 
+## AGY 1.3.5 upgrade
+
+The adapter and Compose pin now target **1.3.5**, as reported by the official
+[Linux ARM64 manifest](https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/linux_arm64.json)
+and [Linux AMD64 manifest](https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/linux_amd64.json).
+Both archives' SHA-512 digests were checked. The new ARM64 runtime image reports
+`1.3.5`, and its `--help` lists `plan`, `accept-edits` and `auto` execution modes.
+
+The supplied terminal audit of host AGY 1.3.5 reported the same 60 `init.tools`
+names as 1.2.15. The versioned public snapshot carries that inventory forward;
+the adapter still rejects duplicates, omissions and additions before sending
+user input. A fresh unauthenticated Linux CLI exits with an authentication
+error before emitting `init`, so this upgrade does not claim a new authenticated
+Linux inventory capture or live model acceptance run.
+
+Native `auto` is accepted only behind the existing native enablement and scope
+gates. HTTP and runner fixtures check forwarding with `--sandbox`, invalid-mode
+rejection and operation without an explicit effort. Answer verbosity keeps its
+existing neutral-default/rejection behavior. `/compact` is not exposed because
+the router replays submitted history in fresh conversations.
+
+The new production ARM64 image passed health, CLI version, capabilities,
+readiness/authentication failure handling and disabled-native smoke checks with
+fresh disposable unauthenticated state. Docker policy checks passed using only
+synthetic banned-path fixtures. The Rust suite passed 85 tests (51 unit,
+22 HTTP and 12 runner), including the new mode regressions. Monitor PTY checks,
+156 OpenAI 3.24.0 TCP/SDK/policy checks and 56 n8n Vercel SDK checks also passed
+via `./scripts/test-local.sh`. Rust formatting and `git diff --check` passed.
+
+The evidence below records the earlier 1.2.15 acceptance runs; it is not a claim
+that those live-provider checks were repeated against 1.3.5.
+
 ## Gates
 
 | Gate | Evidence |

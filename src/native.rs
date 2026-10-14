@@ -136,7 +136,9 @@ pub async fn create(
     };
     let mode = match map.get("mode") {
         None | Some(Value::Null) => None,
-        Some(Value::String(s)) if ["plan", "accept-edits"].contains(&s.as_str()) => Some(s.clone()),
+        Some(Value::String(s)) if ["plan", "accept-edits", "auto"].contains(&s.as_str()) => {
+            Some(s.clone())
+        }
         _ => return Err(error(400, "invalid_request", "Invalid mode")),
     };
     let schema = match map.get("json_schema") {

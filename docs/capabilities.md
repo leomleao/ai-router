@@ -1,7 +1,9 @@
 # Capability matrix
 
-The installed/tested CLI pin is **1.2.15**. Capabilities are not inferred from
-the OpenAI endpoint catalogue. The official CLI is the provider boundary.
+The installed CLI pin is **1.3.5**. Authenticated Linux acceptance evidence
+currently covers **1.2.15**; live 1.3.5 acceptance is an operator gate.
+Capabilities are not inferred from the OpenAI endpoint catalogue. The official
+CLI is the provider boundary.
 `GET /v1/capabilities` reports the active version, catalogue, readiness and
 verification status. Fixture/SDK tests prove the adapter, not Google inference.
 
@@ -18,7 +20,7 @@ verification status. Fixture/SDK tests prove the adapter, not Google inference.
 | Forced/required tool choice | None | Rejected; no proven CLI enforcement |
 | Effort/model selection | OpenAI reasoning effort/native effort | Official flags passed through; acceptance depends on the selected model |
 | Answer verbosity | Responses `text.verbosity`, Chat `verbosity` | Absent, null and `medium` are equivalent: the neutral OpenAI/n8n default is accepted without changing the prompt, model or reasoning effort. `low`/`high` and malformed values are rejected; no AGY answer-detail control is promised |
-| Native execution modes | Native `mode` | `plan` / `accept-edits` select the official CLI flag; profile gated by sandbox verification |
+| Native execution modes | Native `mode` | `plan` / `accept-edits` / `auto` select the official CLI flag; profile gated by sandbox verification |
 | Built-in tools/subagents | Native run/event API | Tool/agent steps retained; only built-ins allowed by fixed policy and sandbox, profile off until verified |
 | Input files | Native uploads | Explicit base64 uploads into `input/`; modality interpretation depends on CLI/model/tool support |
 | Artifacts | Native owner-scoped list/download | Safe bounded byte transport; no cross-owner access, protected paths, symlinks or hardlinks |
