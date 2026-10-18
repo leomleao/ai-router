@@ -28,13 +28,13 @@ use tokio_util::sync::CancellationToken;
 
 const AGENT_NAME: &str = "router-model";
 const SERVER_NAME: &str = "ai-router";
-const VERIFIED_AGY_VERSION: &str = "1.3.5";
+const VERIFIED_AGY_VERSION: &str = "1.4.2";
 const STDERR_LIMIT: usize = 64 * 1024;
 
-/// AGY 1.3.5 advertises its global CLI registry in init.tools, not the
-/// selected custom agent's effective tools. Its buildInitPayload calls
-/// advertisedTools with only the backend kind; the latter reads a global map.
-/// Verify that pinned protocol inventory before sending any user prompt.
+/// The pinned contract carries forward the global init.tools inventory
+/// observed on AGY 1.3.5, rather than a custom agent's effective tools.
+/// Recheck the exact inventory on every 1.4.2 init before sending a prompt;
+/// a changed registry fails closed until it has been independently reviewed.
 /// Effective model isolation comes from the owned custom-agent configuration,
 /// with no built-in components and at most the fixed inert MCP server. Every
 /// subsequent native tool/subagent step still fails closed below.
@@ -46,7 +46,7 @@ fn verified_init_registry(tools: &[String]) -> bool {
     }
     static REGISTRY: std::sync::OnceLock<Registry> = std::sync::OnceLock::new();
     let registry = REGISTRY.get_or_init(|| {
-        serde_json::from_str(include_str!("agy-init-tools-1.3.5.json"))
+        serde_json::from_str(include_str!("agy-init-tools-1.4.2.json"))
             .expect("the compiled public AGY registry snapshot must be valid")
     });
     let expected: HashSet<_> = registry.tools.iter().map(String::as_str).collect();
@@ -330,7 +330,10 @@ impl Runner {
             .env("LANG", "C.UTF-8")
             .env("LC_ALL", "C.UTF-8")
             .env("NO_COLOR", "1");
-        command.env("AGY_CLI_DISABLE_AUTO_UPDATE", "true");
+        command
+            .env("AGY_CLI_DISABLE_AUTO_UPDATE", "true")
+            // Headless pipes carry JSON only, never terminal status sequences.
+            .env("AGY_CLI_OSC7501", "off");
         command
             .current_dir(cwd)
             .stdin(Stdio::piped())

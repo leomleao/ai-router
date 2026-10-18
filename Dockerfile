@@ -13,6 +13,7 @@ COPY scripts/install-agy.sh /tmp/install-agy.sh
 RUN sh /tmp/install-agy.sh "$TARGETARCH" && rm /tmp/install-agy.sh
 ENV HOME=/var/lib/ai-router/auth \
     AGY_CLI_DISABLE_AUTO_UPDATE=true \
+    AGY_CLI_OSC7501=off \
     AI_ROUTER_AGY_BIN=/usr/local/bin/agy \
     AI_ROUTER_STATE_DIR=/var/lib/ai-router/auth \
     AI_ROUTER_WORKSPACE_DIR=/run/ai-router/workspaces \

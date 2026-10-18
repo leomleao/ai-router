@@ -57,7 +57,7 @@ impl Config {
         };
         let bind = value("AI_ROUTER_BIND", "0.0.0.0:8080")?;
         let agy_bin = value("AI_ROUTER_AGY_BIN", "/usr/local/bin/agy")?.into();
-        let expected_agy_version = value("AI_ROUTER_EXPECTED_AGY_VERSION", "1.3.5")?;
+        let expected_agy_version = value("AI_ROUTER_EXPECTED_AGY_VERSION", "1.4.2")?;
         let state_dir = value("AI_ROUTER_STATE_DIR", "/var/lib/ai-router/auth")?.into();
         let workspace_dir = value("AI_ROUTER_WORKSPACE_DIR", "/run/ai-router/workspaces")?.into();
         let telemetry_dir =
@@ -216,7 +216,7 @@ impl Config {
         Self {
             bind: "127.0.0.1:0".to_owned(),
             agy_bin: root.join("fake-agy"),
-            expected_agy_version: "1.3.5".to_owned(),
+            expected_agy_version: "1.4.2".to_owned(),
             state_dir: root.join("auth"),
             workspace_dir: root.join("workspaces"),
             telemetry_dir: root.join("telemetry"),

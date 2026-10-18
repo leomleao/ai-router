@@ -14,7 +14,7 @@ flowchart LR
     P --> R[127.0.0.1:8090 → Rust gateway]
     R --> A[Authentication, limits, validation]
     A --> M[Shared AGY subprocess supervisor]
-    M --> G[Official AGY 1.3.5]
+    M --> G[Official AGY 1.4.2]
     G --> S[Google subscription]
     M --> T[Private monitor socket]
     G --> V[Named AGY state volume]

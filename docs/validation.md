@@ -3,9 +3,50 @@
 All automated tests run in local Docker with explicit fake AGY paths and
 synthetic keys/state.
 
-## AGY 1.3.5 upgrade
+## AGY 1.4.2 upgrade
 
-The adapter and Compose pin now target **1.3.5**, as reported by the official
+The current adapter and Compose pin target **1.4.2**. Official Linux ARM64 and
+AMD64 manifests agree on release `1.4.2-4835981233356800`; both archives'
+SHA-512 digests were checked. The Linux ARM64 runtime reports `1.4.2`.
+
+The verified binary's `agy changelog` includes 1.4.1 and 1.4.2 patch notes
+that the public web changelog had not yet listed when checked. Changes since
+1.3.5 relevant to this adapter include network-disconnect retries, temporary
+startup eligibility retries and MCP process-exit handling. Large structured
+tool-result truncation and Auto-mode sandbox reviews improve native execution;
+they do not add OpenAI generation parameters. The 1.4.2 patch itself fixes
+Remote Control daemon conversation history.
+
+The runner now explicitly sets `AGY_CLI_OSC7501=off` for every subprocess,
+including management probes, to keep terminal-status sequences out of its
+headless pipes. The image sets the same default for manual CLI commands.
+Router deadlines still apply: the default 120-second deadline expires before
+AGY's five-minute stalled-connection retry threshold. Native execution stays
+behind the existing sandbox-verification gate.
+
+The 60-name registry snapshot is carried forward from the previously observed
+1.3.5 contract; it has not been recaptured from authenticated Linux 1.4.2.
+The adapter still fails closed on any additional, missing or duplicate tool.
+Fresh unauthenticated 1.4.2 cannot emit the authenticated init payload, so a
+live request after the operator deploys remains a separate acceptance gate.
+No new answer-verbosity, token-limit or prompt-cache flags appear in `--help`.
+
+Validation passed 87 Rust tests, monitor PTY checks, 86 pinned n8n SDK checks
+and 156 OpenAI 3.24.0 TCP/SDK/policy checks. The fixture verifies both disabled
+auto-update and `AGY_CLI_OSC7501=off` for every subprocess, including probes.
+Production-image smoke checks passed health, matching expected/observed 1.4.2
+versions, unauthenticated readiness, disabled native execution and n8n cache
+disclosure. The actual CLI's unauthenticated stream output parses as JSON and
+contains no terminal escape sequences.
+
+Sources: [official ARM64 manifest](https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/linux_arm64.json),
+[official AMD64 manifest](https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/linux_amd64.json),
+[published CLI changelog](https://www.antigravity.google/docs/changelog), and
+`agy changelog` from the checksum-verified Linux 1.4.2 executable.
+
+## Earlier AGY 1.3.5 upgrade
+
+The earlier adapter and Compose pin targeted **1.3.5**, as reported by the official
 [Linux ARM64 manifest](https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/linux_arm64.json)
 and [Linux AMD64 manifest](https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/linux_amd64.json).
 Both archives' SHA-512 digests were checked. The new ARM64 runtime image reports

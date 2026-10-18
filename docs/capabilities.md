@@ -1,7 +1,7 @@
 # Capability matrix
 
-The installed CLI pin is **1.3.5**. Authenticated Linux acceptance evidence
-currently covers **1.2.15**; live 1.3.5 acceptance is an operator gate.
+The installed CLI pin is **1.4.2**. Authenticated Linux acceptance evidence
+currently covers **1.2.15**; live 1.4.2 acceptance is an operator gate.
 Capabilities are not inferred from the OpenAI endpoint catalogue. The official
 CLI is the provider boundary.
 `GET /v1/capabilities` reports the active version, catalogue, readiness and

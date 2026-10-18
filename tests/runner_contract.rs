@@ -88,7 +88,7 @@ async fn provider_discovery_checks_pin_and_sanitizes_quota() {
     let mut config = config(root.path());
     let status = runner(config.clone()).probe().await;
     assert!(status.authenticated, "{:?}", status.error);
-    assert_eq!(status.version, "1.3.5");
+    assert_eq!(status.version, "1.4.2");
     assert_eq!(status.models.len(), 2);
     assert_eq!(
         status
@@ -124,7 +124,7 @@ async fn unauthenticated_model_probe_classifies_stdout_without_exposing_diagnost
     )
     .unwrap();
     let status = runner(config).probe().await;
-    assert_eq!(status.version, "1.3.5");
+    assert_eq!(status.version, "1.4.2");
     assert!(!status.authenticated);
     assert!(status.models.is_empty());
     assert_eq!(status.error.as_deref(), Some("provider_auth_required"));

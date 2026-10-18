@@ -4,12 +4,19 @@ Run the gateway in Docker with a loopback-only origin at `127.0.0.1:8090`.
 For remote access, configure an HTTPS reverse proxy on your own domain.
 Change the loopback port with `AI_ROUTER_PORT`.
 
-The image contains the official Linux AGY **1.3.5** executable. Installation
+The image contains the official Linux AGY **1.4.2** executable. Installation
 uses immutable release URLs and SHA-512 values from the official installer’s
 Linux ARM64/AMD64 manifests, then checks `agy --version`. The documented
 `AGY_CLI_DISABLE_AUTO_UPDATE=true` setting prevents background updates from
 changing the tested pin or trying to write the read-only executable. It does not extract
 Google credentials, copy host authentication, or install a paid API provider.
+
+The runner and image set `AGY_CLI_OSC7501=off` so headless JSON pipes do not
+carry terminal-status escape sequences. Release upgrades update the immutable
+URL, both checksums, the compiled adapter version and its inventory contract
+together. If your deployment overrides `AI_ROUTER_EXPECTED_AGY_VERSION`, change
+it to `1.4.2` when deploying this release, or remove that override to use the
+compiled default. This repository's Compose file pins the matching version.
 
 ## Build and keys
 

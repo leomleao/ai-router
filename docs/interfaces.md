@@ -13,7 +13,7 @@ Root wraps config in `Arc<Config>`. Public fields:
 
 ```text
 bind: String (default 0.0.0.0:8080 inside container)
-agy_bin: PathBuf; expected_agy_version: String (1.3.5)
+agy_bin: PathBuf; expected_agy_version: String (1.4.2)
 state_dir: PathBuf; workspace_dir: PathBuf; telemetry_dir: PathBuf
 monitor_socket: PathBuf; keys: Vec<KeyConfig>
 trusted_proxies: Vec<IpAddr>
@@ -90,9 +90,9 @@ one terminal event. AGY is invoked by argument vector, never a shell. Capture
 bounded stderr privately; sanitised provider error codes go to HTTP/telemetry.
 Use real CLI `--input-format stream-json --output-format stream-json`, disable
 slash expansion on model requests, and select a fixed custom agent with
-tools:[], excludeDefaultComponents:true and inheritMcp:false. In AGY 1.3.5,
-init.tools advertises the global registry rather than the selected agent's
-effective tools; init.agent echoes the requested name. Before launching the
+tools:[], excludeDefaultComponents:true and inheritMcp:false. The 1.4.2 adapter
+expects the global registry and echoed agent name observed on 1.3.5; any
+inventory drift fails closed before user input. Before launching the
 conversation process, run the fixed `/agents` JSON management command in the
 owned workspace and require the parsed agent name, zero turns/usage, and no
 errors or denied actions. Then verify the initial exact pinned public registry
