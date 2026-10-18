@@ -3,6 +3,36 @@
 All automated tests run in local Docker with explicit fake AGY paths and
 synthetic keys/state.
 
+## Rejected client-tool diagnostics
+
+A live AGY 1.4.2 run selected `load_skill` successfully, then failed its next
+tool attempt with `invalid_provider_tool_call`. Existing logs retained the
+request/tool inventory and generic error, but discarded the attempted tool
+and validation reason. The new `client_tool_rejected` gateway stderr event
+preserves bounded validation metadata with the request ID, model and stage.
+It does not recover previously discarded attempts or change HTTP errors.
+
+The relay and supervisor share schema validation. A rejected call is carried
+through the owned temporary handoff only until the supervisor classifies it;
+cleanup still removes that workspace. Metadata distinguishes unknown tools,
+non-object arguments, schema mismatches, invalid handoffs and disallowed
+dispatches. Schema diagnostics report paths, JSON types and missing required
+fields without formatting validator errors or recording argument values,
+dynamic instance keys, enum values or schema descriptions.
+
+Formatter unit tests cover classification, missing required fields, enum/type
+failures, dynamic-key privacy and bounded error lists/paths. TCP tests send real
+synthetic MCP calls, assert unchanged failures, wait for workspace cleanup, and
+then inspect gateway stderr for exactly one correlated diagnostic per request.
+They verify the field/type mismatch and confirm synthetic private argument
+values, descriptions and bearer keys are absent from logs.
+
+`./scripts/test-local.sh` passed 95 Rust tests (58 unit, 25 HTTP, 12 runner),
+monitor PTY checks, 122 pinned n8n SDK checks and 170 OpenAI 3.24.0
+TCP/SDK/policy checks. The production gateway image built successfully.
+These checks use synthetic AGY; a fresh live failure after deployment is still
+needed to diagnose the original model's rejected call.
+
 ## n8n Responses item references
 
 The private monitor confirmed the rejected n8n request contained an

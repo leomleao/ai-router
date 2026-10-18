@@ -178,6 +178,13 @@ synthetic keys; fixtures cannot launch signed-in host AGY.
 Model request logs include the router request ID, endpoint, model, and current
 client-tool names/count for inventory diagnostics. Prompts, tool descriptions,
 schemas, arguments and authentication values are not logged.
+`tool_diagnostics::validate_call` shares exact schema validation between the
+relay and supervisor. Rejections emit bounded `client_tool_rejected` JSON on
+gateway stderr with request/model/stage, selected tool, reason, schema paths,
+JSON types and missing schema-declared required fields. Raw validator errors,
+argument values and instance paths must never be formatted into these logs.
+The relay preserves rejected call data in the owned temporary handoff solely
+for supervisor validation; it never executes the tool or fabricates a result.
 `AppState::drain(Duration) -> bool` waits for admission cleanup and telemetry
 recording before shutdown flush. `native::shutdown(&AppState) -> bool` cancels
 jobs and reports whether ownership-aware workspace cleanup completed. Failed

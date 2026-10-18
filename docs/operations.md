@@ -208,6 +208,40 @@ HTTP shutdown and cleanup drain can finish and flush their metadata.
 The history holds at most 50,000 records. Expired records are pruned at startup
 and at most once per minute during operation, including when traffic is idle.
 
+### Rejected client-tool diagnostics
+
+Container stderr emits one JSON `client_tool_rejected` event when a call fails
+relay/handoff validation, crosses the model profile's tool boundary, or completes
+without its required handoff. Each event includes `request_id`, `model`, `stage`
+(`relay`, `handoff`, `dispatch` or `completion`) and a `diagnostic` object.
+Correlate its request ID with the existing `model_request` tool inventory and
+the private monitor's failure record:
+
+```sh
+docker logs --since 15m ai-router 2>&1 | jq -R 'fromjson? | select(.event == "client_tool_rejected")'
+```
+
+Reasons distinguish `unknown_tool`, `invalid_tool_name`, `arguments_not_object`,
+`schema_mismatch`, `invalid_tool_schema`, `invalid_call_id`, `malformed_handoff`,
+`relay_rejected`, `unapproved_provider_tool`, `unapproved_mcp_server`,
+`malformed_dispatch` and `missing_handoff`. Valid identifier-shaped selected
+tool names are recorded up to 64 ASCII characters; other names are omitted.
+Schema failures include up to eight errors, each with the schema path (up to
+256 characters), instance nesting depth and actual JSON type. Type constraints
+also report expected types; required constraints report up to eight missing
+schema-declared field names, each limited to 64 characters. Truncation flags
+identify limited error lists and schema paths.
+
+These are metadata-only container logs: no argument values, dynamic argument
+keys/instance paths, enum values, schema descriptions, prompts or raw validator
+messages are emitted. Rejected raw arguments travel only through the existing
+owned temporary handoff file, which is removed with the request workspace.
+HTTP errors and the private monitor retain their existing generic error codes;
+diagnostic details are not added to API responses or persisted router telemetry.
+Diagnostics apply to new failures after deployment; previous failed calls cannot
+be reconstructed from their generic errors. Recreating the router also clears
+its Responses item store, so start a new n8n chat afterward.
+
 ## Verification boundaries
 
 ```sh

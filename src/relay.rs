@@ -241,31 +241,24 @@ async fn serve_io<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
             "resources/templates/list" => json!({"resourceTemplates":[]}),
             "prompts/list" => json!({"prompts":[]}),
             "tools/call" => {
-                let name = request
-                    .pointer("/params/name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
+                let name = request.pointer("/params/name");
                 let arguments = request
                     .pointer("/params/arguments")
                     .cloned()
                     .unwrap_or_else(|| json!({}));
-                let valid = tools
-                    .iter()
-                    .find(|tool| tool.name == name)
-                    .is_some_and(|tool| {
-                        arguments.is_object()
-                            && jsonschema::validator_for(&tool.parameters)
-                                .is_ok_and(|schema| schema.is_valid(&arguments))
-                    });
+                let valid = crate::tool_diagnostics::validate_call(tools, name, &arguments).is_ok();
                 let value = if valid {
                     serde_json::to_value(ToolCall {
                         id: format!("call_{}", uuid::Uuid::new_v4().simple()),
-                        name: name.to_string(),
+                        name: name.and_then(Value::as_str).unwrap().to_string(),
                         arguments,
                     })
                     .map_err(|_| "Invalid tool call")?
                 } else {
-                    json!({"error":"invalid_tool_call"})
+                    // Preserve the attempted call only in the owned temporary
+                    // workspace. The supervisor computes safe diagnostics and
+                    // deletes the workspace; raw values never enter its logs.
+                    json!({"error":"invalid_tool_call","name":name,"arguments":arguments})
                 };
                 capture(handoff, &value).await?;
                 // Deliberately do not fabricate a tool result or let AGY continue.

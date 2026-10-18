@@ -269,14 +269,19 @@ if tools and select_tool:
         kind = definition.get("type", "string")
         arguments[name] = {"string":"London", "integer":1, "number":1.0,
                            "boolean":True, "array":[], "object":{}}.get(kind, "London")
+    if "__fake_invalid_tool_arguments__" in prompt:
+        arguments = "synthetic-private-tool-arguments"
+    if "__fake_tool_type_mismatch__" in prompt:
+        arguments["city"] = "synthetic-private-tool-argument-value"
+    selected_name = "not_in_catalogue" if "__fake_unknown_tool__" in prompt else tool["name"]
     step(text_delta="", usage=usage)
     step(step_index=2, step_type="tool", state="ACTIVE", tool_name="call_mcp_tool",
          tool_info={"name":"call_mcp_tool", "parameters":{
-             "ServerName":"ai-router", "ToolName":tool["name"], "Arguments":arguments}})
+             "ServerName":"ai-router", "ToolName":selected_name, "Arguments":arguments}})
     # Real MCP handshake and catalogue request, followed by a call with no reply.
     relay, listed = discover_relay()
     assert listed[0]["inputSchema"] == tool["parameters"]
-    relay_rpc(relay, {"jsonrpc":"2.0", "id":3, "method":"tools/call", "params":{"name":tool["name"], "arguments":arguments}}, False)
+    relay_rpc(relay, {"jsonrpc":"2.0", "id":3, "method":"tools/call", "params":{"name":selected_name, "arguments":arguments}}, False)
     time.sleep(300)
 
 if not model_only:

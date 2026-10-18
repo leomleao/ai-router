@@ -443,6 +443,50 @@ def policy_contracts():
     check(MODEL_KEY not in encoded and NATIVE_KEY not in encoded, "Monitor contains no bearer keys")
 
 
+def tool_diagnostic_contracts():
+    expected = {}
+    schema = {"type":"object", "properties":{"city":{"type":"integer"}}, "required":["city"]}
+    cases = [
+        ("__fake_tool_type_mismatch__", schema, "schema_mismatch", "relay", "weather", "invalid_provider_tool_call"),
+        ("__fake_invalid_tool_arguments__", TOOL_SCHEMA, "arguments_not_object", "relay", "weather", "invalid_provider_tool_call"),
+        ("__fake_unknown_tool__", TOOL_SCHEMA, "unknown_tool", "dispatch", "not_in_catalogue", "provider_native_tool_violation"),
+    ]
+    for marker, parameters, reason, stage, selected, code in cases:
+        tool = {"type":"function", "name":"weather", "description":"synthetic-private-tool-description", "parameters":parameters}
+        status, headers, body = http("/v1/responses", {"model":MODEL,"input":marker,"tools":[tool]})
+        check(status == 502 and json.loads(body)["error"]["code"] == code,
+              "Tool diagnostics preserve fail-closed HTTP errors")
+        expected[headers["X-Request-Id"]] = (reason, stage, selected)
+        wait_idle()
+        check(not any(WORKSPACES.iterdir()), "Rejected call workspace cleaned after admission is released")
+    return expected
+
+
+def verify_tool_diagnostics(server, expected):
+    logs = server.stderr.read().decode()
+    events = []
+    for line in logs.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if event.get("event") == "client_tool_rejected":
+            events.append(event)
+    for request_id, (reason, stage, selected) in expected.items():
+        matching = [e for e in events if e["request_id"] == request_id]
+        check(len(matching) == 1, "One correlated rejection log survives request workspace cleanup")
+        event = matching[0]
+        check(event["model"] == MODEL and event["stage"] == stage and
+              event["diagnostic"]["reason"] == reason and event["diagnostic"]["selected_tool"] == selected,
+              "Tool rejection log identifies model, stage, tool and specific reason")
+        if reason == "schema_mismatch":
+            error = event["diagnostic"]["validation_errors"][0]
+            check(error["schema_path"] == "/properties/city/type" and error["actual_type"] == "string"
+                  and error["expected_types"] == ["integer"], "Schema log reports field and expected/actual types")
+    check(all(value not in logs for value in ["London", "synthetic-private-tool-arguments",
+              "synthetic-private-tool-argument-value", "synthetic-private-tool-description", MODEL_KEY]), "Container logs omit argument values, descriptions and bearer key")
+
+
 def native_transport_contracts():
     status, _, body = http("/v1/agy/runs", {"model": MODEL, "prompt": "synthetic native transport"}, key=NATIVE_KEY)
     check(status == 202, "Synthetic native job accepted")
@@ -495,8 +539,10 @@ def main():
         token_budget_contracts()
         n8n_sdk_contracts()
         policy_contracts()
+        diagnostics = tool_diagnostic_contracts()
     finally:
         stop(server)
+    verify_tool_diagnostics(server, diagnostics)
     server = start(native=True)
     try:
         native_transport_contracts()

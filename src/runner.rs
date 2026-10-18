@@ -6,6 +6,7 @@ use crate::{
         Usage,
     },
     relay::{CATALOGUE_NAME, HANDOFF_NAME, bounded_line, protected_path},
+    tool_diagnostics::{Rejection, validate_call},
 };
 use chrono::Utc;
 use serde_json::{Value, json};
@@ -973,23 +974,38 @@ async fn read_handoff(
     let bytes = read_capped(file, 1024 * 1024).await?;
     let value: Value = serde_json::from_slice(&bytes).map_err(|_| protocol_error())?;
     if value.get("error").is_some() {
+        let arguments = value.get("arguments").unwrap_or(&Value::Null);
+        let diagnostic = validate_call(&request.tools, value.get("name"), arguments)
+            .err()
+            .unwrap_or_else(|| Rejection::new("relay_rejected", value.get("name"), arguments));
+        diagnostic.log(request, "relay");
         return Err(ApiError::new(
             502,
             "invalid_provider_tool_call",
             "AGY selected an invalid client tool",
         ));
     }
-    let call: ToolCall = serde_json::from_value(value).map_err(|_| protocol_error())?;
-    let valid = request
-        .tools
-        .iter()
-        .find(|tool| tool.name == call.name)
-        .is_some_and(|tool| {
-            jsonschema::validator_for(&tool.parameters)
-                .is_ok_and(|schema| schema.is_valid(&call.arguments))
-        });
-    if !call.id.starts_with("call_") || call.id.len() > 80 || !call.arguments.is_object() || !valid
-    {
+    let call: ToolCall = serde_json::from_value(value.clone()).map_err(|_| {
+        Rejection::new(
+            "malformed_handoff",
+            value.get("name"),
+            value.get("arguments").unwrap_or(&Value::Null),
+        )
+        .log(request, "handoff");
+        protocol_error()
+    })?;
+    let name = json!(call.name);
+    let rejection = if !call.id.starts_with("call_") || call.id.len() > 80 {
+        Some(Rejection::new(
+            "invalid_call_id",
+            Some(&name),
+            &call.arguments,
+        ))
+    } else {
+        validate_call(&request.tools, Some(&name), &call.arguments).err()
+    };
+    if let Some(diagnostic) = rejection {
+        diagnostic.log(request, "handoff");
         return Err(ApiError::new(
             502,
             "invalid_provider_tool_call",
@@ -1102,19 +1118,47 @@ impl DecodeState {
                         .and_then(Value::as_str)
                         .or_else(|| step.pointer("/tool_info/name").and_then(Value::as_str));
                     if name != Some("call_mcp_tool") || step.get("subagent_info").is_some() {
+                        Rejection::new(
+                            "unapproved_provider_tool",
+                            name.map(|name| json!(name)).as_ref(),
+                            &Value::Null,
+                        )
+                        .log(request, "dispatch");
                         return Err(native_violation());
                     }
-                    let parameters = step
-                        .pointer("/tool_info/parameters")
-                        .ok_or_else(native_violation)?;
+                    let parameters = step.pointer("/tool_info/parameters").ok_or_else(|| {
+                        Rejection::new("malformed_dispatch", None, &Value::Null)
+                            .log(request, "dispatch");
+                        native_violation()
+                    })?;
                     if parameters.get("ServerName").and_then(Value::as_str) != Some(SERVER_NAME) {
+                        Rejection::new(
+                            "unapproved_mcp_server",
+                            parameters.get("ToolName"),
+                            parameters.get("Arguments").unwrap_or(&Value::Null),
+                        )
+                        .log(request, "dispatch");
                         return Err(native_violation());
                     }
                     let name = parameters
                         .get("ToolName")
                         .and_then(Value::as_str)
-                        .ok_or_else(native_violation)?;
+                        .ok_or_else(|| {
+                            Rejection::new(
+                                "invalid_tool_name",
+                                parameters.get("ToolName"),
+                                parameters.get("Arguments").unwrap_or(&Value::Null),
+                            )
+                            .log(request, "dispatch");
+                            native_violation()
+                        })?;
                     if !request.tools.iter().any(|tool| tool.name == name) {
+                        Rejection::new(
+                            "unknown_tool",
+                            parameters.get("ToolName"),
+                            parameters.get("Arguments").unwrap_or(&Value::Null),
+                        )
+                        .log(request, "dispatch");
                         return Err(native_violation());
                     }
                     self.dispatched_tools.insert(name.into());
@@ -1160,6 +1204,16 @@ impl DecodeState {
                     ));
                 }
                 if !self.dispatched_tools.is_empty() {
+                    Rejection::new(
+                        "missing_handoff",
+                        self.dispatched_tools
+                            .iter()
+                            .next()
+                            .map(|name| json!(name))
+                            .as_ref(),
+                        &Value::Null,
+                    )
+                    .log(request, "completion");
                     return Err(ApiError::new(
                         502,
                         "invalid_provider_tool_call",
