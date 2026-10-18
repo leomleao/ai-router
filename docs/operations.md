@@ -245,6 +245,25 @@ tools or start another CLI run, and only the validated final call reaches n8n.
 The request-wide counter survives MCP relay restarts via fixed numbered files.
 Capabilities publish the two-correction budget; no new configuration is needed.
 
+For additional-property failures, provider-only feedback includes `field_feedback`:
+the unexpected field names, declared `allowed_fields`, schema path and instance
+JSON pointer for each failing object. Root instance paths are the empty string.
+Local JSON-pointer `$ref` traversals are resolved for declared field lists;
+unresolved locations use `allowed_fields_available:false` rather than guessing.
+`anyOf`/`oneOf` branch hints retain separate schema paths and must not be merged
+into a single allowed-field list. Pattern-based fields are indicated separately.
+Schemas that permit no properties report an empty allowed-field list.
+
+Provider hints are bounded to eight objects, 16 names per list, 64 characters per
+name and 256 characters per path. The serialized hint array is capped at 8 KiB;
+branch traversal stops after 64 errors or eight nested branch levels. Flags
+identify truncated names, lists, paths and hints; AGY is instructed to consult
+the complete `inputSchema` when a limit is reached. No argument values, enum
+values, schema descriptions or raw validator error messages are included.
+Dynamic names and instance paths are excluded from both JSON and Debug log
+formatting. They are sent only back to the provider that generated the call,
+not attached to HTTP errors, monitor records or persisted router telemetry.
+
 These are metadata-only container logs: no argument values, dynamic argument
 keys/instance paths, enum values, schema descriptions, prompts or raw validator
 messages are emitted. Rejected raw arguments travel only through the existing

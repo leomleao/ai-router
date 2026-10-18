@@ -289,6 +289,8 @@ if tools and select_tool:
     rejected = repair or "__fake_invalid_tool_arguments__" in prompt or "__fake_tool_type_mismatch__" in prompt or enum_invalid
     if rejected:
         bad = {"tools":["synthetic-private-invalid-value"]} if repair else arguments
+        if "__fake_repair_extra_fields__" in prompt:
+            bad = {"createRequest":{}, "synthetic-private-unexpected-field":"synthetic-private-invalid-value"}
         for attempt in range(1, 4):
             if attempt > 1:
                 step(step_index=attempt+1, step_type="tool", state="ACTIVE", tool_name="call_mcp_tool",
@@ -304,10 +306,29 @@ if tools and select_tool:
                 if "__fake_repair_timeout__" in prompt:
                     synthetic_marker("repair-feedback")
                     time.sleep(300)
+                if "__fake_repair_extra_fields__" in prompt:
+                    fields = feedback["field_feedback"][0]
+                    assert fields["unexpected_fields"] == ["synthetic-private-unexpected-field"]
+                    assert fields["allowed_fields"] == ["createRequest","updateRequest"]
+                    assert fields["instance_path"] == ""
+                    assert fields["allowed_fields_available"] is True
+                    assert not feedback["field_feedback_truncated"]
+                    corrected = {key:value for key,value in bad.items() if key in fields["allowed_fields"]}
+                    assert corrected == {"createRequest":{}}
+                    step(step_index=3, step_type="tool", state="ACTIVE", tool_name="call_mcp_tool", usage=usage,
+                         tool_info={"name":"call_mcp_tool","parameters":{"ServerName":"ai-router","ToolName":selected_name,"Arguments":corrected}})
+                    relay_rpc(relay, {"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":selected_name,"arguments":corrected}}, False)
+                    time.sleep(300)
                 if "__fake_repair_success__" in prompt:
                     assert feedback["diagnostic"]["selected_tool"] == selected_name
                     assert any("toolNames" in e.get("missing_required_fields", []) for e in feedback["diagnostic"]["validation_errors"])
-                    corrected = {"toolNames":["get_person"]}
+                    fields = feedback["field_feedback"][0]
+                    assert fields["instance_path"] == ""
+                    assert fields["unexpected_fields"] == ["tools"]
+                    assert fields["allowed_fields"] == ["toolNames"]
+                    assert fields["allowed_fields_available"] is True
+                    assert not feedback["field_feedback_truncated"]
+                    corrected = {fields["allowed_fields"][0]:["get_person"]}
                     step(step_index=3, step_type="tool", state="ACTIVE", tool_name="call_mcp_tool", usage=usage,
                          tool_info={"name":"call_mcp_tool","parameters":{"ServerName":"ai-router","ToolName":selected_name,"Arguments":corrected}})
                     relay_rpc(relay, {"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":selected_name,"arguments":corrected}}, False)

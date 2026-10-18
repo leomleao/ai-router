@@ -3,6 +3,29 @@
 All automated tests run in local Docker with explicit fake AGY paths and
 synthetic keys/state.
 
+## Precise extra-field correction feedback
+
+A live `Hub_Spot_manage_crm_objects` request exhausted all three attempts with
+root `additionalProperties` failures after 84 seconds. Generic schema-rule
+feedback did not identify which fields AGY needed to remove. Provider-only
+`field_feedback` now identifies unexpected names and declared fields at the
+failing object location, without argument values. Container logs retain their
+previous metadata-only contract; JSON serialization and Debug output exclude
+the provider-only names and paths.
+
+Unit coverage includes root and nested objects, local `$ref`, pattern fields,
+separate `anyOf`/`oneOf` branch hints, property-free schemas, bounds and privacy.
+The real synthetic MCP fixture requires the exact unexpected/allowed names
+before correcting its call. SDK coverage reproduces the HubSpot-shaped failure
+with a declared `createRequest` and an extra field: the correction must remove
+only the undeclared field, preserve the declared argument and produce one valid
+call in both streaming modes. Logs/client responses must exclude the private
+unexpected-field name. Live model behavior remains an operator check.
+
+`./scripts/test-local.sh` passed 101 Rust tests (62 unit, 25 HTTP, 14 runner),
+monitor PTY checks, 122 pinned n8n SDK checks and 193 OpenAI 3.24.0
+TCP/SDK/policy checks. The production gateway image built successfully.
+
 ## Bounded client-tool argument correction
 
 New diagnostics identified the live failure precisely: AGY selected

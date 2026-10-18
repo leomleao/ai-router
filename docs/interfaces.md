@@ -198,6 +198,14 @@ CLI process. `client_tool_rejected` includes attempt/opportunity counters;
 `client_tool_call_corrected` records successful recovery. Capabilities expose
 `client_tool_argument_correction` with `max_corrections:2`, `scope:request`,
 `same_run:true`, `unknown_tools:false`.
+`Rejection::feedback` additionally exposes bounded provider-only `field_feedback`
+for additional-property violations: unexpected names, declared fields and exact
+object locations, with separate branch contexts and truncation/availability
+flags. These fields use `serde(skip)` and are excluded from custom Debug output;
+logging must never serialize them separately. Error-kind inspection and local
+schema-pointer traversal supply this guidance without formatting raw errors or
+copying argument values. The correction budget and final schema validation are
+unchanged.
 `AppState::drain(Duration) -> bool` waits for admission cleanup and telemetry
 recording before shutdown flush. `native::shutdown(&AppState) -> bool` cancels
 jobs and reports whether ownership-aware workspace cleanup completed. Failed

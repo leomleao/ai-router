@@ -174,6 +174,10 @@ use terminal error events and never transparently retry a run.
 Before handing off a client tool, the inert MCP relay validates its arguments.
 For a known tool with invalid arguments, it gives AGY validation feedback and
 allows up to two corrections within the same CLI run and original deadline.
+For undeclared fields, feedback names the unexpected fields and the declared
+fields at the failing object location, including nested objects and schema
+branches. This guidance goes only to AGY; argument values and dynamic field
+names stay out of container logs.
 The third rejected attempt fails with `invalid_provider_tool_call`. Unknown
 tools and model-profile boundary violations still fail immediately. Only a
 schema-valid call reaches the client; the router never executes it. Each

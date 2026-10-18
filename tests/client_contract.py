@@ -475,7 +475,7 @@ def verify_tool_diagnostics(server, expected):
             events.append(event)
         if event.get("event") == "client_tool_call_corrected":
             corrected.append(event)
-    check(len(corrected) == 4 and all(e["rejections"] == 1 and e["selected_tool"] == "Twenty_CRM_learn_tools" for e in corrected),
+    check(len(corrected) == 6 and all(e["rejections"] == 1 and e["selected_tool"] in ("Twenty_CRM_learn_tools","Hub_Spot_manage_crm_objects") for e in corrected),
           "Every successful correction has a correlated recovery log")
     check(all(len([r for r in events if r["request_id"] == e["request_id"] and r["correction_offered"]]) == 1 for e in corrected),
           "Corrected requests retain their initial rejection diagnostic")
@@ -495,7 +495,7 @@ def verify_tool_diagnostics(server, expected):
             check(error["schema_path"] == "/properties/city/type" and error["actual_type"] == "string"
                   and error["expected_types"] == ["integer"], "Schema log reports field and expected/actual types")
     check(all(value not in logs for value in ["London", "synthetic-private-tool-arguments",
-              "synthetic-private-tool-argument-value", "synthetic-private-invalid-value", "synthetic-private-tool-description", MODEL_KEY]), "Container logs omit argument values, descriptions and bearer key")
+              "synthetic-private-tool-argument-value", "synthetic-private-invalid-value", "synthetic-private-unexpected-field", "synthetic-private-tool-description", MODEL_KEY]), "Container logs omit argument values, dynamic keys, descriptions and bearer key")
 
 
 def tool_correction_contracts():
@@ -537,6 +537,16 @@ def tool_correction_contracts():
                     arguments = calls[0].function.arguments
                     check(len(calls) == 1 and reply.usage.total_tokens in (23,46), "Chat preserves one corrected call and observed usage")
                 check(json.loads(arguments) == {"toolNames":["get_person"]}, "Chat publishes only corrected arguments")
+    hubspot_tool = {"type":"function","name":"Hub_Spot_manage_crm_objects","parameters":{
+        "type":"object","properties":{"createRequest":{"type":"object"},"updateRequest":{"type":"object"}},"additionalProperties":False}}
+    for streaming in [False,True]:
+        reply = client.responses.create(model=MODEL,input="__fake_repair_extra_fields__",tools=[hubspot_tool],stream=streaming)
+        if streaming:
+            reply = next(e.response for e in reply if e.type == "response.completed")
+        calls = [i for i in reply.output if i.type == "function_call"]
+        check(len(calls) == 1 and calls[0].name == "Hub_Spot_manage_crm_objects", "Precise extra-field feedback recovers the HubSpot-shaped call")
+        check(json.loads(calls[0].arguments) == {"createRequest":{}}, "Correction removes the unexpected key and preserves declared arguments")
+        check("synthetic-private-unexpected-field" not in reply.model_dump_json(), "Provider-only field names are absent from client responses")
     status, _, body = http("/v1/responses", {"model":MODEL,"input":"__fake_repair_exhausted__","tools":[tool],"stream":True})
     check(status == 200 and b"response.failed" in body and b"invalid_provider_tool_call" in body,
           "Exhausted corrections produce a terminal SSE failure")
