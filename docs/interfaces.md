@@ -198,6 +198,14 @@ CLI process. `client_tool_rejected` includes attempt/opportunity counters;
 `client_tool_call_corrected` records successful recovery. Capabilities expose
 `client_tool_argument_correction` with `max_corrections:2`, `scope:request`,
 `same_run:true`, `unknown_tools:false`.
+The provider-facing MCP catalogue uses canonical request-local names
+`router_client_000` through `router_client_127`. The owned model catalogue maps
+each original `name` to `mcp_name`; tool schemas and descriptions are preserved.
+The relay and stream decoder resolve aliases against the same immutable tool
+order, with no original-name fallback. Handoffs, schema validation, successful
+correction logs and API tool calls retain original client names. Correction
+feedback includes the private `mcp_name` to retry. Native provider operations,
+unknown aliases, nested dispatcher selections and other servers remain rejected.
 `Rejection::feedback` additionally exposes bounded provider-only `field_feedback`
 for additional-property violations: unexpected names, declared fields and exact
 object locations, with separate branch contexts and truncation/availability

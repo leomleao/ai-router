@@ -44,13 +44,14 @@ impl Rejection {
         matches!(self.reason, "arguments_not_object" | "schema_mismatch")
     }
 
-    pub(crate) fn feedback(&self, remaining: usize) -> Value {
+    pub(crate) fn feedback(&self, remaining: usize, mcp_name: &str) -> Value {
         json!({"isError":true,"content":[{"type":"text","text":json!({
             "error":"invalid_client_tool_arguments", "diagnostic":self,
+            "mcp_name":mcp_name,
             "field_feedback":self.field_feedback,
             "field_feedback_truncated":self.field_feedback_truncated,
             "remaining_corrections":remaining,
-            "instruction":"No client tool was executed. Correct arguments using the exact inputSchema from tools/list. Remove the unexpected_fields at the indicated instance_path; allowed_fields lists declared fields at that schema location. If allows_pattern_fields is true, names matching patternProperties are also allowed. Choose a suitable anyOf/oneOf branch before applying its hints; do not combine conflicting branch lists. Include required fields and declared types/values. Consult the full inputSchema when field lists are unavailable or any fields, paths or lists are truncated. Submit a corrected tools/call."
+            "instruction":"No client tool was executed. Correct arguments using the exact inputSchema from tools/list. Remove the unexpected_fields at the indicated instance_path; allowed_fields lists declared fields at that schema location. If allows_pattern_fields is true, names matching patternProperties are also allowed. Choose a suitable anyOf/oneOf branch before applying its hints; do not combine conflicting branch lists. Include required fields and declared types/values. Consult the full inputSchema when field lists are unavailable or any fields, paths or lists are truncated. Submit a corrected tools/call to the mcp_name in this feedback; do not switch to the original client name or a native provider tool."
         }).to_string()}]})
     }
 
@@ -362,7 +363,7 @@ mod tests {
 
     fn feedback(rejection: &Rejection) -> Value {
         serde_json::from_str(
-            rejection.feedback(2)["content"][0]["text"]
+            rejection.feedback(2, "router_client_000")["content"][0]["text"]
                 .as_str()
                 .unwrap(),
         )

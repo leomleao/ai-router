@@ -3,6 +3,29 @@
 All automated tests run in local Docker with explicit fake AGY paths and
 synthetic keys/state.
 
+## Distinct client-tool dispatch names
+
+Live failures included direct native `write_todos` selections and a nested
+`call_mcp_tool` selection. The private MCP catalogue now gives tools canonical
+request-local aliases and the owned prompt specifies one dispatcher layer,
+the exact server and alias mapping. The relay resolves the alias before schema
+validation and handoff; the decoder requires a corresponding approved MCP
+dispatch. API clients continue to see their original tool names. Invalid
+argument feedback repeats the private alias and retains the existing bounded
+schema correction guidance and budget.
+
+Synthetic runner coverage selects the second tool after reordering colliding
+client names, replays original-name tool history through Chat and Responses,
+and requires one validated original-name call. Native calls, nested dispatcher
+selections and another MCP server must fail without a tool handoff. Unit checks
+cover canonical aliases, out-of-range indexes, empty catalogues and client
+names that themselves resemble aliases. TCP SDK checks exercise both APIs and
+both streaming modes. Live AGY selection remains an operator validation step.
+
+`./scripts/test-local.sh` passed 103 Rust tests (63 unit, 25 HTTP, 15 runner),
+monitor PTY checks, 122 pinned n8n SDK checks and 229 OpenAI 3.24.0
+TCP/SDK/policy checks. The production gateway image built successfully.
+
 ## Precise extra-field correction feedback
 
 A live `Hub_Spot_manage_crm_objects` request exhausted all three attempts with

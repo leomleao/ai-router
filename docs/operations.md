@@ -210,6 +210,21 @@ and at most once per minute during operation, including when traffic is idle.
 
 ### Rejected client-tool diagnostics
 
+AGY sees private tool aliases (`router_client_000`, etc.) mapped to the current
+client names in its owned agent catalogue. This avoids exposing a client tool
+such as `write_todos` under the same MCP name as an AGY native tool. New calls
+must use `call_mcp_tool` once, with `ServerName:ai-router`, the selected private
+alias in `ToolName`, and the tool argument object in `Arguments`. n8n still
+receives the original function name and validated arguments. Invalid-argument
+feedback repeats the private `mcp_name` so correction stays on the same route.
+Alias indexes belong only to the current request; historical client names do
+not establish a provider route. No changes to n8n's tool definitions are needed.
+
+This reduces model selection mistakes; it does not guarantee compliance by a
+live model. Real native calls, unknown aliases, another MCP server or a nested
+dispatcher remain terminal boundary errors. Do not bypass these checks to
+accept a name that merely resembles a supplied client tool.
+
 Container stderr emits a JSON `client_tool_rejected` event for each call failing
 relay/handoff validation, crosses the model profile's tool boundary, or completes
 without its required handoff. Each event includes `request_id`, `model`, `stage`

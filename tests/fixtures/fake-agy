@@ -129,7 +129,8 @@ if model_only:
     if command:
         assert relay_args[0] == "mcp-relay"
         assert Path(relay_args[1]).name == "router-tools.json"
-        tools = json.loads(Path(relay_args[1]).read_text())
+        tools = [dict(tool, mcp_name=f"router_client_{index:03d}")
+                 for index,tool in enumerate(json.loads(Path(relay_args[1]).read_text()))]
 else:
     assert "--sandbox" in args
     assert flag("--mode") in (None, "plan", "accept-edits", "auto")
@@ -209,7 +210,7 @@ if "__fake_catalogue__" in prompt:
     assert embedded == tools
     if tools:
         relay, listed = discover_relay()
-        expected = [{"name":tool["name"], "description":tool["description"],
+        expected = [{"name":tool["mcp_name"], "description":tool["description"],
                      "inputSchema":tool["parameters"]} for tool in embedded]
         assert listed == expected
         relay.stdin.close()
@@ -262,7 +263,8 @@ has_tool_result = tool_result_count > 0
 select_tool = (tool_result_count < 2 if "__fake_second_tool__" in prompt else
                ("__fake_tool__" in prompt or (not has_tool_result and "__fake_final__" not in prompt)))
 if tools and select_tool:
-    tool = tools[0]
+    tool_index = len(tools)-1 if "__fake_select_last_tool__" in prompt else 0
+    tool = tools[tool_index]
     properties = tool["parameters"].get("properties", {})
     arguments = {}
     for name, definition in properties.items():
@@ -273,16 +275,26 @@ if tools and select_tool:
         arguments = "synthetic-private-tool-arguments"
     if "__fake_tool_type_mismatch__" in prompt:
         arguments["city"] = "synthetic-private-tool-argument-value"
-    selected_name = "not_in_catalogue" if "__fake_unknown_tool__" in prompt else tool["name"]
+    selected_name = "not_in_catalogue" if "__fake_unknown_tool__" in prompt else tool["mcp_name"]
+    if "__fake_direct_client__" in prompt:
+        step(step_type="tool", tool_name=tool["name"], tool_info={"name":tool["name"],"parameters":arguments})
+        time.sleep(300)
+    if "__fake_double_dispatch__" in prompt or "__fake_wrong_server__" in prompt:
+        step(step_type="tool", tool_name="call_mcp_tool", tool_info={"name":"call_mcp_tool","parameters":{
+            "ServerName":"other-server" if "__fake_wrong_server__" in prompt else "ai-router",
+            "ToolName":"call_mcp_tool" if "__fake_double_dispatch__" in prompt else selected_name,
+            "Arguments":{"ServerName":"ai-router","ToolName":selected_name,"Arguments":arguments}}})
+        time.sleep(300)
     step(text_delta="", usage=usage)
     step(step_index=2, step_type="tool", state="ACTIVE", tool_name="call_mcp_tool",
          tool_info={"name":"call_mcp_tool", "parameters":{
              "ServerName":"ai-router", "ToolName":selected_name, "Arguments":arguments}})
-    if selected_name != tool["name"]:
+    if selected_name != tool["mcp_name"]:
         time.sleep(300)  # Exercise the dispatch boundary without a relay race.
     # Real MCP handshake and catalogue request, followed by a call with no reply.
     relay, listed = discover_relay()
-    assert listed[0]["inputSchema"] == tool["parameters"]
+    assert listed[tool_index]["name"] == tool["mcp_name"]
+    assert listed[tool_index]["inputSchema"] == tool["parameters"]
     repair = "__fake_repair_" in prompt
     enum_invalid = (isinstance(arguments, dict) and "enum" in properties.get("city", {})
                     and arguments.get("city") not in properties["city"]["enum"])
@@ -300,6 +312,7 @@ if tools and select_tool:
                 assert reply["result"]["isError"] is True
                 feedback = json.loads(reply["result"]["content"][0]["text"])
                 assert feedback["error"] == "invalid_client_tool_arguments"
+                assert feedback["mcp_name"] == selected_name
                 assert feedback["remaining_corrections"] == 3-attempt
                 assert "synthetic-private-invalid-value" not in json.dumps(reply)
                 assert not Path("router-handoff.json").exists()
@@ -320,7 +333,7 @@ if tools and select_tool:
                     relay_rpc(relay, {"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":selected_name,"arguments":corrected}}, False)
                     time.sleep(300)
                 if "__fake_repair_success__" in prompt:
-                    assert feedback["diagnostic"]["selected_tool"] == selected_name
+                    assert feedback["diagnostic"]["selected_tool"] == tool["name"]
                     assert any("toolNames" in e.get("missing_required_fields", []) for e in feedback["diagnostic"]["validation_errors"])
                     fields = feedback["field_feedback"][0]
                     assert fields["instance_path"] == ""

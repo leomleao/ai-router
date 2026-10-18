@@ -310,6 +310,72 @@ async fn inert_mcp_handoff_and_followup_preserve_client_execution_boundary() {
 }
 
 #[tokio::test]
+async fn private_tool_aliases_preserve_original_names_and_reject_native_dispatches() {
+    let root = tempfile::tempdir().unwrap();
+    let provider = runner(config(root.path()));
+    let parameters = json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false});
+    for responses in [false, true] {
+        for names in [
+            ["write_todos", "Twenty_CRM_execute_tool"],
+            ["Twenty_CRM_execute_tool", "write_todos"],
+        ] {
+            let tools = names
+                .iter()
+                .map(|name| {
+                    let function = json!({"name":name,"parameters":parameters});
+                    if responses {
+                        let mut function = function;
+                        function["type"] = json!("function");
+                        function
+                    } else {
+                        json!({"type":"function","function":function})
+                    }
+                })
+                .collect::<Vec<_>>();
+            let request_id = uuid::Uuid::new_v4().simple().to_string();
+            let input = if responses {
+                normalize_response(json!({"model":"gemini-3-pro","tools":tools,"input":[
+                    {"type":"function_call","call_id":"call_old","name":names[0],"arguments":"{\"query\":\"old\"}"},
+                    {"type":"function_call_output","call_id":"call_old","output":"historical client output"},
+                    {"role":"user","content":"__fake_tool__ __fake_select_last_tool__"}
+                ]}), request_id).unwrap()
+            } else {
+                normalize_chat(json!({"model":"gemini-3-pro","tools":tools,"messages":[
+                    {"role":"assistant","content":null,"tool_calls":[{"type":"function","id":"call_old","function":{"name":names[0],"arguments":"{\"query\":\"old\"}"}}]},
+                    {"role":"tool","tool_call_id":"call_old","content":"historical client output"},
+                    {"role":"user","content":"__fake_tool__ __fake_select_last_tool__"}
+                ]}), request_id).unwrap()
+            };
+            let events = collect(&provider, input).await;
+            let calls = &completed(&events).tool_calls;
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].name, names[1]);
+            assert_eq!(calls[0].arguments, json!({"query":"London"}));
+            assert!(!events.iter().any(|e| matches!(e, RunEvent::Native(_))));
+        }
+    }
+    for marker in [
+        "__fake_direct_client__",
+        "__fake_double_dispatch__",
+        "__fake_wrong_server__",
+    ] {
+        let mut input = request(marker);
+        input.tools.push(ToolDefinition {
+            name: "write_todos".into(),
+            description: String::new(),
+            parameters: parameters.clone(),
+        });
+        let events = collect(&provider, input).await;
+        assert_eq!(error(&events), "provider_native_tool_violation", "{marker}");
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, RunEvent::ToolCall(_) | RunEvent::Completed(_)))
+        );
+    }
+}
+
+#[tokio::test]
 async fn invalid_arguments_can_be_corrected_and_exhaustion_survives_relay_restarts() {
     let root = tempfile::tempdir().unwrap();
     let provider = runner(config(root.path()));

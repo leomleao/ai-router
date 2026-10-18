@@ -131,6 +131,13 @@ model is instructed to answer tool-inventory questions from the current
 catalogue. Container `model_request` logs record client-tool names/count so
 missing selections can be diagnosed without logging prompts or tool arguments.
 
+The private MCP interface uses request-local names such as `router_client_000`
+to keep client tools distinct from AGY native tools with the same name. The
+owned agent receives the exact dispatcher format and original-name mapping.
+Validation and client responses use the original tool names; n8n needs no
+changes. Invalid argument feedback identifies the same private name to retry.
+Unknown names, native calls and other MCP servers still fail closed.
+
 ## HTTP API
 
 Every `/v1` route requires `Authorization: Bearer <client-key>`.

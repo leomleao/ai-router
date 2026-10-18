@@ -450,6 +450,9 @@ def tool_diagnostic_contracts():
         ("__fake_tool_type_mismatch__", schema, "schema_mismatch", "relay", "weather", "invalid_provider_tool_call"),
         ("__fake_invalid_tool_arguments__", TOOL_SCHEMA, "arguments_not_object", "relay", "weather", "invalid_provider_tool_call"),
         ("__fake_unknown_tool__", TOOL_SCHEMA, "unknown_tool", "dispatch", "not_in_catalogue", "provider_native_tool_violation"),
+        ("__fake_direct_client__", TOOL_SCHEMA, "unapproved_provider_tool", "dispatch", "weather", "provider_native_tool_violation"),
+        ("__fake_double_dispatch__", TOOL_SCHEMA, "unknown_tool", "dispatch", "call_mcp_tool", "provider_native_tool_violation"),
+        ("__fake_wrong_server__", TOOL_SCHEMA, "unapproved_mcp_server", "dispatch", "router_client_000", "provider_native_tool_violation"),
     ]
     for marker, parameters, reason, stage, selected, code in cases:
         tool = {"type":"function", "name":"weather", "description":"synthetic-private-tool-description", "parameters":parameters}
@@ -496,6 +499,34 @@ def verify_tool_diagnostics(server, expected):
                   and error["expected_types"] == ["integer"], "Schema log reports field and expected/actual types")
     check(all(value not in logs for value in ["London", "synthetic-private-tool-arguments",
               "synthetic-private-tool-argument-value", "synthetic-private-invalid-value", "synthetic-private-unexpected-field", "synthetic-private-tool-description", MODEL_KEY]), "Container logs omit argument values, dynamic keys, descriptions and bearer key")
+
+
+def tool_alias_contracts():
+    client = OpenAI(api_key=MODEL_KEY, base_url=BASE+"/v1", max_retries=0, timeout=8)
+    for responses in [False,True]:
+        for streaming in [False,True]:
+            for names in [("write_todos","Twenty_CRM_execute_tool"),("Twenty_CRM_execute_tool","write_todos")]:
+                functions = [{"name":name,"parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":False}} for name in names]
+                if responses:
+                    reply = client.responses.create(model=MODEL,input="__fake_select_last_tool__",tools=[dict(f,type="function") for f in functions],stream=streaming)
+                    if streaming:
+                        reply = next(e.response for e in reply if e.type == "response.completed")
+                    calls = [i for i in reply.output if i.type == "function_call"]
+                    name, arguments = calls[0].name, calls[0].arguments
+                else:
+                    reply = client.chat.completions.create(model=MODEL,messages=[{"role":"user","content":"__fake_select_last_tool__"}],tools=[{"type":"function","function":f} for f in functions],stream=streaming)
+                    if streaming:
+                        chunks = list(reply)
+                        deltas = [t for c in chunks if c.choices for t in (c.choices[0].delta.tool_calls or [])]
+                        calls = [t for t in deltas if t.id]
+                        name = "".join(t.function.name or "" for t in deltas)
+                        arguments = "".join(t.function.arguments or "" for t in deltas)
+                    else:
+                        calls = reply.choices[0].message.tool_calls
+                        name, arguments = calls[0].function.name, calls[0].function.arguments
+                check(len(calls) == 1 and name == names[1], "Private MCP aliases preserve the selected original client name")
+                check(json.loads(arguments) == {"query":"London"}, "Alias translation preserves validated arguments")
+                check("router_client_" not in name, "Provider-only tool aliases never become client tool names")
 
 
 def tool_correction_contracts():
@@ -606,6 +637,7 @@ def main():
         token_budget_contracts()
         n8n_sdk_contracts()
         policy_contracts()
+        tool_alias_contracts()
         tool_correction_contracts()
         diagnostics = tool_diagnostic_contracts()
     finally:

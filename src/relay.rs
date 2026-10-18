@@ -9,6 +9,22 @@ pub(crate) const HANDOFF_NAME: &str = "router-handoff.json";
 const MAX_RELAY_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_TOOL_CORRECTIONS: usize = 2;
 
+/// Provider-facing names cannot collide with AGY's native client-tool names.
+/// The index is local to the current immutable request catalogue.
+pub(crate) fn tool_alias(index: usize) -> String {
+    format!("router_client_{index:03}")
+}
+
+pub(crate) fn resolve_tool_alias<'a>(
+    tools: &'a [ToolDefinition],
+    alias: &str,
+) -> Option<&'a ToolDefinition> {
+    tools
+        .iter()
+        .enumerate()
+        .find_map(|(index, tool)| (alias == tool_alias(index)).then_some(tool))
+}
+
 pub(crate) fn rejection_path(handoff: &Path, attempt: usize) -> std::path::PathBuf {
     handoff.with_file_name(format!("router-tool-rejection-{attempt}.json"))
 }
@@ -260,7 +276,7 @@ async fn serve_io<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
             }
             "ping" => json!({}),
             "tools/list" => {
-                json!({"tools":tools.iter().map(|tool| json!({"name":tool.name,"description":tool.description,"inputSchema":tool.parameters})).collect::<Vec<_>>() })
+                json!({"tools":tools.iter().enumerate().map(|(index,tool)| json!({"name":tool_alias(index),"description":tool.description,"inputSchema":tool.parameters})).collect::<Vec<_>>() })
             }
             "resources/list" => json!({"resources":[]}),
             "resources/templates/list" => json!({"resourceTemplates":[]}),
@@ -281,14 +297,26 @@ async fn serve_io<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                     .pointer("/params/arguments")
                     .cloned()
                     .unwrap_or_else(|| json!({}));
-                let validation = crate::tool_diagnostics::validate_call(tools, name, &arguments);
+                let tool = name
+                    .and_then(Value::as_str)
+                    .and_then(|alias| resolve_tool_alias(tools, alias));
+                let client_name = tool.map(|tool| json!(tool.name));
+                // An original client name is not a provider alias. Validate
+                // unrecognized names against an empty inventory, never fall back.
+                let validation = crate::tool_diagnostics::validate_call(
+                    if tool.is_some() { tools } else { &[] },
+                    client_name.as_ref().or(name),
+                    &arguments,
+                );
                 if let Err(diagnostic) = &validation {
                     if diagnostic.repairable() {
-                        let attempt =
-                            record_rejection(handoff, &json!({"name":name,"arguments":arguments}))
-                                .await?;
+                        let attempt = record_rejection(
+                            handoff,
+                            &json!({"name":client_name,"arguments":arguments}),
+                        )
+                        .await?;
                         if attempt <= MAX_TOOL_CORRECTIONS {
-                            respond(&mut writer, json!({"jsonrpc":"2.0","id":id,"result":diagnostic.feedback(MAX_TOOL_CORRECTIONS-attempt+1)})).await?;
+                            respond(&mut writer, json!({"jsonrpc":"2.0","id":id,"result":diagnostic.feedback(MAX_TOOL_CORRECTIONS-attempt+1, name.and_then(Value::as_str).unwrap())})).await?;
                             continue;
                         }
                         // The supervisor observes the third rejection and stops
@@ -300,7 +328,7 @@ async fn serve_io<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                 let value = if validation.is_ok() {
                     serde_json::to_value(ToolCall {
                         id: format!("call_{}", uuid::Uuid::new_v4().simple()),
-                        name: name.and_then(Value::as_str).unwrap().to_string(),
+                        name: tool.unwrap().name.clone(),
                         arguments,
                     })
                     .map_err(|_| "Invalid tool call")?
@@ -333,6 +361,35 @@ async fn serve_io<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
 mod tests {
     use super::*;
 
+    #[test]
+    fn aliases_resolve_only_against_the_current_catalogue() {
+        let tools: Vec<_> = ["write_todos", "router_client_000", "call_mcp_tool"]
+            .iter()
+            .map(|name| ToolDefinition {
+                name: (*name).into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            })
+            .collect();
+        for (index, tool) in tools.iter().enumerate() {
+            assert_eq!(
+                resolve_tool_alias(&tools, &tool_alias(index)).unwrap().name,
+                tool.name
+            );
+        }
+        for invalid in [
+            "write_todos",
+            "call_mcp_tool",
+            "router_client_0",
+            "router_client_003",
+            "router_client_999",
+            "router_client_-01",
+        ] {
+            assert!(resolve_tool_alias(&tools, invalid).is_none(), "{invalid}");
+        }
+        assert!(resolve_tool_alias(&[], "router_client_000").is_none());
+    }
+
     #[tokio::test]
     async fn argument_corrections_share_a_budget_across_relay_restarts() {
         let root = tempfile::tempdir().unwrap();
@@ -350,7 +407,7 @@ mod tests {
                 serve_io(BufReader::new(input), output, &[tool], &destination).await
             });
             let mut response = BufReader::new(response);
-            client.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"learn_tools\",\"arguments\":{\"wrong\":\"synthetic-private\"}}}\n").await.unwrap();
+            client.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"router_client_000\",\"arguments\":{\"wrong\":\"synthetic-private\"}}}\n").await.unwrap();
             if attempt <= MAX_TOOL_CORRECTIONS {
                 let line = bounded_line(&mut response, 8192).await.unwrap().unwrap();
                 let reply: Value = serde_json::from_slice(&line).unwrap();
@@ -410,11 +467,12 @@ mod tests {
             .unwrap()
             .unwrap();
         let value: Value = serde_json::from_slice(&response).unwrap();
+        assert_eq!(value["result"]["tools"][0]["name"], "router_client_000");
         assert_eq!(
             value.pointer("/result/tools/0/inputSchema/required"),
             Some(&json!(["city"]))
         );
-        client.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"weather\",\"arguments\":{\"city\":\"London\"}}}\n").await.unwrap();
+        client.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"router_client_000\",\"arguments\":{\"city\":\"London\"}}}\n").await.unwrap();
         for _ in 0..100 {
             if tokio::fs::metadata(&handoff).await.is_ok() {
                 break;

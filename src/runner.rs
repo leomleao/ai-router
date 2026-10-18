@@ -7,7 +7,7 @@ use crate::{
     },
     relay::{
         CATALOGUE_NAME, HANDOFF_NAME, MAX_TOOL_CORRECTIONS, bounded_line, protected_path,
-        rejection_path,
+        rejection_path, resolve_tool_alias, tool_alias,
     },
     tool_diagnostics::{Rejection, validate_call},
 };
@@ -386,10 +386,21 @@ impl Runner {
             if request.tools.is_empty() {
                 agent.push_str("\nCurrent client tool catalogue:\n[]\nNo client tools are available for this request. Answer directly; if asked about available tools, state that no client tools were supplied.\n");
             } else {
+                agent.push_str(include_str!("model-tool-contract.md"));
                 agent.push_str("\nClient tools are exposed through the ai-router MCP server. When a client tool is needed to fulfill the request, make a real call_mcp_tool function call for one selected tool. Never simulate a call as text. The client owns execution; do not invent a tool result. If the relay returns isError with invalid_client_tool_arguments, no client tool was executed: use the validation feedback and exact current inputSchema to correct your arguments and call again. Only two corrections are allowed within this request. Never invent a result after a validation error.\nCurrent client tool catalogue:\n");
                 agent.push_str(
-                    &serde_json::to_string(&request.tools)
-                        .map_err(|_| internal("invalid_tool_catalogue"))?,
+                    &serde_json::to_string(
+                        &request
+                            .tools
+                            .iter()
+                            .enumerate()
+                            .map(|(index, tool)| {
+                                json!({"name":tool.name,"mcp_name":tool_alias(index),
+                                    "description":tool.description,"parameters":tool.parameters})
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .map_err(|_| internal("invalid_tool_catalogue"))?,
                 );
                 agent.push('\n');
             }
@@ -1210,7 +1221,7 @@ impl DecodeState {
                             .log(request, "dispatch");
                             native_violation()
                         })?;
-                    if !request.tools.iter().any(|tool| tool.name == name) {
+                    let Some(tool) = resolve_tool_alias(&request.tools, name) else {
                         Rejection::new(
                             "unknown_tool",
                             parameters.get("ToolName"),
@@ -1218,8 +1229,8 @@ impl DecodeState {
                         )
                         .log(request, "dispatch");
                         return Err(native_violation());
-                    }
-                    self.dispatched_tools.insert(name.into());
+                    };
+                    self.dispatched_tools.insert(tool.name.clone());
                 }
                 if step_type == "agent_response" {
                     if let Some(delta) = step.get("text_delta").and_then(Value::as_str) {
