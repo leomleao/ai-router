@@ -1,6 +1,7 @@
 use crate::{
     auth::{self, RateLimiter},
     config::{Config, KeyConfig},
+    items::{self, ItemStore},
     monitor::{CapturedPayload, RequestRecord, Telemetry},
     native::{self, RunStore},
     protocol::*,
@@ -40,6 +41,7 @@ pub struct AppState {
     pub telemetry: Arc<Telemetry>,
     pub provider: RwLock<ProviderStatus>,
     pub runs: RunStore,
+    items: ItemStore,
     pub shutdown: CancellationToken,
     slots: Arc<Semaphore>,
     body_slots: Arc<Semaphore>,
@@ -68,6 +70,7 @@ impl AppState {
             telemetry,
             provider: RwLock::new(ProviderStatus::default()),
             runs: RunStore::default(),
+            items: ItemStore::default(),
             shutdown: CancellationToken::new(),
             active: AtomicUsize::new(0),
             queued: AtomicUsize::new(0),
@@ -76,6 +79,7 @@ impl AppState {
     }
 
     pub async fn refresh_provider(&self) {
+        self.items.prune();
         let status = self.runner.probe().await;
         self.telemetry.set_provider(status.clone()).await;
         *self.provider.write().await = status;
@@ -501,6 +505,7 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> Json<Value> {
     Json(
         json!({"provider":"agy", "cli_version":provider.version, "expected_cli_version":state.config.expected_agy_version, "provider_ready":provider.authenticated,
         "profiles":{"model":{"chat_completions":true,"responses":true,"streaming":true,"text":true,"json_schema":true,"client_tools":true,"max_tool_calls_per_turn":1,"parallel_tool_execution":false,"media_input":false,
+                    "item_references":{"enabled":true,"storage":"memory","default_store":true,"ttl_seconds":items::TTL_SECONDS,"max_items":items::MAX_ITEMS,"max_bytes":items::MAX_BYTES,"per_client_items":items::CLIENT_ITEMS,"per_client_bytes":items::CLIENT_BYTES,"cleared_on_restart":true,"eviction":"oldest_first"},
                     "prompt_cache_controls":{"mode":"ignored","retention_guarantee":false,"parameters":["prompt_cache_key","prompt_cache_retention"]},
                     "output_token_budget":{"mode":"prompt_guidance","hard_limit":false,"limits_reasoning_tokens":false,"parameters":["max_output_tokens","max_tokens","max_completion_tokens"]}},
                     "native":{"enabled":state.config.native_enabled,"requires_operator_sandbox_verification":true,"runs":true,"uploaded_files":true,"artifacts":true,"continuation":false}},
@@ -556,9 +561,19 @@ async fn generate(
     let has_cache_hints = ["prompt_cache_key", "prompt_cache_retention"]
         .iter()
         .any(|field| body.get(*field).is_some_and(|value| !value.is_null()));
+    let storage_mode = if body.get("store").and_then(Value::as_bool) == Some(false) {
+        "disabled"
+    } else {
+        "memory"
+    };
     let result = generate_body(state.clone(), key, context.clone(), body, responses)
         .await
         .map(|mut response| {
+            if responses {
+                response
+                    .headers_mut()
+                    .insert("x-ai-router-item-storage", storage_mode.parse().unwrap());
+            }
             if has_cache_hints {
                 response.headers_mut().insert(
                     "x-ai-router-prompt-cache-controls",
@@ -583,9 +598,15 @@ async fn generate_body(
     state: Arc<AppState>,
     key: KeyConfig,
     context: Arc<RequestContext>,
-    body: Value,
+    mut body: Value,
     responses: bool,
 ) -> Result<Response, ApiError> {
+    let store_items = responses && body.get("store").and_then(Value::as_bool).unwrap_or(true);
+    if responses {
+        state
+            .items
+            .resolve(&key.id, &mut body, state.config.max_body_bytes)?;
+    }
     let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let has_token_budget = ["max_output_tokens", "max_tokens", "max_completion_tokens"]
         .iter()
@@ -615,6 +636,7 @@ async fn generate_body(
         })
     );
     let mut run = state.runner.start(request, cancel.clone()).await?;
+    let owner = key.id.clone();
     context.recorded.store(true, Ordering::Relaxed);
     let mut guard = CompletionGuard::new(
         state.clone(),
@@ -637,10 +659,16 @@ async fn generate_body(
             match event {
                 RunEvent::Completed(result) => {
                     let output = if responses {
-                        response_object(&completion_id, created, &model, &result)
+                        response_object(&completion_id, created, &model, &result, store_items)
                     } else {
                         chat_object(&completion_id, created, &model, &result)
                     };
+                    if store_items {
+                        if let Err(error) = state.items.save(&owner, &output) {
+                            guard.observe(&RunEvent::Error(error.clone()));
+                            return Err(error);
+                        }
+                    }
                     guard.capture_response(&output);
                     return Ok(token_budget_response(
                         Json(output).into_response(),
@@ -661,13 +689,21 @@ async fn generate_body(
     }
     let stream = async_stream::stream! {
         let mut guard = guard;
-        let mut render = StreamRenderer::new(responses, completion_id.clone(), model.clone(), created, include_usage);
+        let mut render = StreamRenderer::new(responses, completion_id.clone(), model.clone(), created, include_usage, store_items);
         for item in render.begin() { yield Ok::<Event,Infallible>(item); }
         let mut terminal = false;
-        while let Some(event) = run.events.recv().await {
+        while let Some(mut event) = run.events.recv().await {
+            if store_items {
+                if let RunEvent::Completed(result) = &event {
+                    let output = response_object(&completion_id, created, &model, result, true);
+                    if let Err(error) = state.items.save(&owner, &output) {
+                        event = RunEvent::Error(error);
+                    }
+                }
+            }
             guard.observe(&event);
             if let RunEvent::Completed(result) = &event {
-                let output = if responses { response_object(&completion_id, created, &model, result) }
+                let output = if responses { response_object(&completion_id, created, &model, result, store_items) }
                     else { chat_object(&completion_id, created, &model, result) };
                 guard.capture_response(&output);
             }
@@ -718,13 +754,19 @@ pub fn chat_object(id: &str, created: i64, model: &str, result: &RunResult) -> V
 fn response_tool(tool: &ToolCall) -> Value {
     json!({"id":format!("fc_{}",tool.id),"type":"function_call","status":"completed","call_id":tool.id,"name":tool.name,"arguments":tool.arguments.to_string()})
 }
-pub fn response_object(id: &str, created: i64, model: &str, result: &RunResult) -> Value {
+pub fn response_object(
+    id: &str,
+    created: i64,
+    model: &str,
+    result: &RunResult,
+    store: bool,
+) -> Value {
     let mut output = Vec::new();
     if !result.text.is_empty() || result.tool_calls.is_empty() {
         output.push(json!({"id":format!("msg_{id}"),"type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":result.text,"annotations":[]}]}));
     }
     output.extend(result.tool_calls.iter().map(response_tool));
-    json!({"id":id,"object":"response","created_at":created,"status":"completed","error":null,"incomplete_details":null,"model":model,"output":output,"usage":response_usage(&result.usage),"parallel_tool_calls":false,"store":false,"agy_usage_partial":result.usage_partial})
+    json!({"id":id,"object":"response","created_at":created,"status":"completed","error":null,"incomplete_details":null,"model":model,"output":output,"usage":response_usage(&result.usage),"parallel_tool_calls":false,"store":store,"agy_usage_partial":result.usage_partial})
 }
 
 pub struct CompletionGuard {
@@ -849,6 +891,7 @@ impl Drop for CompletionGuard {
 
 struct StreamRenderer {
     responses: bool,
+    store_items: bool,
     id: String,
     model: String,
     created: i64,
@@ -860,9 +903,17 @@ struct StreamRenderer {
     tool_order: Vec<ToolCall>,
 }
 impl StreamRenderer {
-    fn new(responses: bool, id: String, model: String, created: i64, include_usage: bool) -> Self {
+    fn new(
+        responses: bool,
+        id: String,
+        model: String,
+        created: i64,
+        include_usage: bool,
+        store_items: bool,
+    ) -> Self {
         Self {
             responses,
+            store_items,
             id,
             model,
             created,
@@ -892,7 +943,7 @@ impl StreamRenderer {
         if !self.responses {
             return vec![self.chunk(json!({"role":"assistant","content":""}), Value::Null)];
         }
-        let response = json!({"id":self.id,"object":"response","created_at":self.created,"model":self.model,"status":"in_progress","output":[],"error":null,"incomplete_details":null,"usage":null});
+        let response = json!({"id":self.id,"object":"response","created_at":self.created,"model":self.model,"status":"in_progress","output":[],"error":null,"incomplete_details":null,"usage":null,"store":self.store_items});
         vec![
             self.emit("response.created", json!({"response":response})),
             self.emit("response.in_progress", json!({"response":response})),
@@ -956,7 +1007,7 @@ impl StreamRenderer {
                             json!({"output_index":0,"item":item}),
                         ));
                     }
-                    events.push(self.emit("response.completed",json!({"response":response_object(&self.id,self.created,&self.model,&result)})));
+                    events.push(self.emit("response.completed",json!({"response":response_object(&self.id,self.created,&self.model,&result,self.store_items)})));
                 } else {
                     events.push(self.chunk(
                         json!({}),

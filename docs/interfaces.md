@@ -73,6 +73,28 @@ Protocol types derive serde where appropriate:
   truncated JSON/tool call is promised. Capabilities and successful responses
   disclose `prompt_guidance` / `X-AI-Router-Token-Budget-Mode: prompt-guidance`.
 
+`items::ItemStore` owns completed Responses output items independently of telemetry.
+`save(owner:&str, response:&Value) -> Result<(),ApiError>` atomically saves exact
+output JSON; only the successful completion path calls it. `resolve(owner:&str,
+body:&mut Value, max_bytes:usize) -> Result<(),ApiError>` replaces input item
+references before normalisation. References accept `type:"item_reference"` or
+an omitted/null type, a printable ASCII ID of 1–256 bytes, and no other non-null
+fields. Owner is the authenticated, unique configured client ID. Unknown,
+foreign, expired and evicted IDs share the same 400 `item_reference_not_found`.
+Expanded serialized requests exceeding `max_body_bytes` fail with 413
+`input_too_large`; normal message/tool-history validation still applies.
+The store has a fixed 24-hour TTL from completion, 1,024 items / 16 MiB per client,
+and 4,096 items / 64 MiB globally, measured as serialized JSON. Eviction removes
+oldest items first; startup creates an empty store. Expiration runs on access
+and provider refresh. Oversized output groups fail atomically with 503
+`response_storage_limit`, suggesting `store:false`.
+Responses accept omitted/null/true `store` as enabled and false as opt-out;
+other values are invalid. An opt-out request can resolve earlier saved items.
+Response objects report the selected `store` flag; successful HTTP responses
+include `X-AI-Router-Item-Storage: memory|disabled`. Capabilities expose the
+limits and restart behavior. This does not implement response retrieval,
+`previous_response_id`, provider conversation resume or prompt-cache control.
+
 ## P2 owner: runner.rs, relay.rs, tests/fixtures/fake-agy (and runner unit tests)
 
 `Runner::new(Arc<Config>) -> Runner` (Clone).

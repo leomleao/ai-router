@@ -1,6 +1,7 @@
 pub mod api;
 pub mod auth;
 pub mod config;
+pub mod items;
 pub mod monitor;
 pub mod native;
 pub mod profile;

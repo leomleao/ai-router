@@ -150,8 +150,23 @@ Every `/v1` route requires `Authorization: Bearer <client-key>`.
 | `GET /v1/agy/runs/{id}/artifacts` | List safe files after a successful run |
 | `GET /v1/agy/runs/{id}/artifacts/{path}` | Download a safe, bounded artifact |
 
-Responses are stateless and use `store:false`; retrieval, background Responses,
-and raw provider conversation resumption are unsupported. Streaming preserves
+Responses save completed output items in client-scoped process memory by default
+(`store` omitted, null or true). This lets n8n replay assistant messages and
+function calls using `item_reference` without changing its requests. `store:false`
+disables storage of new outputs; it can still reference earlier saved items.
+Successful Responses disclose `X-AI-Router-Item-Storage: memory` or `disabled`.
+Items expire after 24 hours, with earlier oldest-first eviction above 1,024 items
+or 16 MiB per client, or 4,096 items or 64 MiB globally (serialized JSON bytes).
+Restarting the router clears all items. Start a new n8n chat after deploying this
+feature: IDs returned by an older router cannot be recovered. Missing, expired,
+evicted and foreign references all return `item_reference_not_found`; resend
+complete history or start a new chat. Expanded requests remain subject to the
+request body limit. Storage retains exact output content in memory, separately
+from redacted telemetry, and does not control AGY prompt caching.
+
+Each AGY invocation still replays the submitted history in a fresh conversation.
+Response retrieval, `previous_response_id`, background Responses and raw provider
+conversation resumption are unsupported. Streaming preserves
 stable completion/item/call IDs, terminal status, and cancellation. Before SSE
 starts, failures use ordinary HTTP error responses. After SSE starts, failures
 use terminal error events and never transparently retry a run.

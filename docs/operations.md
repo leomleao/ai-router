@@ -91,6 +91,20 @@ image. A successful host macOS login does not prove these cases.
 | Named volume `ai-router-telemetry` | Persists through container replacement | Router request metadata, bounded to 30 days and 50,000 events |
 | `/run/ai-router/workspaces` on tmpfs | Disappears when the container stops | Request workspaces, uploads, temporary artifacts |
 | `/run/ai-router/monitor.sock` on tmpfs | Disappears when the container stops | Private read-only monitor socket, mode 0600 |
+| Router process memory | Cleared by restart/redeployment | Exact completed Responses output items, scoped to configured client ID; enabled unless `store:false` |
+
+The Responses item store holds raw output content so `item_reference` can replay
+messages and function calls exactly. It is separate from redacted telemetry and
+is never written to the router's volumes. Items expire after 24 hours, with
+earlier oldest-first eviction at 1,024 items / 16 MiB per client or 4,096 items /
+64 MiB globally (serialized JSON bytes; allocation overhead is additional).
+Expiration runs on access and the periodic provider refresh. Successful
+Responses advertise `X-AI-Router-Item-Storage: memory` or `disabled`; capabilities
+publish the same limits. `store:false` disables storage of new outputs but does
+not remove prior items or affect AGY's own state. Keep configured client IDs
+unique to their owners. On restart, eviction or expiry, clients must resend full
+history or start a new chat. Start a new n8n chat when first deploying this
+feature because older response IDs have no saved content.
 
 These are Docker-managed named volumes, with no manually managed host folder.
 AGY may persist its own conversations/cache inside its state volume. The

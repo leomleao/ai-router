@@ -497,6 +497,7 @@ fn validate_common(root: &Map<String, Value>, responses: bool) -> Result<(), Api
             "reasoning",
             "text",
             "max_output_tokens",
+            "store",
         ]
     } else {
         vec![
@@ -514,6 +515,9 @@ fn validate_common(root: &Map<String, Value>, responses: bool) -> Result<(), Api
             "max_completion_tokens",
         ]
     };
+    if responses && nonnull(root.get("store")).is_some_and(|v| !v.is_boolean()) {
+        return Err(ApiError::bad_request("store must be boolean"));
+    }
     for (field, value) in root {
         if value.is_null() || supported.contains(&field.as_str()) {
             continue;

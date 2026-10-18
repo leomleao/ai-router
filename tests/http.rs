@@ -27,6 +27,142 @@ use tower::ServiceExt;
 
 const MODEL: &str = "gemini-3-pro";
 
+async fn completed_response(harness: &Harness, body: Value) -> Value {
+    let streaming = body["stream"] == true;
+    let response = harness
+        .send(Method::POST, "/v1/responses", Some(body), Some("test-key"))
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    if !streaming {
+        return read_json(response).await;
+    }
+    let frames = frames(&read_bytes(response).await);
+    event_json(
+        frames
+            .iter()
+            .find(|f| f.event == "response.completed")
+            .unwrap(),
+    )["response"]
+        .clone()
+}
+
+#[tokio::test]
+async fn response_item_references_replay_exact_history_and_enforce_storage_and_ownership() {
+    let harness = Harness::new(|_| {}).await;
+    for streaming in [false, true] {
+        for store in [
+            None,
+            Some(json!(null)),
+            Some(json!(true)),
+            Some(json!(false)),
+        ] {
+            let mut body = json!({"model":MODEL,"input":"hello","stream":streaming});
+            if let Some(store) = &store {
+                body["store"] = store.clone();
+            }
+            let first = completed_response(&harness, body).await;
+            let stored = store != Some(json!(false));
+            assert_eq!(first["store"], stored);
+            let item = &first["output"][0];
+            let history = json!([{"role":"user","content":"hello"},
+                {"type":"item_reference","id":item["id"]},
+                {"role":"user","content":"__fake_referenced_history__"}]);
+            let next = json!({"model":MODEL,"input":history,"stream":streaming});
+            if stored {
+                let second = completed_response(&harness, next.clone()).await;
+                assert_eq!(
+                    second["output"][0]["content"][0]["text"],
+                    "Hello from fixture"
+                );
+            } else {
+                let (status, error) = harness.post("/v1/responses", next.clone()).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                assert_eq!(error["error"]["code"], "item_reference_not_found");
+            }
+            // A different valid key cannot discover whether this ID exists.
+            let (status, foreign) = harness
+                .json(
+                    Method::POST,
+                    "/v1/responses",
+                    Some(next),
+                    Some("other-test-key"),
+                )
+                .await;
+            let (_, unknown) = harness
+                .post(
+                    "/v1/responses",
+                    json!({"model":MODEL,"input":[{"type":"item_reference","id":"unknown"}]}),
+                )
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(foreign["error"], unknown["error"]);
+        }
+    }
+    for store in [json!(1), json!("false"), json!({})] {
+        let (status, error) = harness
+            .post(
+                "/v1/responses",
+                json!({"model":MODEL,"input":"hello","store":store}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error["error"]["code"], "invalid_request");
+    }
+}
+
+#[tokio::test]
+async fn referenced_function_calls_keep_call_ids_and_failed_stream_items_are_not_stored() {
+    let harness = Harness::new(|_| {}).await;
+    for streaming in [false, true] {
+        let selected=completed_response(&harness,json!({"model":MODEL,"input":"weather","tools":[weather_response()],"stream":streaming})).await;
+        let call = selected["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["type"] == "function_call")
+            .unwrap();
+        let result=completed_response(&harness,json!({"model":MODEL,"input":[{"role":"user","content":"weather"},
+            {"type":"item_reference","id":call["id"]},
+            {"type":"function_call_output","call_id":call["call_id"],"output":"15 C"}],"tools":[weather_response()],"stream":streaming})).await;
+        assert_eq!(
+            result["output"][0]["content"][0]["text"],
+            "Fixture final answer"
+        );
+    }
+    let failed = harness
+        .send(
+            Method::POST,
+            "/v1/responses",
+            Some(json!({"model":MODEL,"input":"__fake_no_result__","stream":true})),
+            Some("test-key"),
+        )
+        .await;
+    let frames = frames(&read_bytes(failed).await);
+    assert!(frames.iter().any(|f| f.event == "response.failed"));
+    let provisional = event_json(
+        frames
+            .iter()
+            .find(|f| f.event == "response.output_item.added")
+            .unwrap(),
+    )["item"]["id"]
+        .clone();
+    let (_, error) = harness
+        .post(
+            "/v1/responses",
+            json!({"model":MODEL,"input":[{"type":"item_reference","id":provisional}]}),
+        )
+        .await;
+    assert_eq!(error["error"]["code"], "item_reference_not_found");
+    let fresh = Harness::new(|_| {}).await;
+    let (_, error) = fresh
+        .post(
+            "/v1/responses",
+            json!({"model":MODEL,"input":[{"type":"item_reference","id":provisional}]}),
+        )
+        .await;
+    assert_eq!(error["error"]["code"], "item_reference_not_found");
+}
+
 #[tokio::test]
 async fn cache_hints_work_for_both_apis_and_streams_with_explicit_disclosure() {
     let harness = Harness::new(|_| {}).await;

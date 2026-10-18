@@ -168,6 +168,11 @@ synthetic_marker("prompt-read")
 assert message["event"] == "user"
 prompt = message["message"]["content"]
 assert isinstance(prompt, str)
+if "__fake_referenced_history__" in prompt:
+    # Fail if a referenced assistant turn was dropped or left as a bare ID.
+    assert '"role":"assistant"' in prompt
+    assert 'Hello from fixture' in prompt
+    assert '"type":"item_reference"' not in prompt
 
 def step(**fields):
     emit({"event": "step_update", "step_update": {

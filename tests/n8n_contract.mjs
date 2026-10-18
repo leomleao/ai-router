@@ -31,7 +31,8 @@ const provider = createOpenAI({
     const response = await fetch(input, init);
     wire.push({ path: url.pathname, body, status: response.status,
       mode: response.headers.get('x-ai-router-token-budget-mode'),
-      cacheControls: response.headers.get('x-ai-router-prompt-cache-controls') });
+      cacheControls: response.headers.get('x-ai-router-prompt-cache-controls'),
+      itemStorage: response.headers.get('x-ai-router-item-storage') });
     return response;
   },
 });
@@ -100,4 +101,33 @@ for (const style of ['chat', 'responses']) {
   checkResult({ text, finishReason: await result.finishReason, usage: await result.usage }, `${style} stream`);
 }
 
+// Preserve the SDK's provider item IDs, exactly as n8n does between turns.
+// Omitted store uses the SDK's default reference behavior, not a forced replay.
+async function turn(messages, streaming, store) {
+  const opts = { model: provider.responses(MODEL), messages,
+    maxRetries: 0, abortSignal: AbortSignal.timeout(30_000),
+    ...(store === undefined ? {} : { providerOptions: { openai: { store } } }) };
+  if (!streaming) return generateText(opts);
+  const result = streamText(opts);
+  let text = '';
+  for await (const chunk of result.textStream) text += chunk;
+  return { text, response: await result.response, usage: await result.usage };
+}
+for (const streaming of [false, true]) {
+  for (const store of [undefined, true, false]) {
+    wire = [];
+    const initial = [{ role: 'user', content: 'Hello' }];
+    const first = await turn(initial, streaming, store);
+    check(first.text === 'Hello from fixture', 'First default-SDK turn succeeds');
+    const next = await turn([...initial, ...first.response.messages,
+      { role: 'user', content: '__fake_referenced_history__' }], !streaming, store);
+    check(wire.length === 2 && wire.every(r => r.status === 200), 'Both SDK turns succeed without retries');
+    check(wire[1].body.input.some(i => i.type === 'item_reference') === (store !== false),
+      'SDK default/true sends actual references; explicit false replays full messages');
+    check(wire.every(r => r.itemStorage === (store === false ? 'disabled' : 'memory')),
+      'Both response modes disclose memory-only item storage');
+    check(next.text === 'Hello from fixture', 'Referenced assistant text reaches the fake provider intact');
+    check(next.usage.totalTokens === 23, 'Reference expansion does not fabricate usage');
+  }
+}
 console.log(`PASS: ${checks} n8n Vercel SDK checks using ai7.0.66/openai4.0.20 and synthetic AGY`);

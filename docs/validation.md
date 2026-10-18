@@ -3,6 +3,38 @@
 All automated tests run in local Docker with explicit fake AGY paths and
 synthetic keys/state.
 
+## n8n Responses item references
+
+The private monitor confirmed the rejected n8n request contained an
+`item_reference` to a prior router-generated assistant message. Upgrading AGY
+alone cannot resolve an HTTP adapter reference. The router now saves completed
+Responses output items as exact, client-scoped JSON in bounded process memory
+and expands references before normal message/tool-history validation. It does
+not reconstruct content from redacted monitor captures or resume AGY sessions.
+
+Default/null/true `store` enables storage, and `store:false` opts out of saving
+new items. A 24-hour TTL and oldest-first per-client/global count and byte
+limits bound retention; restarts clear the store. Headers, capabilities and
+operator docs disclose these boundaries. Clients must start a new chat or
+resend complete history when a referenced item is unavailable, including IDs
+issued before deploying this feature.
+
+Validation passed 93 Rust tests (56 unit, 25 HTTP, 12 runner), monitor PTY
+checks, 122 pinned n8n Vercel SDK checks and 156 OpenAI 3.24.0 TCP/SDK/policy
+checks through `./scripts/test-local.sh`. Actual SDK response messages are
+replayed across streaming/nonstreaming turns with omitted/true/false `store`;
+the tests assert the SDK sends item references for stored turns and complete
+content for opt-out turns. The provider fixture asserts resolved assistant text
+reaches its prompt. HTTP tests cover referenced function calls/results with
+unchanged call IDs, owner isolation, malformed storage flags and failed-stream
+items; unit tests cover exact unredacted synthetic output, expiry, a fresh
+store, count/byte eviction, immutable IDs, atomic oversized writes, reference
+shape and expanded-input limits. These tests use only synthetic AGY and do not
+claim a live n8n application or authenticated AGY 1.4.2 acceptance run.
+The production image also passed health, item-reference capability limits,
+missing-reference errors, expected CLI pin and unauthenticated-readiness smoke
+checks with fresh disposable state; its installed AGY reports 1.4.2.
+
 ## AGY 1.4.2 upgrade
 
 The current adapter and Compose pin target **1.4.2**. Official Linux ARM64 and
