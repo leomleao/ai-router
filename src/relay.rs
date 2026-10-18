@@ -7,6 +7,11 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufRea
 pub(crate) const CATALOGUE_NAME: &str = "router-tools.json";
 pub(crate) const HANDOFF_NAME: &str = "router-handoff.json";
 const MAX_RELAY_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_TOOL_CORRECTIONS: usize = 2;
+
+pub(crate) fn rejection_path(handoff: &Path, attempt: usize) -> std::path::PathBuf {
+    handoff.with_file_name(format!("router-tool-rejection-{attempt}.json"))
+}
 
 /// The catalogue must be the router-created file in the relay's working directory.
 /// This subcommand has no configurable executable, destination, or network transport.
@@ -165,6 +170,14 @@ async fn respond<W: AsyncWrite + Unpin>(writer: &mut W, value: Value) -> Result<
 }
 
 async fn capture(handoff: &Path, value: &Value) -> Result<(), String> {
+    if publish(handoff, value).await? {
+        Ok(())
+    } else {
+        Err("Tool already captured".into())
+    }
+}
+
+async fn publish(handoff: &Path, value: &Value) -> Result<bool, String> {
     // Publish a complete file atomically. hard_link fails rather than replacing
     // an existing call or following a destination symlink.
     let temporary = handoff.with_file_name(format!(
@@ -185,12 +198,24 @@ async fn capture(handoff: &Path, value: &Value) -> Result<(), String> {
         .map_err(|_| "Unable to capture tool")?;
     file.flush().await.map_err(|_| "Unable to capture tool")?;
     drop(file);
-    let published = tokio::fs::hard_link(&temporary, handoff)
-        .await
-        .map_err(|_| "Tool already captured".to_string());
+    let published = match tokio::fs::hard_link(&temporary, handoff).await {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(_) => Err("Unable to publish tool call".to_string()),
+    };
     let _ = tokio::fs::remove_file(&temporary).await;
-    published?;
-    Ok(())
+    published
+}
+
+async fn record_rejection(handoff: &Path, value: &Value) -> Result<usize, String> {
+    // Atomic numbered publications share the budget across relay restarts and
+    // concurrent MCP connections. Neither counters nor files are overwritten.
+    for attempt in 1..=MAX_TOOL_CORRECTIONS + 1 {
+        if publish(&rejection_path(handoff, attempt), value).await? {
+            return Ok(attempt);
+        }
+    }
+    Ok(MAX_TOOL_CORRECTIONS + 1)
 }
 
 async fn serve_io<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
@@ -241,13 +266,38 @@ async fn serve_io<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
             "resources/templates/list" => json!({"resourceTemplates":[]}),
             "prompts/list" => json!({"prompts":[]}),
             "tools/call" => {
+                match tokio::fs::symlink_metadata(rejection_path(handoff, MAX_TOOL_CORRECTIONS + 1))
+                    .await
+                {
+                    Ok(_) => {
+                        std::future::pending::<()>().await;
+                        unreachable!();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => return Err("Correction budget unavailable".into()),
+                }
                 let name = request.pointer("/params/name");
                 let arguments = request
                     .pointer("/params/arguments")
                     .cloned()
                     .unwrap_or_else(|| json!({}));
-                let valid = crate::tool_diagnostics::validate_call(tools, name, &arguments).is_ok();
-                let value = if valid {
+                let validation = crate::tool_diagnostics::validate_call(tools, name, &arguments);
+                if let Err(diagnostic) = &validation {
+                    if diagnostic.repairable() {
+                        let attempt =
+                            record_rejection(handoff, &json!({"name":name,"arguments":arguments}))
+                                .await?;
+                        if attempt <= MAX_TOOL_CORRECTIONS {
+                            respond(&mut writer, json!({"jsonrpc":"2.0","id":id,"result":diagnostic.feedback(MAX_TOOL_CORRECTIONS-attempt+1)})).await?;
+                            continue;
+                        }
+                        // The supervisor observes the third rejection and stops
+                        // the request. Never let relay restarts reset the budget.
+                        std::future::pending::<()>().await;
+                        unreachable!();
+                    }
+                }
+                let value = if validation.is_ok() {
                     serde_json::to_value(ToolCall {
                         id: format!("call_{}", uuid::Uuid::new_v4().simple()),
                         name: name.and_then(Value::as_str).unwrap().to_string(),
@@ -261,7 +311,7 @@ async fn serve_io<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                     json!({"error":"invalid_tool_call","name":name,"arguments":arguments})
                 };
                 capture(handoff, &value).await?;
-                // Deliberately do not fabricate a tool result or let AGY continue.
+                // A valid selection never receives a fabricated tool result.
                 // The supervisor observes the capture and kills this process group.
                 std::future::pending::<()>().await;
                 unreachable!();
@@ -282,6 +332,59 @@ async fn serve_io<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn argument_corrections_share_a_budget_across_relay_restarts() {
+        let root = tempfile::tempdir().unwrap();
+        let handoff = root.path().join(HANDOFF_NAME);
+        for attempt in 1..=MAX_TOOL_CORRECTIONS + 1 {
+            let tool = ToolDefinition {
+                name: "learn_tools".into(),
+                description: String::new(),
+                parameters: json!({"type":"object","properties":{"toolNames":{"type":"array","items":{"type":"string"}}},"required":["toolNames"],"additionalProperties":false}),
+            };
+            let (input, mut client) = tokio::io::duplex(8192);
+            let (response, output) = tokio::io::duplex(8192);
+            let destination = handoff.clone();
+            let server = tokio::spawn(async move {
+                serve_io(BufReader::new(input), output, &[tool], &destination).await
+            });
+            let mut response = BufReader::new(response);
+            client.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"learn_tools\",\"arguments\":{\"wrong\":\"synthetic-private\"}}}\n").await.unwrap();
+            if attempt <= MAX_TOOL_CORRECTIONS {
+                let line = bounded_line(&mut response, 8192).await.unwrap().unwrap();
+                let reply: Value = serde_json::from_slice(&line).unwrap();
+                assert_eq!(reply["result"]["isError"], true);
+                assert!(!reply.to_string().contains("synthetic-private"));
+                assert!(!handoff.exists());
+                client.shutdown().await.unwrap();
+                assert!(server.await.unwrap().is_ok());
+            } else {
+                for _ in 0..200 {
+                    if rejection_path(&handoff, attempt).exists() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                assert!(
+                    tokio::time::timeout(
+                        std::time::Duration::from_millis(30),
+                        bounded_line(&mut response, 8192)
+                    )
+                    .await
+                    .is_err()
+                );
+                assert!(!handoff.exists());
+                server.abort();
+            }
+            assert!(rejection_path(&handoff, attempt).exists());
+        }
+        assert!(
+            capture(&rejection_path(&handoff, 1), &json!({}))
+                .await
+                .is_err()
+        );
+    }
 
     #[tokio::test]
     async fn relay_lists_exact_schema_and_captures_without_result() {

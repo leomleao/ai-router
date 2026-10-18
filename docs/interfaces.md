@@ -183,8 +183,21 @@ relay and supervisor. Rejections emit bounded `client_tool_rejected` JSON on
 gateway stderr with request/model/stage, selected tool, reason, schema paths,
 JSON types and missing schema-declared required fields. Raw validator errors,
 argument values and instance paths must never be formatted into these logs.
-The relay preserves rejected call data in the owned temporary handoff solely
-for supervisor validation; it never executes the tool or fabricates a result.
+The relay preserves rejected call data only in owned temporary files for
+supervisor validation; it never executes the tool or fabricates a successful
+result. Known tools with `arguments_not_object` / `schema_mismatch` receive up
+to two MCP `isError:true` feedback results, containing the bounded diagnostic
+and fixed correction instructions. The third rejection ends the request with
+`invalid_provider_tool_call`. Atomic, non-overwriting numbered publications
+`router-tool-rejection-{1..3}.json` carry attempts and share the budget across
+relay restarts/connections. The supervisor revalidates each attempt, logs it
+once, and revalidates the final handoff; only a valid final call produces a
+client ToolCall. Failed corrections do not enter client history. Deadlines,
+IO bounds, cancellation and native-tool boundaries apply throughout the same
+CLI process. `client_tool_rejected` includes attempt/opportunity counters;
+`client_tool_call_corrected` records successful recovery. Capabilities expose
+`client_tool_argument_correction` with `max_corrections:2`, `scope:request`,
+`same_run:true`, `unknown_tools:false`.
 `AppState::drain(Duration) -> bool` waits for admission cleanup and telemetry
 recording before shutdown flush. `native::shutdown(&AppState) -> bool` cancels
 jobs and reports whether ownership-aware workspace cleanup completed. Failed

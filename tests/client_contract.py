@@ -456,7 +456,7 @@ def tool_diagnostic_contracts():
         status, headers, body = http("/v1/responses", {"model":MODEL,"input":marker,"tools":[tool]})
         check(status == 502 and json.loads(body)["error"]["code"] == code,
               "Tool diagnostics preserve fail-closed HTTP errors")
-        expected[headers["X-Request-Id"]] = (reason, stage, selected)
+        expected[headers["X-Request-Id"]] = (reason, stage, selected, 1 if stage == "dispatch" else 3)
         wait_idle()
         check(not any(WORKSPACES.iterdir()), "Rejected call workspace cleaned after admission is released")
     return expected
@@ -465,6 +465,7 @@ def tool_diagnostic_contracts():
 def verify_tool_diagnostics(server, expected):
     logs = server.stderr.read().decode()
     events = []
+    corrected = []
     for line in logs.splitlines():
         try:
             event = json.loads(line)
@@ -472,19 +473,75 @@ def verify_tool_diagnostics(server, expected):
             continue
         if event.get("event") == "client_tool_rejected":
             events.append(event)
-    for request_id, (reason, stage, selected) in expected.items():
+        if event.get("event") == "client_tool_call_corrected":
+            corrected.append(event)
+    check(len(corrected) == 4 and all(e["rejections"] == 1 and e["selected_tool"] == "Twenty_CRM_learn_tools" for e in corrected),
+          "Every successful correction has a correlated recovery log")
+    check(all(len([r for r in events if r["request_id"] == e["request_id"] and r["correction_offered"]]) == 1 for e in corrected),
+          "Corrected requests retain their initial rejection diagnostic")
+    for request_id, (reason, stage, selected, count) in expected.items():
         matching = [e for e in events if e["request_id"] == request_id]
-        check(len(matching) == 1, "One correlated rejection log survives request workspace cleanup")
+        check(len(matching) == count, "Every bounded rejection survives request workspace cleanup")
         event = matching[0]
         check(event["model"] == MODEL and event["stage"] == stage and
               event["diagnostic"]["reason"] == reason and event["diagnostic"]["selected_tool"] == selected,
               "Tool rejection log identifies model, stage, tool and specific reason")
+        if count == 3:
+            check([e["rejection_attempt"] for e in matching] == [1,2,3] and
+                  [e["correction_offered"] for e in matching] == [True,True,False],
+                  "Two correction opportunities precede terminal validation failure")
         if reason == "schema_mismatch":
             error = event["diagnostic"]["validation_errors"][0]
             check(error["schema_path"] == "/properties/city/type" and error["actual_type"] == "string"
                   and error["expected_types"] == ["integer"], "Schema log reports field and expected/actual types")
     check(all(value not in logs for value in ["London", "synthetic-private-tool-arguments",
-              "synthetic-private-tool-argument-value", "synthetic-private-tool-description", MODEL_KEY]), "Container logs omit argument values, descriptions and bearer key")
+              "synthetic-private-tool-argument-value", "synthetic-private-invalid-value", "synthetic-private-tool-description", MODEL_KEY]), "Container logs omit argument values, descriptions and bearer key")
+
+
+def tool_correction_contracts():
+    schema = {"type":"object","properties":{"toolNames":{"type":"array","items":{"type":"string"},"minItems":1}},
+              "required":["toolNames"],"additionalProperties":False}
+    tool = {"type":"function","name":"Twenty_CRM_learn_tools","description":"Synthetic", "parameters":schema}
+    client = OpenAI(api_key=MODEL_KEY, base_url=BASE+"/v1", max_retries=0, timeout=8)
+    cap = json.loads(http("/v1/capabilities")[2])
+    check(cap["profiles"]["model"]["client_tool_argument_correction"] ==
+          {"max_corrections":2,"scope":"request","same_run":True,"unknown_tools":False},
+          "Capabilities disclose bounded in-run argument correction")
+    for responses in [False,True]:
+        for streaming in [False,True]:
+            if responses:
+                reply = client.responses.create(model=MODEL, input="__fake_repair_success__", tools=[tool], stream=streaming)
+                if streaming:
+                    events = list(reply)
+                    complete = [e.response for e in events if e.type == "response.completed"]
+                    check(len(complete) == 1 and not any(e.type in ("error","response.failed") for e in events),
+                          "Correction stays inside one successful Responses stream")
+                    reply = complete[0]
+                calls = [i for i in reply.output if i.type == "function_call"]
+                check(len(calls) == 1 and json.loads(calls[0].arguments) == {"toolNames":["get_person"]},
+                      "Responses publishes only the corrected call")
+                check(reply.usage.total_tokens in (23,46) and reply.model_extra.get("agy_usage_partial") is True,
+                      "Responses retains observed usage with partial handoff disclosure")
+            else:
+                chat_tool = {"type":"function","function":{k:v for k,v in tool.items() if k != "type"}}
+                reply = client.chat.completions.create(model=MODEL, messages=[{"role":"user","content":"__fake_repair_success__"}],
+                        tools=[chat_tool],stream=streaming, **({"stream_options":{"include_usage":True}} if streaming else {}))
+                if streaming:
+                    chunks = list(reply)
+                    calls = [t for c in chunks if c.choices for t in (c.choices[0].delta.tool_calls or [])]
+                    arguments = "".join(c.function.arguments or "" for c in calls)
+                    check(sum(bool(c.id) for c in calls) == 1, "Chat stream emits one corrected tool call ID")
+                    check(chunks[-1].usage.total_tokens in (23,46), "Chat stream retains observed correction usage")
+                else:
+                    calls = reply.choices[0].message.tool_calls
+                    arguments = calls[0].function.arguments
+                    check(len(calls) == 1 and reply.usage.total_tokens in (23,46), "Chat preserves one corrected call and observed usage")
+                check(json.loads(arguments) == {"toolNames":["get_person"]}, "Chat publishes only corrected arguments")
+    status, _, body = http("/v1/responses", {"model":MODEL,"input":"__fake_repair_exhausted__","tools":[tool],"stream":True})
+    check(status == 200 and b"response.failed" in body and b"invalid_provider_tool_call" in body,
+          "Exhausted corrections produce a terminal SSE failure")
+    check(b"response.completed" not in body and b'"type":"function_call"' not in body,
+          "No failed argument attempt reaches the client as a tool call")
 
 
 def native_transport_contracts():
@@ -539,6 +596,7 @@ def main():
         token_budget_contracts()
         n8n_sdk_contracts()
         policy_contracts()
+        tool_correction_contracts()
         diagnostics = tool_diagnostic_contracts()
     finally:
         stop(server)

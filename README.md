@@ -171,6 +171,16 @@ stable completion/item/call IDs, terminal status, and cancellation. Before SSE
 starts, failures use ordinary HTTP error responses. After SSE starts, failures
 use terminal error events and never transparently retry a run.
 
+Before handing off a client tool, the inert MCP relay validates its arguments.
+For a known tool with invalid arguments, it gives AGY validation feedback and
+allows up to two corrections within the same CLI run and original deadline.
+The third rejected attempt fails with `invalid_provider_tool_call`. Unknown
+tools and model-profile boundary violations still fail immediately. Only a
+schema-valid call reaches the client; the router never executes it. Each
+rejection and successful correction appears in the container's metadata logs,
+and capabilities disclose the correction limit. Model self-correction is
+best effort and may consume additional provider tokens/time.
+
 Model JSON Schema requests instruct the model to return raw JSON, then validate
 the complete final value in Rust. Invalid JSON or schema failures return an
 error; provisional schema output is withheld. This is validated generated text,

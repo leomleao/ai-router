@@ -5,7 +5,10 @@ use crate::{
         ApiError, ModelInfo, ProviderStatus, RunEvent, RunProfile, RunRequest, RunResult, ToolCall,
         Usage,
     },
-    relay::{CATALOGUE_NAME, HANDOFF_NAME, bounded_line, protected_path},
+    relay::{
+        CATALOGUE_NAME, HANDOFF_NAME, MAX_TOOL_CORRECTIONS, bounded_line, protected_path,
+        rejection_path,
+    },
     tool_diagnostics::{Rejection, validate_call},
 };
 use chrono::Utc;
@@ -383,7 +386,7 @@ impl Runner {
             if request.tools.is_empty() {
                 agent.push_str("\nCurrent client tool catalogue:\n[]\nNo client tools are available for this request. Answer directly; if asked about available tools, state that no client tools were supplied.\n");
             } else {
-                agent.push_str("\nClient tools are exposed through the ai-router MCP server. When a client tool is needed to fulfill the request, make a real call_mcp_tool function call for one selected tool. Never simulate a call as text. The client owns execution; do not invent a tool result.\nCurrent client tool catalogue:\n");
+                agent.push_str("\nClient tools are exposed through the ai-router MCP server. When a client tool is needed to fulfill the request, make a real call_mcp_tool function call for one selected tool. Never simulate a call as text. The client owns execution; do not invent a tool result. If the relay returns isError with invalid_client_tool_arguments, no client tool was executed: use the validation feedback and exact current inputSchema to correct your arguments and call again. Only two corrections are allowed within this request. Never invent a result after a validation error.\nCurrent client tool catalogue:\n");
                 agent.push_str(
                     &serde_json::to_string(&request.tools)
                         .map_err(|_| internal("invalid_tool_catalogue"))?,
@@ -822,12 +825,14 @@ async fn supervise(
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut state = DecodeState::default();
     let mut stderr_bytes = Vec::new();
+    let mut rejections_seen = 0;
     let mut terminal: Result<RunResult, ApiError> = loop {
         tokio::select! {
             _ = cancel.cancelled() => break Err(cancelled()),
             _ = sender.closed() => break Err(cancelled()),
             _ = tokio::time::sleep_until(deadline) => break Err(timeout()),
             _ = poll.tick(), if request.profile == RunProfile::Model && !request.tools.is_empty() => {
+                if let Err(error) = read_rejections(&workspace, &request, &mut rejections_seen).await { break Err(error); }
                 match read_handoff(&workspace, &request).await {
                     Ok(Some(call)) => {
                         // MCP publication can beat the matching stdout event.
@@ -902,6 +907,15 @@ async fn supervise(
     drop(stdin);
     guard.kill();
     let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+    // Retain rejection diagnostics even when stdout ends or cancellation wins
+    // before the next poll. Never replace a cancellation/deadline error.
+    if request.profile == RunProfile::Model && !request.tools.is_empty() {
+        if let Err(error) = read_rejections(&workspace, &request, &mut rejections_seen).await {
+            if terminal.is_ok() {
+                terminal = Err(error);
+            }
+        }
+    }
     // Some soft permission denials only appear on stderr even with SUCCESS.
     // Killing the group closes stderr; retain only a safe error classification.
     let drain = async {
@@ -918,6 +932,16 @@ async fn supervise(
     if terminal.is_ok() {
         if let Some(error) = diagnostic_failure(&stderr_bytes) {
             terminal = Err(error);
+        }
+    }
+    if let Ok(result) = &terminal {
+        if rejections_seen > 0 {
+            if let Some(call) = result.tool_calls.first() {
+                eprintln!(
+                    "{}",
+                    json!({"event":"client_tool_call_corrected","request_id":request.request_id,"model":request.model,"selected_tool":call.name,"rejections":rejections_seen})
+                );
+            }
         }
     }
     stdout_task.abort();
@@ -948,7 +972,80 @@ async fn read_handoff(
     workspace: &Path,
     request: &RunRequest,
 ) -> Result<Option<ToolCall>, ApiError> {
-    let path = workspace.join(HANDOFF_NAME);
+    let Some(value) = read_publication(&workspace.join(HANDOFF_NAME)).await? else {
+        return Ok(None);
+    };
+    if value.get("error").is_some() {
+        let arguments = value.get("arguments").unwrap_or(&Value::Null);
+        let diagnostic = validate_call(&request.tools, value.get("name"), arguments)
+            .err()
+            .unwrap_or_else(|| Rejection::new("relay_rejected", value.get("name"), arguments));
+        diagnostic.log(request, "relay");
+        return Err(invalid_tool_call());
+    }
+    let malformed = Rejection::new(
+        "malformed_handoff",
+        value.get("name"),
+        value.get("arguments").unwrap_or(&Value::Null),
+    );
+    let call: ToolCall = serde_json::from_value(value).map_err(|_| {
+        malformed.log(request, "handoff");
+        protocol_error()
+    })?;
+    let name = json!(call.name);
+    let rejection = if !call.id.starts_with("call_") || call.id.len() > 80 {
+        Some(Rejection::new(
+            "invalid_call_id",
+            Some(&name),
+            &call.arguments,
+        ))
+    } else {
+        validate_call(&request.tools, Some(&name), &call.arguments).err()
+    };
+    if let Some(diagnostic) = rejection {
+        diagnostic.log(request, "handoff");
+        return Err(invalid_tool_call());
+    }
+    Ok(Some(call))
+}
+
+fn invalid_tool_call() -> ApiError {
+    ApiError::new(
+        502,
+        "invalid_provider_tool_call",
+        "AGY selected an invalid client tool",
+    )
+}
+
+async fn read_rejections(
+    workspace: &Path,
+    request: &RunRequest,
+    seen: &mut usize,
+) -> Result<(), ApiError> {
+    while *seen <= MAX_TOOL_CORRECTIONS {
+        let attempt = *seen + 1;
+        let path = rejection_path(&workspace.join(HANDOFF_NAME), attempt);
+        let Some(value) = read_publication(&path).await? else {
+            break;
+        };
+        let diagnostic = validate_call(
+            &request.tools,
+            value.get("name"),
+            value.get("arguments").unwrap_or(&Value::Null),
+        )
+        .err()
+        .filter(Rejection::repairable)
+        .ok_or_else(protocol_error)?;
+        diagnostic.log_attempt(request, attempt, MAX_TOOL_CORRECTIONS);
+        *seen = attempt;
+        if attempt > MAX_TOOL_CORRECTIONS {
+            return Err(invalid_tool_call());
+        }
+    }
+    Ok(())
+}
+
+async fn read_publication(path: &Path) -> Result<Option<Value>, ApiError> {
     let metadata = match tokio::fs::symlink_metadata(&path).await {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -970,49 +1067,10 @@ async fn read_handoff(
     options.read(true);
     #[cfg(unix)]
     options.custom_flags(libc::O_NOFOLLOW);
-    let file = options.open(&path).await.map_err(|_| protocol_error())?;
+    let file = options.open(path).await.map_err(|_| protocol_error())?;
     let bytes = read_capped(file, 1024 * 1024).await?;
     let value: Value = serde_json::from_slice(&bytes).map_err(|_| protocol_error())?;
-    if value.get("error").is_some() {
-        let arguments = value.get("arguments").unwrap_or(&Value::Null);
-        let diagnostic = validate_call(&request.tools, value.get("name"), arguments)
-            .err()
-            .unwrap_or_else(|| Rejection::new("relay_rejected", value.get("name"), arguments));
-        diagnostic.log(request, "relay");
-        return Err(ApiError::new(
-            502,
-            "invalid_provider_tool_call",
-            "AGY selected an invalid client tool",
-        ));
-    }
-    let call: ToolCall = serde_json::from_value(value.clone()).map_err(|_| {
-        Rejection::new(
-            "malformed_handoff",
-            value.get("name"),
-            value.get("arguments").unwrap_or(&Value::Null),
-        )
-        .log(request, "handoff");
-        protocol_error()
-    })?;
-    let name = json!(call.name);
-    let rejection = if !call.id.starts_with("call_") || call.id.len() > 80 {
-        Some(Rejection::new(
-            "invalid_call_id",
-            Some(&name),
-            &call.arguments,
-        ))
-    } else {
-        validate_call(&request.tools, Some(&name), &call.arguments).err()
-    };
-    if let Some(diagnostic) = rejection {
-        diagnostic.log(request, "handoff");
-        return Err(ApiError::new(
-            502,
-            "invalid_provider_tool_call",
-            "AGY selected an invalid client tool",
-        ));
-    }
-    Ok(Some(call))
+    Ok(Some(value))
 }
 
 #[derive(Default)]

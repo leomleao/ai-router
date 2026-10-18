@@ -3,6 +3,35 @@
 All automated tests run in local Docker with explicit fake AGY paths and
 synthetic keys/state.
 
+## Bounded client-tool argument correction
+
+New diagnostics identified the live failure precisely: AGY selected
+`Twenty_CRM_learn_tools` without required `toolNames` and with undeclared fields.
+Known tools now receive bounded MCP `isError:true` feedback for non-object
+arguments/schema mismatches, with up to two corrections in the same CLI run.
+The third rejection remains a terminal `invalid_provider_tool_call`; unknown
+tools and native-profile boundary violations still fail immediately. No rejected
+call is handed to the client or executed by the router.
+
+The budget uses atomic, non-overwriting numbered workspace publications and
+survives MCP relay restarts/connections. The supervisor revalidates and logs
+each rejected attempt, and emits `client_tool_call_corrected` after successful
+recovery. Original deadlines, cancellation, IO bounds and partial usage labeling
+remain in effect. Corrections do not start another CLI run or reset SSE IDs.
+
+Synthetic relay/runner tests reproduce the `toolNames` failure, provide real
+MCP error feedback, and require a valid correction before one client call is
+published. Coverage includes budget exhaustion across relay restarts and
+deadline/cancellation after feedback. TCP SDK checks exercise Chat and
+Responses, both streaming modes, valid final arguments, observed partial usage,
+rejection/recovery logs after cleanup and exclusion of private argument values.
+Model self-correction on authenticated AGY remains a separate operator gate.
+
+`./scripts/test-local.sh` passed 98 Rust tests (59 unit, 25 HTTP, 14 runner),
+monitor PTY checks, 122 pinned n8n SDK checks and 187 OpenAI 3.24.0
+TCP/SDK/policy checks. The production gateway image built successfully.
+Streaming exhaustion produces one terminal failure and no client tool call.
+
 ## Rejected client-tool diagnostics
 
 A live AGY 1.4.2 run selected `load_skill` successfully, then failed its next

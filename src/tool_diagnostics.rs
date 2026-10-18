@@ -16,6 +16,28 @@ pub(crate) struct Rejection {
 }
 
 impl Rejection {
+    pub(crate) fn repairable(&self) -> bool {
+        matches!(self.reason, "arguments_not_object" | "schema_mismatch")
+    }
+
+    pub(crate) fn feedback(&self, remaining: usize) -> Value {
+        json!({"isError":true,"content":[{"type":"text","text":json!({
+            "error":"invalid_client_tool_arguments", "diagnostic":self,
+            "remaining_corrections":remaining,
+            "instruction":"No client tool was executed. Correct the arguments to match this tool's exact inputSchema from tools/list: include required fields, remove undeclared fields, and use the declared types and values. Submit a corrected tools/call."
+        }).to_string()}]})
+    }
+
+    pub(crate) fn log_attempt(&self, request: &RunRequest, attempt: usize, limit: usize) {
+        eprintln!(
+            "{}",
+            json!({"event":"client_tool_rejected", "request_id":request.request_id,
+            "model":request.model, "stage":"relay", "diagnostic":self,
+            "rejection_attempt":attempt, "correction_offered":attempt<=limit,
+            "remaining_corrections":limit.saturating_sub(attempt.saturating_sub(1))})
+        );
+    }
+
     pub(crate) fn new(reason: &'static str, name: Option<&Value>, arguments: &Value) -> Self {
         Self {
             reason,

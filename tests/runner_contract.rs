@@ -310,6 +310,92 @@ async fn inert_mcp_handoff_and_followup_preserve_client_execution_boundary() {
 }
 
 #[tokio::test]
+async fn invalid_arguments_can_be_corrected_and_exhaustion_survives_relay_restarts() {
+    let root = tempfile::tempdir().unwrap();
+    let provider = runner(config(root.path()));
+    let tool = ToolDefinition {
+        name: "learn_tools".into(),
+        description: "Synthetic".into(),
+        parameters: json!({"type":"object","properties":{"toolNames":{"type":"array","items":{"type":"string"},"minItems":1}},"required":["toolNames"],"additionalProperties":false}),
+    };
+    let mut input = request("__fake_repair_success__");
+    input.tools.push(tool.clone());
+    let events = collect(&provider, input).await;
+    let result = completed(&events);
+    assert_eq!(result.tool_calls.len(), 1);
+    assert_eq!(
+        result.tool_calls[0].arguments,
+        json!({"toolNames":["get_person"]})
+    );
+    // Handoff can precede the last stdout usage update; retain observed usage
+    // and its existing partial flag rather than fabricate a complete total.
+    assert!([23, 46].contains(&result.usage.as_ref().unwrap().total_tokens));
+    assert!(result.usage_partial);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, RunEvent::ToolCall(_)))
+            .count(),
+        1
+    );
+    for marker in ["__fake_repair_exhausted__", "__fake_repair_restart__"] {
+        let mut input = request(marker);
+        input.tools.push(tool.clone());
+        let events = collect(&provider, input).await;
+        assert_eq!(error(&events), "invalid_provider_tool_call");
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, RunEvent::ToolCall(_) | RunEvent::Completed(_)))
+        );
+    }
+}
+
+#[tokio::test]
+async fn correction_feedback_does_not_extend_deadlines_or_prevent_cancellation() {
+    for cancel_request in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let mut configuration = config(root.path());
+        configuration.request_timeout_secs = 2;
+        let provider = runner(configuration);
+        let mut input = request("__fake_repair_timeout__");
+        let id = input.request_id.clone();
+        input.tools.push(ToolDefinition {name:"learn_tools".into(),description:String::new(),parameters:json!({"type":"object","properties":{"toolNames":{"type":"array"}},"required":["toolNames"],"additionalProperties":false})});
+        let cancel = CancellationToken::new();
+        let mut run = provider.start(input, cancel.clone()).await.unwrap();
+        let marker = root
+            .path()
+            .join("auth")
+            .join(format!("synthetic-repair-feedback-{id}"));
+        for _ in 0..300 {
+            if marker.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(marker.exists(), "provider received correction feedback");
+        if cancel_request {
+            cancel.cancel();
+        }
+        let mut events = Vec::new();
+        while let Some(event) = run.events.recv().await {
+            events.push(event);
+        }
+        assert_eq!(
+            error(&events),
+            if cancel_request {
+                "request_cancelled"
+            } else {
+                "provider_timeout"
+            }
+        );
+        tokio::time::timeout(Duration::from_secs(3), run.finished.cancelled())
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
 async fn current_client_catalogue_refreshes_for_chat_and_responses_without_execution() {
     let root = tempfile::tempdir().unwrap();
     let runner = runner(config(root.path()));

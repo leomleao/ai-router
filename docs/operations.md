@@ -210,7 +210,7 @@ and at most once per minute during operation, including when traffic is idle.
 
 ### Rejected client-tool diagnostics
 
-Container stderr emits one JSON `client_tool_rejected` event when a call fails
+Container stderr emits a JSON `client_tool_rejected` event for each call failing
 relay/handoff validation, crosses the model profile's tool boundary, or completes
 without its required handoff. Each event includes `request_id`, `model`, `stage`
 (`relay`, `handoff`, `dispatch` or `completion`) and a `diagnostic` object.
@@ -232,15 +232,34 @@ also report expected types; required constraints report up to eight missing
 schema-declared field names, each limited to 64 characters. Truncation flags
 identify limited error lists and schema paths.
 
+Known tools with invalid arguments get up to two correction opportunities
+inside the original AGY run. Each `client_tool_rejected` relay event records
+`rejection_attempt` (1–3), `correction_offered` and `remaining_corrections`.
+The first two failures return bounded MCP validation feedback; the third
+ends the request. A valid corrected selection emits `client_tool_call_corrected`
+with the request ID, model, selected tool and number of preceding rejections.
+Unknown tools, disallowed dispatches, invalid schemas and malformed handoffs
+remain immediate failures. Corrections keep the original deadline, cancellation
+and IO limits; they may consume more tokens/time. They never execute client
+tools or start another CLI run, and only the validated final call reaches n8n.
+The request-wide counter survives MCP relay restarts via fixed numbered files.
+Capabilities publish the two-correction budget; no new configuration is needed.
+
 These are metadata-only container logs: no argument values, dynamic argument
 keys/instance paths, enum values, schema descriptions, prompts or raw validator
 messages are emitted. Rejected raw arguments travel only through the existing
-owned temporary handoff file, which is removed with the request workspace.
+owned temporary handoff/rejection files (at most three rejection files, each
+bounded to 1 MiB), removed with the request workspace.
 HTTP errors and the private monitor retain their existing generic error codes;
 diagnostic details are not added to API responses or persisted router telemetry.
 Diagnostics apply to new failures after deployment; previous failed calls cannot
 be reconstructed from their generic errors. Recreating the router also clears
 its Responses item store, so start a new n8n chat afterward.
+
+The feedback uses [MCP tool errors](https://modelcontextprotocol.io/specification/2025-11-25/server/tools#error-handling)
+with `isError:true`, so AGY receives actionable validation feedback without a
+fabricated successful tool result. Automated correction tests prove the adapter;
+whether a particular live model corrects its call remains an operator check.
 
 ## Verification boundaries
 

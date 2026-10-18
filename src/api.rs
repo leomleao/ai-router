@@ -505,6 +505,7 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> Json<Value> {
     Json(
         json!({"provider":"agy", "cli_version":provider.version, "expected_cli_version":state.config.expected_agy_version, "provider_ready":provider.authenticated,
         "profiles":{"model":{"chat_completions":true,"responses":true,"streaming":true,"text":true,"json_schema":true,"client_tools":true,"max_tool_calls_per_turn":1,"parallel_tool_execution":false,"media_input":false,
+                    "client_tool_argument_correction":{"max_corrections":crate::relay::MAX_TOOL_CORRECTIONS,"scope":"request","same_run":true,"unknown_tools":false},
                     "item_references":{"enabled":true,"storage":"memory","default_store":true,"ttl_seconds":items::TTL_SECONDS,"max_items":items::MAX_ITEMS,"max_bytes":items::MAX_BYTES,"per_client_items":items::CLIENT_ITEMS,"per_client_bytes":items::CLIENT_BYTES,"cleared_on_restart":true,"eviction":"oldest_first"},
                     "prompt_cache_controls":{"mode":"ignored","retention_guarantee":false,"parameters":["prompt_cache_key","prompt_cache_retention"]},
                     "output_token_budget":{"mode":"prompt_guidance","hard_limit":false,"limits_reasoning_tokens":false,"parameters":["max_output_tokens","max_tokens","max_completion_tokens"]}},
