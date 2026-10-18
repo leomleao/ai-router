@@ -28,6 +28,87 @@ use tower::ServiceExt;
 const MODEL: &str = "gemini-3-pro";
 
 #[tokio::test]
+async fn cache_hints_work_for_both_apis_and_streams_with_explicit_disclosure() {
+    let harness = Harness::new(|_| {}).await;
+    for path in ["/v1/chat/completions", "/v1/responses"] {
+        for streaming in [false, true] {
+            for hints in [
+                json!({}),
+                json!({"prompt_cache_key":null,"prompt_cache_retention":null}),
+                json!({"prompt_cache_key":"synthetic-cache-key"}),
+                json!({"prompt_cache_retention":"in_memory"}),
+                json!({"prompt_cache_key":"synthetic-cache-key","prompt_cache_retention":"24h"}),
+            ] {
+                let mut body = if path.ends_with("completions") {
+                    json!({"model":MODEL,"messages":[{"role":"user","content":"hello"}]})
+                } else {
+                    json!({"model":MODEL,"input":"hello"})
+                };
+                let has_hints = hints
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .any(|value| !value.is_null());
+                body.as_object_mut()
+                    .unwrap()
+                    .extend(hints.as_object().unwrap().clone());
+                body["stream"] = json!(streaming);
+                let response = harness
+                    .send(Method::POST, path, Some(body), Some("test-key"))
+                    .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(
+                    response
+                        .headers()
+                        .get("x-ai-router-prompt-cache-controls")
+                        .map(|v| v.to_str().unwrap()),
+                    has_hints.then_some("ignored")
+                );
+                let bytes = read_bytes(response).await;
+                assert!(
+                    String::from_utf8_lossy(&bytes).contains("Hello from fixture") || streaming
+                );
+                if streaming {
+                    let frames = frames(&bytes);
+                    assert!(
+                        frames
+                            .iter()
+                            .any(|frame| frame.event == "response.completed"
+                                || frame.data == "[DONE]")
+                    );
+                }
+            }
+        }
+        for (field, value) in [
+            ("prompt_cache_key", json!(true)),
+            ("prompt_cache_retention", json!("forever")),
+        ] {
+            let mut body = if path.ends_with("completions") {
+                json!({"model":MODEL,"messages":[{"role":"user","content":"hello"}]})
+            } else {
+                json!({"model":MODEL,"input":"hello"})
+            };
+            body[field] = value;
+            let (status, error) = harness.post(path, body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(error["error"]["code"], "unsupported_parameter");
+        }
+    }
+    let (status, capabilities) = harness
+        .json(Method::GET, "/v1/capabilities", None, Some("test-key"))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        capabilities["profiles"]["model"]["prompt_cache_controls"]["mode"],
+        "ignored"
+    );
+    assert_eq!(
+        capabilities["profiles"]["model"]["prompt_cache_controls"]["retention_guarantee"],
+        false
+    );
+}
+
+#[tokio::test]
 async fn monitor_captures_actual_call_json_and_streamed_final_output_without_persisting_bodies() {
     let harness = Harness::new(|_| {}).await;
     for streaming in [false, true] {

@@ -501,6 +501,7 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> Json<Value> {
     Json(
         json!({"provider":"agy", "cli_version":provider.version, "expected_cli_version":state.config.expected_agy_version, "provider_ready":provider.authenticated,
         "profiles":{"model":{"chat_completions":true,"responses":true,"streaming":true,"text":true,"json_schema":true,"client_tools":true,"max_tool_calls_per_turn":1,"parallel_tool_execution":false,"media_input":false,
+                    "prompt_cache_controls":{"mode":"ignored","retention_guarantee":false,"parameters":["prompt_cache_key","prompt_cache_retention"]},
                     "output_token_budget":{"mode":"prompt_guidance","hard_limit":false,"limits_reasoning_tokens":false,"parameters":["max_output_tokens","max_tokens","max_completion_tokens"]}},
                     "native":{"enabled":state.config.native_enabled,"requires_operator_sandbox_verification":true,"runs":true,"uploaded_files":true,"artifacts":true,"continuation":false}},
         "unsupported":["sampling_controls","forced_tool_choice","embeddings","audio","image_generation_api","realtime","batches","fine_tuning","provider_management"],
@@ -552,7 +553,20 @@ async fn generate(
             &body,
         )
         .await;
-    let result = generate_body(state.clone(), key, context.clone(), body, responses).await;
+    let has_cache_hints = ["prompt_cache_key", "prompt_cache_retention"]
+        .iter()
+        .any(|field| body.get(*field).is_some_and(|value| !value.is_null()));
+    let result = generate_body(state.clone(), key, context.clone(), body, responses)
+        .await
+        .map(|mut response| {
+            if has_cache_hints {
+                response.headers_mut().insert(
+                    "x-ai-router-prompt-cache-controls",
+                    "ignored".parse().unwrap(),
+                );
+            }
+            response
+        });
     if let Err(error) = &result {
         state
             .telemetry

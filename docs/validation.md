@@ -35,6 +35,28 @@ via `./scripts/test-local.sh`. Rust formatting and `git diff --check` passed.
 The evidence below records the earlier 1.2.15 acceptance runs; it is not a claim
 that those live-provider checks were repeated against 1.3.5.
 
+## n8n prompt cache hint compatibility
+
+Inspection of the running server's private monitor confirmed n8n sends
+Responses requests with a string `prompt_cache_key`,
+`prompt_cache_retention:"24h"`, `stream:true` and `tool_choice:"auto"`.
+The captured error rejected the cache key before starting an AGY run.
+
+Both model APIs now validate and ignore string cache keys and the known
+`in_memory`/`24h` retention hints. They do not reach AGY, alter the normalized
+prompt/tool history, isolate provider caches or promise a retention period.
+Successful hinted responses disclose `X-AI-Router-Prompt-Cache-Controls: ignored`;
+capabilities report the same limitation. Malformed hints and unrelated controls
+remain rejected.
+
+Validation passed 87 Rust tests (52 unit, 23 HTTP, 12 runner), monitor PTY
+checks, 86 pinned n8n Vercel SDK checks and 156 OpenAI 3.24.0 TCP/SDK/policy
+checks. Coverage includes both API styles, both streaming modes, tool
+handoff/result replay with cache hints, unchanged normalized requests and
+usage, and omission/null behavior. A fresh unauthenticated production image
+reports the limitation and admits hinted requests to the provider readiness
+gate. This does not claim a post-fix live n8n run or deployment.
+
 ## Gates
 
 | Gate | Evidence |

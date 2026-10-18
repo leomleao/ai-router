@@ -111,6 +111,15 @@ the actual provider usage. Successful budget-bearing responses include
 same limitation. Omitted/null budgets add no instructions. Supplying both Chat
 budget fields is rejected. This allows n8n's built-in connection probe, which
 always sets a token budget, to reach the provider.
+
+n8n also sends `prompt_cache_key` and `prompt_cache_retention` automatically.
+Both API styles accept string cache keys and retention hints `in_memory` or
+`24h`, then ignore them. They do not change prompts, identify conversations,
+isolate provider caches or guarantee any AGY cache retention period. Successful
+requests carrying either non-null hint include
+`X-AI-Router-Prompt-Cache-Controls: ignored`; `/v1/capabilities` reports this
+limitation. Provider-reported cached-token usage is preserved.
+
 Parallel tool calls are permitted in requests, but this adapter returns at most
 one call per turn. Forced/required tool selection is currently unsupported.
 

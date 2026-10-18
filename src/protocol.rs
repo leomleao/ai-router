@@ -528,6 +528,12 @@ fn validate_common(root: &Map<String, Value>, responses: bool) -> Result<(), Api
             "include" | "stop" => value.as_array().is_some_and(Vec::is_empty),
             "truncation" => responses && value.as_str() == Some("disabled"),
             "verbosity" => !responses && value.as_str() == Some("medium"),
+            // n8n supplies these OpenAI cache hints automatically. They never
+            // reach AGY or change the prompt; retention remains provider-owned.
+            "prompt_cache_key" => value.is_string(),
+            "prompt_cache_retention" => {
+                matches!(value.as_str(), Some("in_memory" | "24h"))
+            }
             _ => false,
         };
         if !benign {
@@ -1170,6 +1176,64 @@ mod tests {
                     .code,
                 "unsupported_parameter"
             );
+        }
+    }
+    #[test]
+    fn cache_hints_preserve_requests_and_reject_malformed_controls() {
+        for responses in [false, true] {
+            let normalize = if responses {
+                normalize_response
+            } else {
+                normalize_chat
+            };
+            let input = if responses {
+                json!({"model":"gemini-test","input":"hello","tools":[{
+                    "type":"function","name":"weather","parameters":{"type":"object"}}],
+                    "reasoning":{"effort":"high"},"text":{"verbosity":"medium"}})
+            } else {
+                let mut input = chat();
+                input["tools"] = json!([tool()]);
+                input["reasoning_effort"] = json!("high");
+                input
+            };
+            let expected =
+                serde_json::to_value(normalize(input.clone(), "req".into()).unwrap()).unwrap();
+            for retention in [Value::Null, json!("in_memory"), json!("24h")] {
+                for key in [Value::Null, json!(""), json!("synthetic-cache-key")] {
+                    let mut value = input.clone();
+                    value["prompt_cache_key"] = key;
+                    value["prompt_cache_retention"] = retention.clone();
+                    assert_eq!(
+                        serde_json::to_value(normalize(value, "req".into()).unwrap()).unwrap(),
+                        expected
+                    );
+                }
+            }
+            for (field, values) in [
+                (
+                    "prompt_cache_key",
+                    vec![json!(true), json!(1), json!([]), json!({})],
+                ),
+                (
+                    "prompt_cache_retention",
+                    vec![
+                        json!("forever"),
+                        json!(""),
+                        json!(24),
+                        json!(false),
+                        json!({}),
+                    ],
+                ),
+                ("prompt_cache_options", vec![json!({"ttl":"30m"})]),
+            ] {
+                for value in values {
+                    let mut input = input.clone();
+                    input[field] = value;
+                    let error = normalize(input, "req".into()).unwrap_err();
+                    assert_eq!(error.code, "unsupported_parameter");
+                    assert!(error.message.starts_with(field));
+                }
+            }
         }
     }
     #[test]

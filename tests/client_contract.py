@@ -243,8 +243,9 @@ def sdk_contracts():
     # Hermes-compatible Chat tool call/result history with a client-owned tool.
     messages = [{"role": "system", "content": "Use supplied client tools when useful."},
                 {"role": "user", "content": "Weather in London"}]
+    cache_hints = {"prompt_cache_key": "synthetic-cache-key", "prompt_cache_retention": "24h"}
     selected = client.chat.completions.create(model=MODEL, messages=messages, tools=[CHAT_TOOL],
-                                             tool_choice="auto", parallel_tool_calls=False)
+                                             tool_choice="auto", parallel_tool_calls=False, **cache_hints)
     call = selected.choices[0].message.tool_calls[0]
     check(selected.choices[0].finish_reason == "tool_calls", "Hermes-shaped tool finish reason")
     check(call.function.name == "weather" and json.loads(call.function.arguments) == {"city": "London"},
@@ -254,7 +255,7 @@ def sdk_contracts():
                       "tool_calls": [{"id": call.id, "type": "function", "function": {
                           "name": call.function.name, "arguments": call.function.arguments}}]},
                      {"role": "tool", "tool_call_id": call.id, "content": "15 C"}])
-    final = client.chat.completions.create(model=MODEL, messages=messages, tools=[CHAT_TOOL], parallel_tool_calls=False)
+    final = client.chat.completions.create(model=MODEL, messages=messages, tools=[CHAT_TOOL], parallel_tool_calls=False, **cache_hints)
     check(final.choices[0].message.content == "Fixture final answer", "Chat tool result/final answer loop")
     streamed = list(client.chat.completions.create(model=MODEL, messages=[{"role": "user", "content": "__fake_tool__"}],
                                                   tools=[CHAT_TOOL], parallel_tool_calls=False, stream=True))
@@ -283,14 +284,14 @@ def sdk_contracts():
 
     # n8n-compatible Responses tool call/result replay: call_id is distinct from item id.
     history = [{"role": "user", "content": [{"type": "input_text", "text": "Weather in London"}]}]
-    selected = client.responses.create(model=MODEL, input=history, tools=[RESPONSE_TOOL], store=False, parallel_tool_calls=False)
+    selected = client.responses.create(model=MODEL, input=history, tools=[RESPONSE_TOOL], store=False, parallel_tool_calls=False, **cache_hints)
     call = next(item for item in selected.output if item.type == "function_call")
     check(call.id != call.call_id and call.call_id.startswith("call_"), "Responses item ID and call ID remain distinct")
     history.extend([call.model_dump(exclude_none=True), {"type": "function_call_output", "call_id": call.call_id, "output": "15 C"}])
-    final = client.responses.create(model=MODEL, input=history, tools=[RESPONSE_TOOL], store=False, parallel_tool_calls=False)
+    final = client.responses.create(model=MODEL, input=history, tools=[RESPONSE_TOOL], store=False, parallel_tool_calls=False, **cache_hints)
     check(final.output_text == "Fixture final answer", "Responses tool result/final answer loop")
     with client.responses.stream(model=MODEL, input="__fake_tool__", tools=[RESPONSE_TOOL], store=False,
-                                 parallel_tool_calls=False) as stream:
+                                 parallel_tool_calls=False, **cache_hints) as stream:
         tool_events = list(stream)
         accumulated = stream.get_final_response()
         item = next(item for item in accumulated.output if item.type == "function_call")

@@ -20,6 +20,7 @@ verification status. Fixture/SDK tests prove the adapter, not Google inference.
 | Forced/required tool choice | None | Rejected; no proven CLI enforcement |
 | Effort/model selection | OpenAI reasoning effort/native effort | Official flags passed through; acceptance depends on the selected model |
 | Answer verbosity | Responses `text.verbosity`, Chat `verbosity` | Absent, null and `medium` are equivalent: the neutral OpenAI/n8n default is accepted without changing the prompt, model or reasoning effort. `low`/`high` and malformed values are rejected; no AGY answer-detail control is promised |
+| Prompt cache hints | Both APIs: `prompt_cache_key`, `prompt_cache_retention` | String keys and `in_memory`/`24h` are accepted and ignored for n8n compatibility. No provider cache control, key-based cache isolation or retention guarantee. Header `X-AI-Router-Prompt-Cache-Controls: ignored` and capabilities disclose this; observed cached-token usage remains unchanged |
 | Native execution modes | Native `mode` | `plan` / `accept-edits` / `auto` select the official CLI flag; profile gated by sandbox verification |
 | Built-in tools/subagents | Native run/event API | Tool/agent steps retained; only built-ins allowed by fixed policy and sandbox, profile off until verified |
 | Input files | Native uploads | Explicit base64 uploads into `input/`; modality interpretation depends on CLI/model/tool support |

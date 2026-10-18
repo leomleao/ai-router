@@ -30,7 +30,8 @@ const provider = createOpenAI({
       : input instanceof Request ? await input.clone().json() : undefined;
     const response = await fetch(input, init);
     wire.push({ path: url.pathname, body, status: response.status,
-      mode: response.headers.get('x-ai-router-token-budget-mode') });
+      mode: response.headers.get('x-ai-router-token-budget-mode'),
+      cacheControls: response.headers.get('x-ai-router-prompt-cache-controls') });
     return response;
   },
 });
@@ -44,7 +45,10 @@ function options(style, budget, neutralDefaults = false) {
     maxOutputTokens: budget,
     abortSignal: AbortSignal.timeout(30_000),
     maxRetries: 0,
-    ...(neutralDefaults ? { providerOptions: { openai: { textVerbosity: 'medium', store: false } } } : {}),
+    ...(neutralDefaults ? { providerOptions: { openai: {
+      textVerbosity: 'medium', store: false,
+      promptCacheKey: 'synthetic-n8n-cache-key', promptCacheRetention: '24h',
+    } } } : {}),
   };
 }
 
@@ -60,9 +64,13 @@ function checkWire(style, budget, streaming, neutralDefaults = false) {
   const verbosity = style === 'responses' ? request.body.text?.verbosity : request.body.verbosity;
   if (neutralDefaults) {
     check(verbosity === 'medium' && request.body.store === false, `${style}: separately requested neutral defaults travel with the budget`);
+    check(request.body.prompt_cache_key === 'synthetic-n8n-cache-key'
+      && request.body.prompt_cache_retention === '24h', `${style}: SDK sends n8n cache hints on the wire`);
+    check(request.cacheControls === 'ignored', `${style}: cache hints are explicitly disclosed as ignored`);
   } else {
     check(verbosity === undefined && request.body.store === undefined,
       `${style}: exact setup probe adds no artificial verbosity/store provider options`);
+    check(request.cacheControls === null, `${style}: no ignored-cache header without hints`);
   }
 }
 
@@ -80,6 +88,10 @@ for (const style of ['chat', 'responses']) {
     checkWire(style, budget, false);
     checkResult(result, style);
   }
+  wire = [];
+  const cached = await generateText(options(style, 16, true));
+  checkWire(style, 16, false, true);
+  checkResult(cached, `${style} with cache hints`);
   wire = [];
   const result = streamText(options(style, 16, true));
   let text = '';
