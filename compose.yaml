@@ -15,7 +15,7 @@ services:
       # Digests only. Operator exports JSON in the calling shell; no env_file.
       AI_ROUTER_KEYS: "${AI_ROUTER_KEYS:?Export digest records before starting}"
       AI_ROUTER_NATIVE_ENABLED: "false"
-      AI_ROUTER_EXPECTED_AGY_VERSION: "1.4.2"
+      AI_ROUTER_EXPECTED_AGY_VERSION: "1.4.3"
       AI_ROUTER_TRUSTED_PROXIES: "${AI_ROUTER_TRUSTED_PROXIES:-}"
     volumes:
       - auth:/var/lib/ai-router/auth

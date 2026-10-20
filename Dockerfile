@@ -54,8 +54,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends python3 python3
 ENV PATH=/opt/test-venv/bin:$PATH
 COPY --from=n8n-contract-deps /usr/local/bin/node /usr/local/bin/node
 COPY --from=n8n-contract-deps /opt/n8n-contract /opt/n8n-contract
+COPY --from=agy-runtime /usr/local/bin/agy /opt/agy-real
 COPY tests ./tests
 RUN cargo test --locked && python3 tests/monitor_tui.py
+RUN --network=none python3 tests/agy_cli_contract.py
 
 FROM agy-runtime AS gateway
 COPY --from=builder /build/target/release/ai-router /usr/local/bin/ai-router

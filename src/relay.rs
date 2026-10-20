@@ -15,6 +15,31 @@ pub(crate) fn tool_alias(index: usize) -> String {
     format!("router_client_{index:03}")
 }
 
+pub(crate) fn provider_tool_name(index: usize) -> String {
+    format!("mcp_ai-router_{}", tool_alias(index))
+}
+
+fn provider_input_schema(index: usize, parameters: &Value) -> Value {
+    let mut input = parameters.clone();
+    // Nesting must not change the resource root of client-local references.
+    // Keep any caller-declared resource identity; otherwise give this schema
+    // its own identity so #/$defs/... still resolves inside the client schema.
+    input
+        .as_object_mut()
+        .unwrap()
+        .entry("$id")
+        .or_insert_with(|| json!(format!("urn:ai-router:client-input:{index}")));
+    json!({"type":"object","properties":{"input":input},"required":["input"],"additionalProperties":false})
+}
+
+pub(crate) fn resolve_provider_tool<'a>(
+    tools: &'a [ToolDefinition],
+    name: &str,
+) -> Option<&'a ToolDefinition> {
+    name.strip_prefix("mcp_ai-router_")
+        .and_then(|alias| resolve_tool_alias(tools, alias))
+}
+
 pub(crate) fn resolve_tool_alias<'a>(
     tools: &'a [ToolDefinition],
     alias: &str,
@@ -276,7 +301,9 @@ async fn serve_io<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
             }
             "ping" => json!({}),
             "tools/list" => {
-                json!({"tools":tools.iter().enumerate().map(|(index,tool)| json!({"name":tool_alias(index),"description":tool.description,"inputSchema":tool.parameters})).collect::<Vec<_>>() })
+                json!({"tools":tools.iter().enumerate().map(|(index,tool)| json!({"name":tool_alias(index),"description":tool.description,
+                    "inputSchema":provider_input_schema(index,&tool.parameters),
+                    "_meta":{"antigravity/alwaysLoad":true}})).collect::<Vec<_>>() })
             }
             "resources/list" => json!({"resources":[]}),
             "resources/templates/list" => json!({"resourceTemplates":[]}),
@@ -293,14 +320,23 @@ async fn serve_io<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                     Err(_) => return Err("Correction budget unavailable".into()),
                 }
                 let name = request.pointer("/params/name");
-                let arguments = request
+                let envelope = request
                     .pointer("/params/arguments")
                     .cloned()
                     .unwrap_or_else(|| json!({}));
+                let valid_envelope = envelope
+                    .as_object()
+                    .is_some_and(|object| object.len() == 1 && object.contains_key("input"));
+                let arguments = envelope.get("input").cloned().unwrap_or(Value::Null);
                 let tool = name
                     .and_then(Value::as_str)
                     .and_then(|alias| resolve_tool_alias(tools, alias));
                 let client_name = tool.map(|tool| json!(tool.name));
+                if tool.is_some() && !valid_envelope {
+                    capture(handoff, &json!({"error":"invalid_tool_envelope","name":client_name,"arguments":Value::Null})).await?;
+                    std::future::pending::<()>().await;
+                    unreachable!();
+                }
                 // An original client name is not a provider alias. Validate
                 // unrecognized names against an empty inventory, never fall back.
                 let validation = crate::tool_diagnostics::validate_call(
@@ -376,6 +412,24 @@ mod tests {
                 resolve_tool_alias(&tools, &tool_alias(index)).unwrap().name,
                 tool.name
             );
+            assert_eq!(
+                resolve_provider_tool(&tools, &provider_tool_name(index))
+                    .unwrap()
+                    .name,
+                tool.name
+            );
+        }
+        for invalid in [
+            "write_todos",
+            "router_client_000",
+            "mcp_other-server_router_client_000",
+            "mcp_ai-router_router_client_999",
+            "mcp_ai-router_router_client_0",
+        ] {
+            assert!(
+                resolve_provider_tool(&tools, invalid).is_none(),
+                "{invalid}"
+            );
         }
         for invalid in [
             "write_todos",
@@ -407,7 +461,7 @@ mod tests {
                 serve_io(BufReader::new(input), output, &[tool], &destination).await
             });
             let mut response = BufReader::new(response);
-            client.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"router_client_000\",\"arguments\":{\"wrong\":\"synthetic-private\"}}}\n").await.unwrap();
+            client.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"router_client_000\",\"arguments\":{\"input\":{\"wrong\":\"synthetic-private\"}}}}\n").await.unwrap();
             if attempt <= MAX_TOOL_CORRECTIONS {
                 let line = bounded_line(&mut response, 8192).await.unwrap().unwrap();
                 let reply: Value = serde_json::from_slice(&line).unwrap();
@@ -444,6 +498,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_transport_envelopes_never_publish_client_arguments() {
+        for envelope in [
+            json!(null),
+            json!("synthetic-private"),
+            json!({}),
+            json!({"city":"synthetic-private"}),
+            json!({"input":{"city":"London"},"extra":"synthetic-private"}),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let handoff = root.path().join(HANDOFF_NAME);
+            let tool = ToolDefinition {
+                name: "weather".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            };
+            let (input, mut client) = tokio::io::duplex(4096);
+            let (mut response, output) = tokio::io::duplex(4096);
+            let destination = handoff.clone();
+            let server = tokio::spawn(async move {
+                serve_io(BufReader::new(input), output, &[tool], &destination).await
+            });
+            let mut request =
+                serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"router_client_000","arguments":envelope}}))
+                .unwrap();
+            request.push(b'\n');
+            client.write_all(&request).await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while !handoff.exists() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let captured = tokio::fs::read(&handoff).await.unwrap();
+            let value: Value = serde_json::from_slice(&captured).unwrap();
+            assert_eq!(value["error"], "invalid_tool_envelope");
+            assert_eq!(value["name"], "weather");
+            assert_eq!(value["arguments"], Value::Null);
+            assert!(
+                !String::from_utf8(captured)
+                    .unwrap()
+                    .contains("synthetic-private")
+            );
+            assert!(!rejection_path(&handoff, 1).exists());
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(20),
+                    bounded_line(&mut BufReader::new(&mut response), 4096)
+                )
+                .await
+                .is_err()
+            );
+            server.abort();
+        }
+    }
+
+    #[test]
+    fn nesting_client_schemas_preserves_local_reference_roots() {
+        for mut schema in [
+            json!({"type":"object","properties":{"value":{"$ref":"#/$defs/value"}},
+                "$defs":{"value":{"type":"string"}},"required":["value"],"additionalProperties":false}),
+            json!({"type":"object","properties":{"value":{"$ref":"#value"}},
+                "$defs":{"value":{"$anchor":"value","type":"string"}},"required":["value"]}),
+        ] {
+            for identity in [None, Some("urn:synthetic-client-schema")] {
+                if let Some(identity) = identity {
+                    schema["$id"] = json!(identity);
+                }
+                let wrapped = provider_input_schema(0, &schema);
+                let validator = jsonschema::validator_for(&wrapped).unwrap();
+                assert!(validator.is_valid(&json!({"input":{"value":"valid"}})));
+                assert!(!validator.is_valid(&json!({"input":{"value":42}})));
+                assert!(!validator.is_valid(&json!({"input":{}})));
+                if let Some(identity) = identity {
+                    assert_eq!(wrapped["properties"]["input"]["$id"], identity);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn relay_lists_exact_schema_and_captures_without_result() {
         let root = tempfile::tempdir().unwrap();
         let handoff = root.path().join(HANDOFF_NAME);
@@ -469,10 +605,14 @@ mod tests {
         let value: Value = serde_json::from_slice(&response).unwrap();
         assert_eq!(value["result"]["tools"][0]["name"], "router_client_000");
         assert_eq!(
-            value.pointer("/result/tools/0/inputSchema/required"),
+            value["result"]["tools"][0]["_meta"]["antigravity/alwaysLoad"],
+            true
+        );
+        assert_eq!(
+            value.pointer("/result/tools/0/inputSchema/properties/input/required"),
             Some(&json!(["city"]))
         );
-        client.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"router_client_000\",\"arguments\":{\"city\":\"London\"}}}\n").await.unwrap();
+        client.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"router_client_000\",\"arguments\":{\"input\":{\"city\":\"London\"}}}}\n").await.unwrap();
         for _ in 0..100 {
             if tokio::fs::metadata(&handoff).await.is_ok() {
                 break;

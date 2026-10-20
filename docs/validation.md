@@ -1,7 +1,52 @@
 # Local validation
 
-All automated tests run in local Docker with explicit fake AGY paths and
-synthetic keys/state.
+Automated tests run in local Docker with synthetic keys/state. Most use an
+explicit fake provider; the pinned official CLI also runs against a loopback
+mock model with external networking disabled.
+
+## AGY 1.4.3 and direct client-tool functions
+
+The installer pins official release `1.4.3-4577820882632704`, with separate
+SHA-512 checks for Linux ARM64 and AMD64, and verifies `agy --version`.
+The official ARM64 executable's 60-name `init.tools` registry was independently
+recaptured against a synthetic Gemini endpoint and matches the compiled
+1.4.3 snapshot. Inventory drift still fails closed.
+
+The latest production failure had `unapproved_mcp_server`, with no selected
+tool preserved by the old diagnostics. Direct functions now remove that
+model-selected routing envelope: the inert MCP catalogue advertises
+`_meta.antigravity/alwaysLoad:true`, a capability documented in the official
+[1.3.3 changelog](https://github.com/google-antigravity/antigravity-cli/blob/main/CHANGELOG.md).
+The real 1.4.3 model declarations contain qualified functions bound to the
+private server and omit `call_mcp_tool`. Native/provider tool steps and unknown
+aliases remain terminal errors. Stream claims without an actual validated
+relay handoff cannot produce a client call.
+
+Real CLI testing also established that its required `toolSummary` metadata
+must be separate from closed client argument schemas. A fixed private `input`
+envelope preserves client fields, including a field named `toolSummary`.
+The relay unwraps and independently validates the original schema. Client
+schemas receive their own resource root when needed to preserve local refs.
+Logs classify malformed dispatch shapes and server-name status without raw
+server names, encoded envelopes or argument values.
+
+`tests/agy_cli_contract.py` exercises the official CLI, real gateway and real
+inert relay in fresh synthetic state. It covers both API styles and streaming
+modes, colliding native/client names, second-tool selection, nested objects,
+closed union schemas, local references, metadata separation, invalid-argument
+correction and native-tool rejection. Quota/model/agent-list management probe
+metadata is synthetic: fresh API-key mode lists no main agents on both 1.4.2
+and 1.4.3, although actual custom-agent execution works. Production's strict
+account-backed preflight is unchanged. These checks do not claim subscription
+authentication or live inference acceptance; that remains an operator gate.
+
+`AI_ROUTER_TEST_IMAGE=ai-router-test:agy143-direct-final ./scripts/test-local.sh`
+passed 106 Rust tests (66 unit, 25 HTTP, 15 runner), monitor PTY checks,
+109 official CLI/gateway/MCP checks, 122 pinned n8n SDK checks and 235 OpenAI
+3.24.0 TCP/SDK/policy checks. `python3 scripts/test-docker-policy.py` passed
+with synthetic protected-path fixtures. The production gateway image built
+successfully with the pinned ARM64 executable. No signed-in provider state
+was used for these checks.
 
 ## Distinct client-tool dispatch names
 

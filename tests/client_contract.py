@@ -453,6 +453,7 @@ def tool_diagnostic_contracts():
         ("__fake_direct_client__", TOOL_SCHEMA, "unapproved_provider_tool", "dispatch", "weather", "provider_native_tool_violation"),
         ("__fake_double_dispatch__", TOOL_SCHEMA, "unknown_tool", "dispatch", "call_mcp_tool", "provider_native_tool_violation"),
         ("__fake_wrong_server__", TOOL_SCHEMA, "unapproved_mcp_server", "dispatch", "router_client_000", "provider_native_tool_violation"),
+        ("__fake_nonobject_dispatch__", TOOL_SCHEMA, "unapproved_mcp_server", "dispatch", None, "provider_native_tool_violation"),
     ]
     for marker, parameters, reason, stage, selected, code in cases:
         tool = {"type":"function", "name":"weather", "description":"synthetic-private-tool-description", "parameters":parameters}
@@ -497,8 +498,12 @@ def verify_tool_diagnostics(server, expected):
             error = event["diagnostic"]["validation_errors"][0]
             check(error["schema_path"] == "/properties/city/type" and error["actual_type"] == "string"
                   and error["expected_types"] == ["integer"], "Schema log reports field and expected/actual types")
+        if reason == "unapproved_mcp_server":
+            check(event["dispatch"]["server_name_status"] == ("missing" if selected is None else "other")
+                  and event["dispatch"]["parameters_type"] == ("string" if selected is None else "object"),
+                  "Dispatch diagnostics distinguish malformed envelopes from incorrect servers without values")
     check(all(value not in logs for value in ["London", "synthetic-private-tool-arguments",
-              "synthetic-private-tool-argument-value", "synthetic-private-invalid-value", "synthetic-private-unexpected-field", "synthetic-private-tool-description", MODEL_KEY]), "Container logs omit argument values, dynamic keys, descriptions and bearer key")
+              "synthetic-private-tool-argument-value", "synthetic-private-invalid-value", "synthetic-private-unexpected-field", "synthetic-private-encoded-envelope", "synthetic-private-tool-description", MODEL_KEY]), "Container logs omit argument values, dynamic keys, descriptions and bearer key")
 
 
 def tool_alias_contracts():

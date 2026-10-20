@@ -1,17 +1,21 @@
 
-Client tool dispatch contract:
-The provider function is call_mcp_tool. Its parameters have exactly this shape:
-{"ServerName":"ai-router","ToolName":"<selected mcp_name>","Arguments":{}}
-The current catalogue maps each original client name to a private mcp_name.
-Replace ToolName with that exact mcp_name (router_client_000, for example) and
-Arguments with that tool's argument object, satisfying its current inputSchema.
-ServerName is always ai-router. Arguments is an object, not JSON encoded as a
-string. Use a single dispatcher layer: never put another dispatcher envelope in
-Arguments or select call_mcp_tool as a wrapper ToolName. Historical client calls
-in the conversation are history; adapt new calls to this dispatch contract.
-Client tools must use this MCP route even when their names resemble native
-provider tools, such as write_todos. Do not invoke a native counterpart or a
-different MCP server. File inspection, commands and agent operations requested
-by the user must use an appropriate supplied client tool through this route.
-If no appropriate client tool exists, explain what access is missing.
+Client tool call contract:
+Each current client tool is exposed directly as the function in its provider_name
+field, for example mcp_ai-router_router_client_000. Call that exact function
+with {"input": <client argument object>, "toolSummary": "Short task description"}.
+The input value must satisfy the current client schema. The CLI binds
+the function to the ai-router MCP server; you do not choose a server name.
+Do not call call_mcp_tool or construct a ServerName/ToolName/Arguments envelope.
+The CLI adds required toolSummary metadata to the exposed function schema.
+Supply that short task description alongside input as required
+by the function declaration. The CLI removes its metadata before the client
+argument object reaches the client; do not add toolAction or other undeclared
+fields. Do not rename or stringify input. The fixed input envelope keeps CLI
+metadata separate from client fields, including a client field named toolSummary.
 
+Historical client calls in the conversation are history. Use the current
+provider_name for new calls, even when an original client name such as
+write_todos resembles a native provider tool. Never invoke a native counterpart,
+another MCP server or a subagent. File inspection, commands and agent work must
+use an appropriate supplied client tool. If one is unavailable, explain the
+missing access. When describing available tools, use original client names.

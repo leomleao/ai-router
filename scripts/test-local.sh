@@ -1,5 +1,5 @@
 #!/bin/sh
-# Docker-only runtime tests. This image contains the synthetic provider only;
+# Docker-only runtime tests. Client contracts use a synthetic provider;
 # authentication volumes never overlap with the real AGY service volume.
 set -eu
 test_image=${AI_ROUTER_TEST_IMAGE:-ai-router-test:local}

@@ -88,7 +88,7 @@ async fn provider_discovery_checks_pin_and_sanitizes_quota() {
     let mut config = config(root.path());
     let status = runner(config.clone()).probe().await;
     assert!(status.authenticated, "{:?}", status.error);
-    assert_eq!(status.version, "1.4.2");
+    assert_eq!(status.version, "1.4.3");
     assert_eq!(status.models.len(), 2);
     assert_eq!(
         status
@@ -124,7 +124,7 @@ async fn unauthenticated_model_probe_classifies_stdout_without_exposing_diagnost
     )
     .unwrap();
     let status = runner(config).probe().await;
-    assert_eq!(status.version, "1.4.2");
+    assert_eq!(status.version, "1.4.3");
     assert!(!status.authenticated);
     assert!(status.models.is_empty());
     assert_eq!(status.error.as_deref(), Some("provider_auth_required"));
@@ -358,6 +358,8 @@ async fn private_tool_aliases_preserve_original_names_and_reject_native_dispatch
         "__fake_direct_client__",
         "__fake_double_dispatch__",
         "__fake_wrong_server__",
+        "__fake_wrong_direct_server__",
+        "__fake_outside_direct_alias__",
     ] {
         let mut input = request(marker);
         input.tools.push(ToolDefinition {
@@ -373,6 +375,19 @@ async fn private_tool_aliases_preserve_original_names_and_reject_native_dispatch
                 .any(|e| matches!(e, RunEvent::ToolCall(_) | RunEvent::Completed(_)))
         );
     }
+    let mut input = request("__fake_no_mcp_handoff__");
+    input.tools.push(ToolDefinition {
+        name: "write_todos".into(),
+        description: String::new(),
+        parameters,
+    });
+    let events = collect(&provider, input).await;
+    assert_eq!(error(&events), "invalid_provider_tool_call");
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, RunEvent::ToolCall(_) | RunEvent::Completed(_)))
+    );
 }
 
 #[tokio::test]

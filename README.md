@@ -14,7 +14,7 @@ flowchart LR
     P --> R[127.0.0.1:8090 → Rust gateway]
     R --> A[Authentication, limits, validation]
     A --> M[Shared AGY subprocess supervisor]
-    M --> G[Official AGY 1.4.2]
+    M --> G[Official AGY 1.4.3]
     G --> S[Google subscription]
     M --> T[Private monitor socket]
     G --> V[Named AGY state volume]
@@ -133,7 +133,9 @@ missing selections can be diagnosed without logging prompts or tool arguments.
 
 The private MCP interface uses request-local names such as `router_client_000`
 to keep client tools distinct from AGY native tools with the same name. The
-owned agent receives the exact dispatcher format and original-name mapping.
+CLI exposes each alias as a direct function bound to the private server, so
+the model does not need to choose a server or construct a dispatcher envelope.
+Client arguments live inside a private `input` object, separate from CLI metadata.
 Validation and client responses use the original tool names; n8n needs no
 changes. Invalid argument feedback identifies the same private name to retry.
 Unknown names, native calls and other MCP servers still fail closed.
@@ -267,14 +269,15 @@ privileges. See the native verification gate in the operations guide.
 ./scripts/test-local.sh
 ```
 
-The local suite builds and tests in Docker, uses an explicit synthetic fake AGY,
-exercises the actual Rust MCP relay, runs network/client contract checks, and
-uses disposable test state separate from the login volume. Fixtures never
-fall back to the signed-in host CLI. See [validation evidence](docs/validation.md)
+The local suite builds and tests in Docker, exercises the Rust MCP relay with a
+synthetic provider, and tests the official pinned CLI against a loopback mock
+model with external networking disabled. Client contracts use disposable test
+state separate from the login volume. Fixtures never fall back to the signed-in
+host CLI. See [validation evidence](docs/validation.md)
 for the commands/results and the remaining authenticated checks.
 
-The local suite passes 70 Rust tests and 76 HTTP/SDK checks. Authenticated
-acceptance also passes 15 live SDK checks for Gemini text, both API styles,
+The local suite covers Rust, monitor PTY, n8n SDK and OpenAI SDK contracts.
+Earlier authenticated acceptance passed 15 live SDK checks for Gemini text, both API styles,
 streams, JSON Schema and client-owned tool loops. AGY login survives restart
 and container recreation; Claude text also passes after restart. Running the
 complete installed n8n/Hermes applications and enabling the native sandbox

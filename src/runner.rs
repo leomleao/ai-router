@@ -7,7 +7,7 @@ use crate::{
     },
     relay::{
         CATALOGUE_NAME, HANDOFF_NAME, MAX_TOOL_CORRECTIONS, bounded_line, protected_path,
-        rejection_path, resolve_tool_alias, tool_alias,
+        provider_tool_name, rejection_path, resolve_provider_tool, resolve_tool_alias, tool_alias,
     },
     tool_diagnostics::{Rejection, validate_call},
 };
@@ -32,12 +32,13 @@ use tokio_util::sync::CancellationToken;
 
 const AGENT_NAME: &str = "router-model";
 const SERVER_NAME: &str = "ai-router";
-const VERIFIED_AGY_VERSION: &str = "1.4.2";
+const VERIFIED_AGY_VERSION: &str = "1.4.3";
 const STDERR_LIMIT: usize = 64 * 1024;
 
 /// The pinned contract carries forward the global init.tools inventory
-/// observed on AGY 1.3.5, rather than a custom agent's effective tools.
-/// Recheck the exact inventory on every 1.4.2 init before sending a prompt;
+/// recaptured from the official 1.4.3 executable with a synthetic model API,
+/// rather than a custom agent's effective tools.
+/// Recheck the exact inventory on every 1.4.3 init before sending a prompt;
 /// a changed registry fails closed until it has been independently reviewed.
 /// Effective model isolation comes from the owned custom-agent configuration,
 /// with no built-in components and at most the fixed inert MCP server. Every
@@ -50,7 +51,7 @@ fn verified_init_registry(tools: &[String]) -> bool {
     }
     static REGISTRY: std::sync::OnceLock<Registry> = std::sync::OnceLock::new();
     let registry = REGISTRY.get_or_init(|| {
-        serde_json::from_str(include_str!("agy-init-tools-1.4.2.json"))
+        serde_json::from_str(include_str!("agy-init-tools-1.4.3.json"))
             .expect("the compiled public AGY registry snapshot must be valid")
     });
     let expected: HashSet<_> = registry.tools.iter().map(String::as_str).collect();
@@ -378,7 +379,7 @@ impl Runner {
                     json!(["mcp-relay", catalogue.to_string_lossy().as_ref()])
                 ));
             }
-            // MCP supplies its dispatcher dynamically. Listing call_mcp_tool
+            // MCP supplies its tools dynamically. Listing call_mcp_tool
             // as a built-in frontmatter component is invalid in AGY 1.2.15.
             agent.push_str("---\n# System Prompt\nYou are the assistant in the supplied complete conversation. Never perform native file, command, web or agent operations.\n");
             agent.push_str(&request.system);
@@ -387,7 +388,7 @@ impl Runner {
                 agent.push_str("\nCurrent client tool catalogue:\n[]\nNo client tools are available for this request. Answer directly; if asked about available tools, state that no client tools were supplied.\n");
             } else {
                 agent.push_str(include_str!("model-tool-contract.md"));
-                agent.push_str("\nClient tools are exposed through the ai-router MCP server. When a client tool is needed to fulfill the request, make a real call_mcp_tool function call for one selected tool. Never simulate a call as text. The client owns execution; do not invent a tool result. If the relay returns isError with invalid_client_tool_arguments, no client tool was executed: use the validation feedback and exact current inputSchema to correct your arguments and call again. Only two corrections are allowed within this request. Never invent a result after a validation error.\nCurrent client tool catalogue:\n");
+                agent.push_str("\nClient tools are exposed directly through the ai-router MCP server. When a client tool is needed to fulfill the request, call the exact provider_name for one selected tool. Never simulate a call as text. The client owns execution; do not invent a tool result. If the relay returns isError with invalid_client_tool_arguments, no client tool was executed: use the validation feedback and exact current client schema to correct input and call again. Only two corrections are allowed within this request. Never invent a result after a validation error.\nCurrent client tool catalogue:\n");
                 agent.push_str(
                     &serde_json::to_string(
                         &request
@@ -395,7 +396,7 @@ impl Runner {
                             .iter()
                             .enumerate()
                             .map(|(index, tool)| {
-                                json!({"name":tool.name,"mcp_name":tool_alias(index),
+                                json!({"name":tool.name,"mcp_name":tool_alias(index),"provider_name":provider_tool_name(index),
                                     "description":tool.description,"parameters":tool.parameters})
                             })
                             .collect::<Vec<_>>(),
@@ -988,9 +989,15 @@ async fn read_handoff(
     };
     if value.get("error").is_some() {
         let arguments = value.get("arguments").unwrap_or(&Value::Null);
-        let diagnostic = validate_call(&request.tools, value.get("name"), arguments)
-            .err()
-            .unwrap_or_else(|| Rejection::new("relay_rejected", value.get("name"), arguments));
+        let diagnostic = if value.get("error").and_then(Value::as_str)
+            == Some("invalid_tool_envelope")
+        {
+            Rejection::new("invalid_tool_envelope", value.get("name"), arguments)
+        } else {
+            validate_call(&request.tools, value.get("name"), arguments)
+                .err()
+                .unwrap_or_else(|| Rejection::new("relay_rejected", value.get("name"), arguments))
+        };
         diagnostic.log(request, "relay");
         return Err(invalid_tool_call());
     }
@@ -1186,51 +1193,63 @@ impl DecodeState {
                         .get("tool_name")
                         .and_then(Value::as_str)
                         .or_else(|| step.pointer("/tool_info/name").and_then(Value::as_str));
-                    if name != Some("call_mcp_tool") || step.get("subagent_info").is_some() {
-                        Rejection::new(
-                            "unapproved_provider_tool",
-                            name.map(|name| json!(name)).as_ref(),
-                            &Value::Null,
-                        )
-                        .log(request, "dispatch");
-                        return Err(native_violation());
-                    }
-                    let parameters = step.pointer("/tool_info/parameters").ok_or_else(|| {
-                        Rejection::new("malformed_dispatch", None, &Value::Null)
-                            .log(request, "dispatch");
-                        native_violation()
-                    })?;
-                    if parameters.get("ServerName").and_then(Value::as_str) != Some(SERVER_NAME) {
-                        Rejection::new(
-                            "unapproved_mcp_server",
-                            parameters.get("ToolName"),
-                            parameters.get("Arguments").unwrap_or(&Value::Null),
-                        )
-                        .log(request, "dispatch");
-                        return Err(native_violation());
-                    }
-                    let name = parameters
-                        .get("ToolName")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| {
+                    if step.get("subagent_info").is_none()
+                        && let Some(tool) =
+                            name.and_then(|name| resolve_provider_tool(&request.tools, name))
+                    {
+                        // Eager MCP functions are bound to our sole server by
+                        // the pinned CLI. A matching inert relay publication
+                        // and independent argument validation are still required.
+                        self.dispatched_tools.insert(tool.name.clone());
+                    } else {
+                        if name != Some("call_mcp_tool") || step.get("subagent_info").is_some() {
                             Rejection::new(
-                                "invalid_tool_name",
+                                "unapproved_provider_tool",
+                                name.map(|name| json!(name)).as_ref(),
+                                &Value::Null,
+                            )
+                            .log_dispatch(request, step);
+                            return Err(native_violation());
+                        }
+                        let parameters =
+                            step.pointer("/tool_info/parameters").ok_or_else(|| {
+                                Rejection::new("malformed_dispatch", None, &Value::Null)
+                                    .log_dispatch(request, step);
+                                native_violation()
+                            })?;
+                        if parameters.get("ServerName").and_then(Value::as_str) != Some(SERVER_NAME)
+                        {
+                            Rejection::new(
+                                "unapproved_mcp_server",
                                 parameters.get("ToolName"),
                                 parameters.get("Arguments").unwrap_or(&Value::Null),
                             )
-                            .log(request, "dispatch");
-                            native_violation()
-                        })?;
-                    let Some(tool) = resolve_tool_alias(&request.tools, name) else {
-                        Rejection::new(
-                            "unknown_tool",
-                            parameters.get("ToolName"),
-                            parameters.get("Arguments").unwrap_or(&Value::Null),
-                        )
-                        .log(request, "dispatch");
-                        return Err(native_violation());
-                    };
-                    self.dispatched_tools.insert(tool.name.clone());
+                            .log_dispatch(request, step);
+                            return Err(native_violation());
+                        }
+                        let name = parameters
+                            .get("ToolName")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| {
+                                Rejection::new(
+                                    "invalid_tool_name",
+                                    parameters.get("ToolName"),
+                                    parameters.get("Arguments").unwrap_or(&Value::Null),
+                                )
+                                .log_dispatch(request, step);
+                                native_violation()
+                            })?;
+                        let Some(tool) = resolve_tool_alias(&request.tools, name) else {
+                            Rejection::new(
+                                "unknown_tool",
+                                parameters.get("ToolName"),
+                                parameters.get("Arguments").unwrap_or(&Value::Null),
+                            )
+                            .log_dispatch(request, step);
+                            return Err(native_violation());
+                        };
+                        self.dispatched_tools.insert(tool.name.clone());
+                    }
                 }
                 if step_type == "agent_response" {
                     if let Some(delta) = step.get("text_delta").and_then(Value::as_str) {

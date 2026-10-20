@@ -38,7 +38,7 @@ def fixture():
         })
     return {
         "generated_at": now.isoformat(), "active": 2, "queued": 1,
-        "provider": {"version": "1.4.2", "authenticated": True, "checked_at": now.isoformat(), "error": None,
+        "provider": {"version": "1.4.3", "authenticated": True, "checked_at": now.isoformat(), "error": None,
                      "models": [{"id": "gemini-3-pro", "name": "Gemini 3 Pro"}],
                      "quota": {"groups": [{"name": "Gemini", "buckets": [{"id": "pro", "remaining_fraction": .72}]}]}},
         "provider_age_seconds": 12,

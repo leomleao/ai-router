@@ -13,7 +13,7 @@ Root wraps config in `Arc<Config>`. Public fields:
 
 ```text
 bind: String (default 0.0.0.0:8080 inside container)
-agy_bin: PathBuf; expected_agy_version: String (1.4.2)
+agy_bin: PathBuf; expected_agy_version: String (1.4.3)
 state_dir: PathBuf; workspace_dir: PathBuf; telemetry_dir: PathBuf
 monitor_socket: PathBuf; keys: Vec<KeyConfig>
 trusted_proxies: Vec<IpAddr>
@@ -112,8 +112,8 @@ one terminal event. AGY is invoked by argument vector, never a shell. Capture
 bounded stderr privately; sanitised provider error codes go to HTTP/telemetry.
 Use real CLI `--input-format stream-json --output-format stream-json`, disable
 slash expansion on model requests, and select a fixed custom agent with
-tools:[], excludeDefaultComponents:true and inheritMcp:false. The 1.4.2 adapter
-expects the global registry and echoed agent name observed on 1.3.5; any
+tools:[], excludeDefaultComponents:true and inheritMcp:false. The 1.4.3 adapter
+expects the global registry independently recaptured on 1.4.3; any
 inventory drift fails closed before user input. Before launching the
 conversation process, run the fixed `/agents` JSON management command in the
 owned workspace and require the parsed agent name, zero turns/usage, and no
@@ -200,11 +200,21 @@ CLI process. `client_tool_rejected` includes attempt/opportunity counters;
 `same_run:true`, `unknown_tools:false`.
 The provider-facing MCP catalogue uses canonical request-local names
 `router_client_000` through `router_client_127`. The owned model catalogue maps
-each original `name` to `mcp_name`; tool schemas and descriptions are preserved.
+each original `name` to `mcp_name` and the qualified direct `provider_name`
+(`mcp_ai-router_router_client_000`, etc.). MCP tools advertise
+`_meta.antigravity/alwaysLoad:true`, binding each function to the sole server
+without a model-selected routing envelope. Its private input schema contains
+one required `input` field holding the original client schema. CLI metadata
+such as `toolSummary` stays outside that object and is stripped by the CLI.
+Schemas without their own `$id` receive a private resource identity so local
+references keep their original root after nesting; caller identities are kept.
+The relay accepts exactly that envelope and validates the unwrapped arguments.
 The relay and stream decoder resolve aliases against the same immutable tool
 order, with no original-name fallback. Handoffs, schema validation, successful
 correction logs and API tool calls retain original client names. Correction
-feedback includes the private `mcp_name` to retry. Native provider operations,
+feedback includes the private `provider_name` to retry. Direct stream steps
+alone cannot create client calls: a matching inert relay publication is required.
+Native provider operations,
 unknown aliases, nested dispatcher selections and other servers remain rejected.
 `Rejection::feedback` additionally exposes bounded provider-only `field_feedback`
 for additional-property violations: unexpected names, declared fields and exact

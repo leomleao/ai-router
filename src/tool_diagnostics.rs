@@ -48,10 +48,11 @@ impl Rejection {
         json!({"isError":true,"content":[{"type":"text","text":json!({
             "error":"invalid_client_tool_arguments", "diagnostic":self,
             "mcp_name":mcp_name,
+            "provider_name":format!("mcp_ai-router_{mcp_name}"),
             "field_feedback":self.field_feedback,
             "field_feedback_truncated":self.field_feedback_truncated,
             "remaining_corrections":remaining,
-            "instruction":"No client tool was executed. Correct arguments using the exact inputSchema from tools/list. Remove the unexpected_fields at the indicated instance_path; allowed_fields lists declared fields at that schema location. If allows_pattern_fields is true, names matching patternProperties are also allowed. Choose a suitable anyOf/oneOf branch before applying its hints; do not combine conflicting branch lists. Include required fields and declared types/values. Consult the full inputSchema when field lists are unavailable or any fields, paths or lists are truncated. Submit a corrected tools/call to the mcp_name in this feedback; do not switch to the original client name or a native provider tool."
+            "instruction":"No client tool was executed. Correct arguments using the exact current client inputSchema. Remove the unexpected_fields at the indicated instance_path; allowed_fields lists declared fields at that schema location. If allows_pattern_fields is true, names matching patternProperties are also allowed. Choose a suitable anyOf/oneOf branch before applying its hints; do not combine conflicting branch lists. Include required fields and declared types/values. Consult the full inputSchema when field lists are unavailable or any fields, paths or lists are truncated. Retry the direct function identified by provider_name with input set to the corrected client argument object and toolSummary set to the CLI-required task description. Feedback paths are relative to input. Do not construct a ServerName/ToolName/Arguments envelope or switch to a native provider tool."
         }).to_string()}]})
     }
 
@@ -93,6 +94,34 @@ impl Rejection {
             "model":request.model, "stage":stage, "diagnostic":self})
         );
     }
+
+    pub(crate) fn log_dispatch(&self, request: &RunRequest, step: &Value) {
+        eprintln!(
+            "{}",
+            json!({"event":"client_tool_rejected","request_id":request.request_id,
+            "model":request.model,"stage":"dispatch","diagnostic":self,
+            "dispatch":dispatch_metadata(step)})
+        );
+    }
+}
+
+fn dispatch_metadata(step: &Value) -> Value {
+    let parameters = step.pointer("/tool_info/parameters");
+    let field_type = |field: &str| {
+        parameters
+            .and_then(|p| p.get(field))
+            .map_or("missing", value_type)
+    };
+    let server_status = match parameters.and_then(|p| p.get("ServerName")) {
+        None => "missing",
+        Some(Value::Null) => "null",
+        Some(Value::String(name)) if name == "ai-router" => "expected",
+        Some(Value::String(_)) => "other",
+        Some(_) => "non_string",
+    };
+    json!({"parameters_type":parameters.map_or("missing",value_type),"server_name_status":server_status,
+        "tool_name_type":field_type("ToolName"),"arguments_type":field_type("Arguments"),
+        "subagent_reported":step.get("subagent_info").is_some()})
 }
 
 fn bounded_fields<'a>(fields: impl Iterator<Item = &'a str>) -> (Vec<String>, bool) {
@@ -360,6 +389,30 @@ pub(crate) fn validate_call(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dispatch_metadata_distinguishes_shape_without_exposing_values() {
+        for (value, expected) in [
+            (json!({}), "missing"),
+            (json!({"ServerName":null}), "null"),
+            (json!({"ServerName":123}), "non_string"),
+            (json!({"ServerName":"ai-router"}), "expected"),
+            (
+                json!({"ServerName":"synthetic-private-server","Arguments":{"synthetic-private-key":"synthetic-private-value"}}),
+                "other",
+            ),
+        ] {
+            let metadata = dispatch_metadata(&json!({"tool_info":{"parameters":value}}));
+            assert_eq!(metadata["server_name_status"], expected);
+            assert!(!metadata.to_string().contains("synthetic-private"));
+        }
+        assert_eq!(
+            dispatch_metadata(
+                &json!({"tool_info":{"parameters":"synthetic-private-encoded-envelope"}})
+            )["parameters_type"],
+            "string"
+        );
+    }
 
     fn feedback(rejection: &Rejection) -> Value {
         serde_json::from_str(

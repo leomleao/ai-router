@@ -4,7 +4,7 @@ Run the gateway in Docker with a loopback-only origin at `127.0.0.1:8090`.
 For remote access, configure an HTTPS reverse proxy on your own domain.
 Change the loopback port with `AI_ROUTER_PORT`.
 
-The image contains the official Linux AGY **1.4.2** executable. Installation
+The image contains the official Linux AGY **1.4.3** executable. Installation
 uses immutable release URLs and SHA-512 values from the official installer’s
 Linux ARM64/AMD64 manifests, then checks `agy --version`. The documented
 `AGY_CLI_DISABLE_AUTO_UPDATE=true` setting prevents background updates from
@@ -15,7 +15,7 @@ The runner and image set `AGY_CLI_OSC7501=off` so headless JSON pipes do not
 carry terminal-status escape sequences. Release upgrades update the immutable
 URL, both checksums, the compiled adapter version and its inventory contract
 together. If your deployment overrides `AI_ROUTER_EXPECTED_AGY_VERSION`, change
-it to `1.4.2` when deploying this release, or remove that override to use the
+it to `1.4.3` when deploying this release, or remove that override to use the
 compiled default. This repository's Compose file pins the matching version.
 
 ## Build and keys
@@ -212,11 +212,13 @@ and at most once per minute during operation, including when traffic is idle.
 
 AGY sees private tool aliases (`router_client_000`, etc.) mapped to the current
 client names in its owned agent catalogue. This avoids exposing a client tool
-such as `write_todos` under the same MCP name as an AGY native tool. New calls
-must use `call_mcp_tool` once, with `ServerName:ai-router`, the selected private
-alias in `ToolName`, and the tool argument object in `Arguments`. n8n still
-receives the original function name and validated arguments. Invalid-argument
-feedback repeats the private `mcp_name` so correction stays on the same route.
+such as `write_todos` under the same MCP name as an AGY native tool. The CLI
+loads each tool eagerly as a direct function, for example
+`mcp_ai-router_router_client_000`. The server binding is fixed; the model no
+longer supplies `ServerName`, `ToolName` or `Arguments`. Its client arguments go
+inside `input`, separate from the CLI-required `toolSummary` metadata. n8n still
+receives the original function name and validated client arguments.
+Invalid-argument feedback repeats the direct `provider_name` for correction.
 Alias indexes belong only to the current request; historical client names do
 not establish a provider route. No changes to n8n's tool definitions are needed.
 
@@ -239,7 +241,11 @@ docker logs --since 15m ai-router 2>&1 | jq -R 'fromjson? | select(.event == "cl
 Reasons distinguish `unknown_tool`, `invalid_tool_name`, `arguments_not_object`,
 `schema_mismatch`, `invalid_tool_schema`, `invalid_call_id`, `malformed_handoff`,
 `relay_rejected`, `unapproved_provider_tool`, `unapproved_mcp_server`,
-`malformed_dispatch` and `missing_handoff`. Valid identifier-shaped selected
+`malformed_dispatch`, `invalid_tool_envelope` and `missing_handoff`. Dispatch
+events also report parameter/field JSON types, whether a subagent was reported,
+and `server_name_status` (`missing`, `null`, `expected`, `other`, `non_string`).
+They never include the raw server name or encoded argument envelopes.
+Valid identifier-shaped selected
 tool names are recorded up to 64 ASCII characters; other names are omitted.
 Schema failures include up to eight errors, each with the schema path (up to
 256 characters), instance nesting depth and actual JSON type. Type constraints
@@ -310,7 +316,13 @@ limits, native artifact transport fixtures, and monitoring persistence. The
 test image's provider path points explicitly to the synthetic executable; its
 temporary named volumes have unique `ai-router-contract-*` names and are
 removed after the run. It uses neither the operator's auth volume nor host AGY.
-Python and the OpenAI SDK are installed in the test image only.
+Python and the OpenAI SDK are installed in the test image only. A separate
+build step runs the official pinned CLI with a loopback mock Gemini endpoint
+and external networking disabled. It verifies real custom-agent loading,
+direct MCP dispatch, nested schemas and CLI metadata handling in fresh
+synthetic state. Only version discovery and conversation execution use the
+official binary; quota/model/agent-list probe metadata is synthetic. No saved
+login or real inference is used by this test.
 
 The second command uses host Python to drive Docker/Compose configuration and
 build-context checks with freshly created synthetic dummy files. It passes

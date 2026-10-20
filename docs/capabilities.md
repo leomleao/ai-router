@@ -1,11 +1,14 @@
 # Capability matrix
 
-The installed CLI pin is **1.4.2**. Authenticated Linux acceptance evidence
-currently covers **1.2.15**; live 1.4.2 acceptance is an operator gate.
+The installed CLI pin is **1.4.3**. Authenticated Linux acceptance evidence
+currently covers **1.2.15**; live 1.4.3 acceptance is an operator gate.
 Capabilities are not inferred from the OpenAI endpoint catalogue. The official
 CLI is the provider boundary.
 `GET /v1/capabilities` reports the active version, catalogue, readiness and
 verification status. Fixture/SDK tests prove the adapter, not Google inference.
+The official 1.4.3 binary also passes direct MCP handoff tests against a
+loopback mock model in isolated synthetic state; this does not verify account
+authentication, quota or real model selection behavior.
 
 | Feature | HTTP surface | Current evidence / boundary |
 | --- | --- | --- |
