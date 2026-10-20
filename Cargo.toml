@@ -3,7 +3,7 @@ name = "ai-router"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "A capability-aware HTTP gateway over the official Antigravity CLI"
+description = "A model-only HTTP gateway over direct Antigravity and ChatGPT plan providers"
 
 [dependencies]
 async-stream = "0.3"

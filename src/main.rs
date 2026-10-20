@@ -1,10 +1,9 @@
 use ai_router::{
+    antigravity::Antigravity,
     api::{self, AppState},
     auth,
     config::Config,
     monitor::{self, MonitorArgs, Telemetry},
-    native, relay,
-    runner::Runner,
 };
 use std::future::IntoFuture;
 use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -22,16 +21,11 @@ async fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str).unwrap_or("serve") {
         "openai" => return ai_router::openai_auth::operator(&args[1..]).await,
-        "mcp-relay" => {
-            if args.len() != 2 {
-                return Err("Usage: ai-router mcp-relay <catalogue>".into());
-            }
-            return relay::serve_stdio(std::path::Path::new(&args[1])).await;
-        }
+        "antigravity" => return antigravity_operator(&args[1..]).await,
         "keygen" => {
             let id = args
                 .get(1)
-                .ok_or("Usage: ai-router keygen <client-id> [model|native ...]")?;
+                .ok_or("Usage: ai-router keygen <client-id> [model]")?;
             if id.is_empty()
                 || id.len() > 64
                 || !id
@@ -45,11 +39,8 @@ async fn run() -> Result<(), String> {
             } else {
                 vec!["model".into()]
             };
-            if scopes
-                .iter()
-                .any(|s| !matches!(s.as_str(), "model" | "native"))
-            {
-                return Err("Scopes must be model or native".into());
+            if scopes.iter().any(|s| s != "model") {
+                return Err("The only supported scope is model".into());
             }
             let (key, record) = auth::generate_key(id, scopes);
             ai_router::config::validate_key(&record)?;
@@ -99,24 +90,20 @@ async fn run() -> Result<(), String> {
         }
         "--help" | "-h" => {
             println!(
-                "ai-router serve | openai login|logout|status|accounts|select|resume | keygen <id> [model|native ...] | monitor [--json|--text] [--range 24h] | mcp-relay <catalogue>"
+                "ai-router serve | openai login|logout|status|accounts|select|resume | keygen <id> [model] | monitor [--json|--text] [--range 24h] | antigravity login|status|logout|resume"
             );
             return Ok(());
         }
         _ => return Err("Unknown command; use --help".into()),
     }
     let config = Arc::new(Config::from_env()?);
-    ai_router::profile::initialize(&config)?;
-    tokio::fs::create_dir_all(&config.workspace_dir)
-        .await
-        .map_err(|_| "Could not create workspace directory")?;
     let telemetry = Arc::new(Telemetry::open(
         &config.telemetry_dir,
         config.retention_days,
         config.max_events,
     )?);
-    let runner = Runner::new(config.clone());
-    let state = AppState::new(config.clone(), runner, telemetry.clone());
+    let antigravity = Antigravity::new(config.clone());
+    let state = AppState::new(config.clone(), antigravity, telemetry.clone());
     let cancel = CancellationToken::new();
     let monitor_cancel = cancel.clone();
     let socket = config.monitor_socket.clone();
@@ -128,7 +115,6 @@ async fn run() -> Result<(), String> {
         let mut retry = 5;
         loop {
             background.refresh_agy().await;
-            native::reap(&background).await;
             let healthy = background.provider.read().await.authenticated;
             let delay = probe_delay(healthy, &mut retry);
             tokio::select! {_ = background_cancel.cancelled()=>break,_ = tokio::time::sleep(delay)=>{}}
@@ -147,6 +133,31 @@ async fn run() -> Result<(), String> {
             let healthy = openai_background.openai_provider.read().await.authenticated;
             let delay = probe_delay(healthy, &mut retry);
             tokio::select! {_ = openai_cancel.cancelled()=>break,_ = tokio::time::sleep(delay)=>{}}
+        }
+    });
+    // Keep monitor status aligned with request admission as cached account
+    // availability can change between provider catalogue probes.
+    let monitor_status = state.clone();
+    let monitor_status_cancel = cancel.clone();
+    let monitor_status_task = tokio::spawn(async move {
+        loop {
+            tokio::join!(
+                monitor_status.publish_openai_monitor_status(),
+                monitor_status.publish_agy_monitor_status()
+            );
+            tokio::select! {
+                _ = monitor_status_cancel.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            }
+        }
+    });
+    let release = state.antigravity.release.clone();
+    let release_telemetry = state.telemetry.clone();
+    let release_cancel = cancel.clone();
+    let release_task = tokio::spawn(async move {
+        loop {
+            tokio::select! { _=release_cancel.cancelled()=>break, value=release.refresh()=>release_telemetry.set_antigravity_release(value).await }
+            tokio::select! { _=release_cancel.cancelled()=>break, _=tokio::time::sleep(Duration::from_secs(3600))=>{} }
         }
     });
     let listener = tokio::net::TcpListener::bind(&config.bind)
@@ -182,19 +193,20 @@ async fn run() -> Result<(), String> {
     drop(server);
     cancel.cancel();
     state.stop();
-    let native_cleaned = native::shutdown(&state).await;
     let drained = state.drain(Duration::from_secs(6)).await;
     background_task.abort();
     openai_background_task.abort();
+    let _ = release_task.await;
+    let _ = monitor_status_task.await;
     let _ = monitor_task.await;
     shutdown_telemetry.flush().await;
-    if drained && native_cleaned {
+    if drained {
         match server_error {
             Some(error) => Err(error),
             None => Ok(()),
         }
     } else {
-        Err("Shutdown cleanup failed or exceeded its deadline; some client bodies or workspace cleanup did not drain".into())
+        Err("Shutdown cleanup failed or exceeded its deadline; some client bodies or provider cleanup did not drain".into())
     }
 }
 
@@ -224,4 +236,44 @@ fn probe_delay(healthy: bool, retry: &mut u64) -> Duration {
     let delay = (*retry + u64::from(rand::random::<u8>() % 3)).min(60);
     *retry = retry.saturating_mul(2).min(60);
     Duration::from_secs(delay)
+}
+
+async fn antigravity_operator(args: &[String]) -> Result<(), String> {
+    use ai_router::antigravity_auth::{AntigravityAuth, OAuthConfig};
+    let directory = std::env::var("AI_ROUTER_STATE_DIR")
+        .unwrap_or_else(|_| "/var/lib/ai-router/antigravity-auth".into());
+    let auth = AntigravityAuth::new(directory.into(), OAuthConfig::from_env())
+        .map_err(|e| e.to_string())?;
+    let value = match args.first().map(String::as_str) {
+        Some("login") => {
+            let port = match args {
+                [_] => 1456,
+                [_, flag, value] if flag == "--port" => {
+                    value.parse::<u16>().map_err(|_| "Invalid callback port")?
+                }
+                _ => return Err("Usage: ai-router antigravity login [--port N]".into()),
+            };
+            auth.login(port).await.map_err(|e| e.to_string())?
+        }
+        Some("status") if args.len() == 1 => auth.status().await.map_err(|e| e.to_string())?,
+        Some("logout") if args.len() == 1 => {
+            auth.logout().await.map_err(|e| e.to_string())?;
+            auth.status().await.map_err(|e| e.to_string())?
+        }
+        Some("resume") if args.len() == 1 => {
+            let generation = auth.generation().await.map_err(|e| e.to_string())?;
+            auth.resume(&generation).await.map_err(|e| e.to_string())?;
+            auth.status().await.map_err(|e| e.to_string())?
+        }
+        _ => {
+            return Err(
+                "Usage: ai-router antigravity login [--port N] | status | logout | resume".into(),
+            );
+        }
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&value).map_err(|_| "Could not format status")?
+    );
+    Ok(())
 }

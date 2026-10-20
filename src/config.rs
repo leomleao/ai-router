@@ -17,14 +17,12 @@ pub struct KeyConfig {
 #[derive(Clone, Debug)]
 pub struct Config {
     pub bind: String,
-    pub agy_bin: PathBuf,
-    pub expected_agy_version: String,
     pub state_dir: PathBuf,
+    pub antigravity_enabled: bool,
     pub openai_enabled: bool,
     pub openai_state_dir: PathBuf,
     pub openai_max_concurrent: usize,
     pub openai_max_queue: usize,
-    pub workspace_dir: PathBuf,
     pub telemetry_dir: PathBuf,
     pub monitor_socket: PathBuf,
     pub keys: Vec<KeyConfig>,
@@ -34,11 +32,9 @@ pub struct Config {
     pub max_concurrent: usize,
     pub max_queue: usize,
     pub request_timeout_secs: u64,
-    pub artifact_ttl_secs: u64,
     pub preauth_per_minute: u32,
     pub global_preauth_per_minute: u32,
     pub per_key_per_minute: u32,
-    pub native_enabled: bool,
     pub retention_days: u64,
     pub max_events: usize,
 }
@@ -60,9 +56,12 @@ impl Config {
             Ok(lookup(name)?.unwrap_or_else(|| fallback.to_owned()))
         };
         let bind = value("AI_ROUTER_BIND", "0.0.0.0:8080")?;
-        let agy_bin = value("AI_ROUTER_AGY_BIN", "/usr/local/bin/agy")?.into();
-        let expected_agy_version = value("AI_ROUTER_EXPECTED_AGY_VERSION", "1.4.3")?;
-        let state_dir = value("AI_ROUTER_STATE_DIR", "/var/lib/ai-router/auth")?.into();
+        let state_dir = value("AI_ROUTER_STATE_DIR", "/var/lib/ai-router/antigravity-auth")?.into();
+        let antigravity_enabled = match value("AI_ROUTER_ANTIGRAVITY_ENABLED", "true")?.as_str() {
+            "true" => true,
+            "false" => false,
+            _ => return Err("AI_ROUTER_ANTIGRAVITY_ENABLED must be true or false".to_owned()),
+        };
         let openai_enabled = match value("AI_ROUTER_OPENAI_ENABLED", "false")?.as_str() {
             "true" => true,
             "false" => false,
@@ -73,7 +72,6 @@ impl Config {
             "/var/lib/ai-router/openai-auth",
         )?
         .into();
-        let workspace_dir = value("AI_ROUTER_WORKSPACE_DIR", "/run/ai-router/workspaces")?.into();
         let telemetry_dir =
             value("AI_ROUTER_TELEMETRY_DIR", "/var/lib/ai-router/telemetry")?.into();
         let monitor_socket =
@@ -103,21 +101,14 @@ impl Config {
                     .map_err(|_| format!("{} must be an unsigned integer", $name))?
             };
         }
-        let native_enabled = match value("AI_ROUTER_NATIVE_ENABLED", "false")?.as_str() {
-            "true" => true,
-            "false" => false,
-            _ => return Err("AI_ROUTER_NATIVE_ENABLED must be true or false".to_owned()),
-        };
         let config = Self {
             bind,
-            agy_bin,
-            expected_agy_version,
             state_dir,
+            antigravity_enabled,
             openai_enabled,
             openai_state_dir,
             openai_max_concurrent: number!("AI_ROUTER_OPENAI_MAX_CONCURRENT", "2"),
             openai_max_queue: number!("AI_ROUTER_OPENAI_MAX_QUEUE", "8"),
-            workspace_dir,
             telemetry_dir,
             monitor_socket,
             keys,
@@ -127,11 +118,9 @@ impl Config {
             max_concurrent: number!("AI_ROUTER_MAX_CONCURRENT", "2"),
             max_queue: number!("AI_ROUTER_MAX_QUEUE", "8"),
             request_timeout_secs: number!("AI_ROUTER_REQUEST_TIMEOUT_SECS", "120"),
-            artifact_ttl_secs: number!("AI_ROUTER_ARTIFACT_TTL_SECS", "3600"),
             preauth_per_minute: number!("AI_ROUTER_PREAUTH_PER_MINUTE", "60"),
             global_preauth_per_minute: number!("AI_ROUTER_GLOBAL_PREAUTH_PER_MINUTE", "600"),
             per_key_per_minute: number!("AI_ROUTER_PER_KEY_PER_MINUTE", "30"),
-            native_enabled,
             retention_days: number!("AI_ROUTER_RETENTION_DAYS", "30"),
             max_events: number!("AI_ROUTER_MAX_EVENTS", "50000"),
         };
@@ -144,37 +133,23 @@ impl Config {
             .parse::<SocketAddr>()
             .map_err(|_| "AI_ROUTER_BIND must be an IP address and port".to_owned())?;
         for (name, path) in [
-            ("AGY_BIN", &self.agy_bin),
             ("STATE_DIR", &self.state_dir),
             ("OPENAI_STATE_DIR", &self.openai_state_dir),
-            ("WORKSPACE_DIR", &self.workspace_dir),
             ("TELEMETRY_DIR", &self.telemetry_dir),
             ("MONITOR_SOCKET", &self.monitor_socket),
         ] {
             validate_path(name, path)?;
         }
-        let storage = [
-            &self.state_dir,
-            &self.openai_state_dir,
-            &self.workspace_dir,
-            &self.telemetry_dir,
-        ];
+        let storage = [&self.state_dir, &self.openai_state_dir, &self.telemetry_dir];
         for (i, path) in storage.iter().enumerate() {
             for other in storage.iter().skip(i + 1) {
                 if path.starts_with(other) || other.starts_with(path) {
-                    return Err("AGY authentication, OpenAI authentication, workspaces, and telemetry paths must be separate directories".to_owned());
+                    return Err("Antigravity authentication, OpenAI authentication, and telemetry paths must be separate directories".to_owned());
                 }
             }
             if self.monitor_socket.starts_with(path) {
-                return Err("Monitor socket must be outside AGY authentication, OpenAI authentication, workspaces, and telemetry directories".to_owned());
+                return Err("Monitor socket must be outside Antigravity authentication, OpenAI authentication, and telemetry directories".to_owned());
             }
-        }
-        let versions: Vec<_> = self.expected_agy_version.split('.').collect();
-        if versions.len() != 3 || versions.iter().any(|part| part.parse::<u32>().is_err()) {
-            return Err(
-                "AI_ROUTER_EXPECTED_AGY_VERSION must be a numeric major.minor.patch version"
-                    .to_owned(),
-            );
         }
         if self.keys.is_empty() || self.keys.len() > 1000 {
             return Err(
@@ -217,7 +192,6 @@ impl Config {
         )?;
         bounds("OPENAI_MAX_QUEUE", self.openai_max_queue as u64, 0, 1024)?;
         bounds("REQUEST_TIMEOUT_SECS", self.request_timeout_secs, 1, 3600)?;
-        bounds("ARTIFACT_TTL_SECS", self.artifact_ttl_secs, 1, 86400)?;
         bounds(
             "PREAUTH_PER_MINUTE",
             self.preauth_per_minute as u64,
@@ -246,20 +220,18 @@ impl Config {
         let digest = Sha256::digest(b"test-key");
         Self {
             bind: "127.0.0.1:0".to_owned(),
-            agy_bin: root.join("fake-agy"),
-            expected_agy_version: "1.4.3".to_owned(),
-            state_dir: root.join("auth"),
+            state_dir: root.join("antigravity-auth"),
+            antigravity_enabled: true,
             openai_enabled: false,
             openai_state_dir: root.join("openai-auth"),
             openai_max_concurrent: 2,
             openai_max_queue: 8,
-            workspace_dir: root.join("workspaces"),
             telemetry_dir: root.join("telemetry"),
             monitor_socket: root.join("monitor.sock"),
             keys: vec![KeyConfig {
                 id: "test".to_owned(),
                 sha256: encode_hex(&digest),
-                scopes: vec!["model".to_owned(), "native".to_owned()],
+                scopes: vec!["model".to_owned()],
             }],
             trusted_proxies: Vec::new(),
             max_body_bytes: 1048576,
@@ -267,11 +239,9 @@ impl Config {
             max_concurrent: 2,
             max_queue: 8,
             request_timeout_secs: 120,
-            artifact_ttl_secs: 3600,
             preauth_per_minute: 60,
             global_preauth_per_minute: 600,
             per_key_per_minute: 30,
-            native_enabled: false,
             retention_days: 30,
             max_events: 50000,
         }
@@ -289,11 +259,11 @@ pub fn validate_key(key: &KeyConfig) -> Result<(), String> {
         return Err("Client sha256 must contain exactly 64 hexadecimal characters".to_owned());
     }
     if key.scopes.is_empty()
-        || key.scopes.len() > 2
-        || key.scopes.iter().any(|s| s != "model" && s != "native")
+        || key.scopes.len() > 1
+        || key.scopes.iter().any(|s| s != "model")
         || key.scopes.iter().collect::<HashSet<_>>().len() != key.scopes.len()
     {
-        return Err("Client scopes must contain unique model and/or native entries".to_owned());
+        return Err("Client scopes must contain only the model entry".to_owned());
     }
     Ok(())
 }
@@ -376,37 +346,44 @@ mod tests {
     #[test]
     fn defaults_have_bounded_resources_and_require_digests() {
         assert!(Config::from_lookup(|_| Ok(None)).is_err());
-        let config = config_with("AI_ROUTER_NATIVE_ENABLED", "false").unwrap();
+        let config = config_with("AI_ROUTER_ANTIGRAVITY_ENABLED", "true").unwrap();
         assert_eq!(config.max_queue, 8);
         assert!(!config.openai_enabled);
+        assert_eq!(
+            config.state_dir,
+            Path::new("/var/lib/ai-router/antigravity-auth")
+        );
         assert_eq!(
             config.openai_state_dir,
             Path::new("/var/lib/ai-router/openai-auth")
         );
         assert_eq!(config.openai_max_concurrent, 2);
         assert_eq!(config.openai_max_queue, 8);
-        assert!(!config.native_enabled);
+        assert!(config.antigravity_enabled);
+        assert!(
+            !config_with("AI_ROUTER_ANTIGRAVITY_ENABLED", "false")
+                .unwrap()
+                .antigravity_enabled
+        );
         assert_eq!(config.keys[0].id, "test");
     }
     #[test]
     fn rejects_invalid_paths_limits_and_public_key_metadata() {
         for (name, value) in [
-            ("AI_ROUTER_WORKSPACE_DIR", "relative"),
             ("AI_ROUTER_STATE_DIR", "/tmp/../auth"),
             ("AI_ROUTER_STATE_DIR", "/tmp/credentials/auth"),
             ("AI_ROUTER_OPENAI_ENABLED", "yes"),
             ("AI_ROUTER_OPENAI_STATE_DIR", "/tmp/auth/../openai"),
             (
                 "AI_ROUTER_OPENAI_STATE_DIR",
-                "/var/lib/ai-router/auth/openai",
+                "/var/lib/ai-router/antigravity-auth/openai",
             ),
             ("AI_ROUTER_OPENAI_MAX_CONCURRENT", "0"),
             ("AI_ROUTER_OPENAI_MAX_QUEUE", "99999999"),
             ("AI_ROUTER_MAX_CONCURRENT", "0"),
             ("AI_ROUTER_MAX_QUEUE", "99999999"),
-            ("AI_ROUTER_NATIVE_ENABLED", "yes"),
+            ("AI_ROUTER_ANTIGRAVITY_ENABLED", "yes"),
             ("AI_ROUTER_TRUSTED_PROXIES", "10.0.0.0/8"),
-            ("AI_ROUTER_EXPECTED_AGY_VERSION", "latest"),
         ] {
             assert!(config_with(name, value).is_err(), "{name}");
         }
@@ -416,13 +393,12 @@ mod tests {
         config.keys.pop();
         config.keys[0].scopes = vec!["admin".to_owned()];
         assert!(config.validate().is_err());
+        config.keys[0].scopes = vec!["native".to_owned()];
+        assert!(config.validate().is_err());
     }
     #[test]
     fn rejects_overlapping_storage_and_duplicate_proxies() {
         let mut config = Config::for_test(Path::new("/tmp/router-test"));
-        config.workspace_dir = config.state_dir.join("runs");
-        assert!(config.validate().is_err());
-        config.workspace_dir = PathBuf::from("/tmp/router-test/workspaces");
         config.openai_state_dir = config.state_dir.join("openai");
         assert!(config.validate().is_err());
         config.openai_state_dir = PathBuf::from("/tmp/router-test/openai-auth");

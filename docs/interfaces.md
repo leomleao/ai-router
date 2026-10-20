@@ -1,267 +1,154 @@
-# Provider implementation interfaces
+# Provider interfaces
 
-Implementation checkpoint: provider seams are present in the current tree;
-integrated validation/review is pending. Operator eligibility and live inference
-remain O1/O2 gates. All modules live in one Rust crate, `ai-router`, with `src/lib.rs` exporting
-`config`, `auth`, `protocol`, `runner`, `relay`, `monitor`, and `api`. Coordinate
-interface changes across modules. Never read protected secret files; use
-synthetic fixtures for validation.
+`ai-router` is one Rust crate with the model API, provider registry, shared
+protocol, independent Antigravity and OpenAI adapters, and monitor. Current
+provider integration is under review; this document describes the code's
+interfaces. The approved pinned OMP sign-in succeeded; catalogue retry and
+live model validation remain pending.
 
-## Configuration, authentication, and protocol
+## Configuration and client authentication
 
-`Config::from_env() -> Result<Config, String>` reads environment values directly
-(no dotenv). `Config::for_test(root: &Path) -> Config` uses synthetic key digests.
-Root wraps config in `Arc<Config>`. Public fields:
+`Config::from_env() -> Result<Config, String>` reads process environment only.
+It does not load dotenv or configuration files. `Config::for_test(root)` uses
+synthetic key digests and separates Antigravity, OpenAI, and telemetry paths.
+
+Main configuration fields and defaults:
+
+| Field | Default |
+| --- | --- |
+| `bind` | `0.0.0.0:8080` |
+| `state_dir` | `/var/lib/ai-router/antigravity-auth` |
+| `antigravity_enabled` | `true` (`AI_ROUTER_ANTIGRAVITY_ENABLED`) |
+| `openai_enabled` | `false` (`AI_ROUTER_OPENAI_ENABLED`) |
+| `openai_state_dir` | `/var/lib/ai-router/openai-auth` |
+| `telemetry_dir` | `/var/lib/ai-router/telemetry` |
+| `monitor_socket` | `/run/ai-router/monitor.sock` |
+| body / output bounds | 1 MiB / 8 MiB |
+| concurrent / queue per provider | 2 / 8 |
+| request deadline | 120 seconds |
+| telemetry retention | 30 days / 50,000 events |
+
+Antigravity, OpenAI, and telemetry paths must be separate absolute directories;
+configured paths reject protected filename and directory patterns. The monitor
+socket must remain outside those storage paths.
+
+`KeyConfig { id, sha256, scopes }` stores digest records in `AI_ROUTER_KEYS`.
+Only the `model` scope is valid. `auth::generate_key(id, scopes)` creates a
+random API key and its digest record; `authenticate` uses a constant-time digest
+comparison. The independent Antigravity OAuth configuration reads
+`AI_ROUTER_GOOGLE_CLIENT_ID` and optional `AI_ROUTER_GOOGLE_CLIENT_SECRET` from
+process environment, using the reviewed pinned registration when unset. Neither
+auth lifecycle reads an auth file from the other provider.
+
+## Shared model protocol
+
+`protocol::RunRequest` is the normalized input shared by both providers:
 
 ```text
-bind: String (default 0.0.0.0:8080 inside container)
-agy_bin: PathBuf; expected_agy_version: String (1.4.3)
-state_dir: PathBuf; openai_state_dir: PathBuf
-  (default /var/lib/ai-router/openai-auth)
-openai_enabled: bool (false); openai_max_concurrent: usize (2)
-openai_max_queue: usize (8)
-workspace_dir: PathBuf; telemetry_dir: PathBuf
-monitor_socket: PathBuf; keys: Vec<KeyConfig>
-trusted_proxies: Vec<IpAddr>
-max_body_bytes: usize (1 MiB); max_output_bytes: usize (8 MiB)
-max_concurrent: usize (2); max_queue: usize (8) (AGY admission only)
-request_timeout_secs: u64 (120); artifact_ttl_secs: u64 (3600)
-preauth_per_minute: u32 (60); global_preauth_per_minute: u32 (600)
-per_key_per_minute: u32 (30); native_enabled: bool (false)
-retention_days: u64 (30); max_events: usize (50000)
+owner: String
+parallel_tool_calls: bool
+remaining_ms: Option<u64>
+input: Vec<Value>                 chronological typed conversation history
+instructions: Vec<Value>          leading system/developer instructions
+provider_generation: Option<String>
+endpoint: String                  "chat" or "responses"
+request_id, model: String
+tools: Vec<ToolDefinition>
+schema: Option<Value>
+effort: Option<String>
 ```
 
-KeyConfig: `id: String`, `sha256: String` (64 hex chars), `scopes: Vec<String>`
-(`model`, `native`). `AI_ROUTER_KEYS` contains JSON digest records, never raw
-keys. Config validates bounds, absolute storage paths, digest/ID/scope format.
-`auth::generate_key(id, scopes) -> (String, KeyConfig)` uses 64 random bytes.
-`authenticate(&[KeyConfig], bearer: &str) -> Option<KeyConfig>` uses constant-time
-digest comparison. `RateLimiter::new(limit:u32, max_entries:usize)` and
-`check(&self, key:&str) -> bool` is a bounded 60-second fixed-window admission gate.
+Both provider serializers consume `instructions` and typed `input`; no
+rendered transcript or CLI-era profile is carried in `RunRequest`. Normalization
+bounds the UTF-8 JSON encoding of the combined typed history and instructions to
+1 MiB. Chat history retains assistant tool calls as messages with original IDs and JSON-string arguments, followed by
+matching `tool` results. Responses history retains typed `message`,
+`function_call`, `function_call_output`, and encrypted `reasoning` items. System
+and developer messages that precede the conversation remain instructions;
+later turns retain their original chronology.
 
-Protocol types derive serde where appropriate:
+`normalize_chat` and `normalize_response` validate supported fields, text-only
+content, call/result pairing, identifiers, and bounded item counts. They
+support tool choice `auto` and `none`; `none` removes the tool inventory.
+Forced/named choices and unsupported sampling controls fail explicitly.
+Positive output budgets add visible-answer guidance only. They do not cap
+provider tokens or truncate text, schema output, or tool arguments.
 
-- `ApiError { status: u16, code: String, message: String }`, constructors and
-  Axum IntoResponse: `{"error":{"message":...,"type":...,"code":...}}`.
-- `ToolDefinition { name:String, description:String, parameters:Value }`.
-- `ToolCall { id:String, name:String, arguments:Value }`.
-- `Usage { input_tokens:u64, output_tokens:u64, thinking_tokens:u64,
-  cache_read_tokens:u64, total_tokens:u64 }`.
-- `InputFile { path:String, data:Vec<u8> }`.
-- `RunProfile` enum `Model`, `Native`.
-- `RunRequest { request_id:String, model:String, prompt:String,
-  system:String, tools:Vec<ToolDefinition>, schema:Option<Value>,
-  profile:RunProfile, effort:Option<String>, mode:Option<String>, files:Vec<InputFile> }`.
-- `RunResult { text:String, structured_output:Option<Value>,
-  conversation_id:String, usage:Option<Usage>, usage_partial:bool,
-  tool_calls:Vec<ToolCall>, status:String }`.
-- `RunEvent` serde tagged: `Init {conversation_id:String, tools:Vec<String>}`,
-  `TextDelta {delta:String}`, `ToolCall(ToolCall)`, `Native(Value)`,
-  `Completed(RunResult)`, `Error(ApiError)`.
-- `ModelInfo {id:String, name:String}`; `ProviderStatus {version:String,
-  authenticated:bool, models:Vec<ModelInfo>, quota:Option<Value>,
-  checked_at:String, error:Option<String>}`; Default unavailable.
-- `normalize_chat(Value, request_id:String) -> Result<RunRequest,ApiError>` and
-  `normalize_response(Value, request_id:String) -> Result<RunRequest,ApiError>`.
-  Preserve all supplied messages and tool results in deterministic rendering;
-  collect leading system/developer messages into system. Reject unsupported
-  modalities/parameters and validate tool names/schemas. Support standard auto
-  and none tool choice, disable parallel calls; do not silently ignore forced
-  tool choices or sampling controls. Accept benign SDK defaults only with
-  documented equivalence. Preserve tool-call IDs/history exactly.
-  Responses `text.verbosity` and Chat `verbosity` accept absent/null/`medium`
-  as equivalent defaults without changing the normalized request. Reject all
-  other verbosity values; answer detail is independent of reasoning effort.
-  Responses `max_output_tokens` and Chat `max_tokens` / `max_completion_tokens`
-  accept positive integers as best-effort visible-answer length instructions
-  in the normalized system prompt. Omission/null add nothing; reject malformed
-  budgets or both non-null Chat fields. No hard output/reasoning/usage cap or
-  truncated JSON/tool call is promised. Capabilities and successful responses
-  disclose `prompt_guidance` / `X-AI-Router-Token-Budget-Mode: prompt-guidance`.
+Shared types include `ToolDefinition`, `ToolCall`, `Usage`, `RunResult`, and
+`RunEvent`. `RunResult::usage_partial` carries incomplete or inferred usage.
+Chat and Responses output continue to expose both `agy_usage_partial` and
+`ai_router_usage_partial`. `RunEvent` contains `Init`, `TextDelta`, `ToolCall`,
+`Completed`, and `Error`; there is no native event.
 
-`items::ItemStore` owns completed Responses output items independently of telemetry.
-`save(owner:&str, response:&Value) -> Result<(),ApiError>` atomically saves exact
-output JSON; only the successful completion path calls it. `resolve(owner:&str,
-body:&mut Value, max_bytes:usize) -> Result<(),ApiError>` replaces input item
-references before normalisation. References accept `type:"item_reference"` or
-an omitted/null type, a printable ASCII ID of 1–256 bytes, and no other non-null
-fields. Owner is the authenticated, unique configured client ID. Unknown,
-foreign, expired and evicted IDs share the same 400 `item_reference_not_found`.
-Expanded serialized requests exceeding `max_body_bytes` fail with 413
-`input_too_large`; normal message/tool-history validation still applies.
-The store has a fixed 24-hour TTL from completion, 1,024 items / 16 MiB per client,
-and 4,096 items / 64 MiB globally, measured as serialized JSON. Eviction removes
-oldest items first; startup creates an empty store. Expiration runs on access
-and provider refresh. Oversized output groups fail atomically with 503
-`response_storage_limit`, suggesting `store:false`.
-Responses accept omitted/null/true `store` as enabled and false as opt-out;
-other values are invalid. An opt-out request can resolve earlier saved items.
-Response objects report the selected `store` flag; successful HTTP responses
-include `X-AI-Router-Item-Storage: memory|disabled`. Capabilities expose the
-limits and restart behavior. This does not implement response retrieval,
-`previous_response_id`, provider conversation resume or prompt-cache control.
+`protocol::validate_schema` enforces schema byte/structure bounds, meta-schema
+validity, compilation, and local-only references. `tool_diagnostics::validate_call`
+is shared by the direct provider, OpenAI adapter, and client-facing API. It
+validates the declared tool, object arguments, and caller schema while producing
+bounded diagnostics without logging raw argument values. Keep these helpers
+even though the MCP relay was removed.
 
-## AGY runner and inert relay
+## Provider ownership and dispatch
 
-`Runner::new(Arc<Config>) -> Runner` (Clone).
-`Runner::start(RunRequest, CancellationToken) -> Result<RunStream, ApiError>`
-is async and returns before any filesystem preparation. `RunStream` contains
-`events:mpsc::Receiver<RunEvent>`, `workspace:PathBuf`,
-`workspace_owned:Arc<AtomicBool>` and `finished:CancellationToken`. An owned
-worker prepares the workspace and supervises the process; preparation failures
-arrive as terminal error events. `finished` is signalled after filesystem and
-process cleanup. Workspace is `config.workspace_dir/<request_id>`; the root
-holds admission until cleanup and deletes only directories the runner created.
-`Runner::probe() -> ProviderStatus` is async, bounded and never logs credentials.
-Cancel/timeout kills the complete child process group, drains/waits, and emits
-one terminal event. AGY is invoked by argument vector, never a shell. Capture
-bounded stderr privately; sanitised provider error codes go to HTTP/telemetry.
-Use real CLI `--input-format stream-json --output-format stream-json`, disable
-slash expansion on model requests, and select a fixed custom agent with
-tools:[], excludeDefaultComponents:true and inheritMcp:false. The 1.4.3 adapter
-expects the global registry independently recaptured on 1.4.3; any
-inventory drift fails closed before user input. Before launching the
-conversation process, run the fixed `/agents` JSON management command in the
-owned workspace and require the parsed agent name, zero turns/usage, and no
-errors or denied actions. Then verify the initial exact pinned public registry
-and requested identity before supplying the prompt. The agent has no built-ins; client tools come
-only from the fixed inert MCP server with its workspace cwd. Every actual
-native tool or subagent step in a model run is fatal. Model schema output uses
-an owned raw-JSON instruction and independent final-value validation. The
-pinned CLI's `--json-schema` flag repeats answers in this isolated profile,
-so that flag is reserved for the separately gated native profile.
+`providers::ProviderId` retains persisted IDs `Agy` (`"agy"`) and `OpenAi`
+(`"openai"`). Ownership is exact and never inferred from model prefixes. The
+registry withholds conflicting IDs and remembers up to 4,096 last-known owners
+so a hidden provider model reports unavailable instead of being routed to the
+other provider. Readiness requires authentication and a catalogue no older than
+180 seconds.
 
-`relay::serve_stdio(...)` supports MCP initialise, tools/list and tools/call.
-Launch relay via the current ai-router executable subcommand `mcp-relay` with
-one router-created catalogue path argument. File is synthetic tool definitions,
-not credentials. Validate the path stays in workspace. Tools/call is inert:
-capture once to a mode-0600 workspace handoff file, never execute or return a
-fake tool result. Runner must detect that handoff promptly and return ToolCall /
-Completed with partial usage, then kill the process group. Native uses the
-official sandbox, never permission skipping, and is gated by config.
+Antigravity's `probe`, `generation`, `availability_error`, `model_availability`,
+and `start` methods feed the same API registry and provider-specific admission
+used by OpenAI. The API pins the account generation before expanding Responses
+item references, admits against the selected provider's own queue/semaphore,
+then re-resolves exact ownership and generation after queueing. Provider
+dispatch rechecks persistent restriction and account-generation state. There
+is no CLI or alternate-provider fallback.
 
-## Monitor, Docker, and operator interface
+`AntigravityTransport` centralizes authenticated HTTP dispatch to fixed reviewed
+origins and operation paths. Redirects are disabled; request, response, event,
+and elapsed-time bounds apply across the original request deadline. The direct
+adapter uses a bounded SSE decoder and emits one terminal event. It validates
+complete tool calls before publication and validates complete structured JSON
+against the shared schema. Its private reasoning/signature replay cache is
+memory-only and keyed by client, exact model, and account generation, with a
+24-hour TTL and per-client/global byte bounds.
 
-`monitor::Telemetry::open(&Path, retention_days:u64, max_events:usize)
- -> Result<Telemetry,String>`; stores metadata only, bounded retention.
-`async record(&self, RequestRecord)`; `async snapshot(&self) -> Snapshot`;
-`async set_provider(&self, ProviderStatus)` for legacy AGY status;
-`async set_openai_provider(&self, ProviderStatus)` for OpenAI status;
-`async set_runtime(&self, active:usize, queued:usize)`.
-`note_rejection(&self, code:&str)` synchronously updates six fixed atomic
-counters. Preflight rejection history is sampled at 30 records/minute. These
-counters reset at process start and are distinct from retained-history totals.
-Insertion evicts excess records in O(1); expiration scans run at most once per
-minute, and snapshot aggregation runs outside the records mutex.
-RequestRecord: `request_id:String, client_id:String, model:String, provider:String, endpoint:String,
-started_at:String, duration_ms:u64, startup_ms:Option<u64>, first_output_ms:Option<u64>,
-status:String, error_code:Option<String>, usage:Option<Usage>, usage_partial:bool`.
-Older records default `provider` to `agy`. Snapshots keep the legacy `provider`
-field for AGY and add a defaulted `openai_provider`; `Aggregate.by_provider`
-attributes counts to `agy`, `openai`, or `other`. OAuth and encrypted reasoning
-fields are redacted in bounded in-memory request details.
-`async monitor::serve(Arc<Telemetry>, PathBuf, CancellationToken)
- -> Result<(),String>` implements read-only mode-0600 Unix socket. Protocol:
-client writes `snapshot\n`, server writes one JSON snapshot and closes.
-`monitor::MonitorArgs { json:bool, text:bool, range_seconds:u64 }` and
-`async monitor::client(socket:&Path,args:MonitorArgs) -> Result<(),String>`.
+`openai::OpenAi` and `openai_auth` keep their own state directory, auth
+lifecycle, generation, provider probe, and Responses transport. Disabling or
+restricting either provider does not disable the other. `provider_stream::RunStream`
+holds an event receiver and a `finished` cancellation token used by API
+completion/drain handling.
 
-Docker publishes only `127.0.0.1:${AI_ROUTER_PORT:-8090}:8080`; no env_file.
-Named auth and telemetry volumes, tmpfs request workspaces. No Docker socket,
-host home folders, privileged mode, or dangerous permission flags. Download
-official pinned CLI with version verification; document any sandbox runtime
-restrictions, do not silently grant full privileges. Scripts never read .env or
-credential files. Operator key setup/login are outside Codex. Docker test build
-must exclude all banned patterns anywhere in context plus target/.git.
+## Responses items and API
 
-## Provider and OpenAI contracts
+`items::ItemStore` keeps exact completed Responses output items in bounded
+process memory. Ownership is the configured client ID. Reasoning references
+also require the same `provider:generation` scope; ordinary visible items remain
+safe to replay across providers for that client. Unknown, foreign, expired,
+evicted, and wrong-generation reasoning references return the same
+`item_reference_not_found` response. Storage is cleared at restart.
 
-`providers::ProviderId` is `Agy` or `OpenAi`; routing uses exact model IDs, never
-prefixes. A catalogue snapshot contains available entries and withholds
-duplicate IDs from both providers. It retains at most 4,096 last-known owners
-so a temporarily hidden model reports provider unavailability instead of being
-dispatched elsewhere. Readiness requires an authenticated status checked within
-180 seconds. Provider probes run independently on a 60-second cadence with a
-10-second timeout and 5-to-60-second exponential retry plus jitter. Provider
-metadata admission has a 100 ms lock deadline.
+The router exposes `/health`, `/ready`, `/v1/models`, `/v1/capabilities`,
+`/v1/chat/completions`, and `/v1/responses`. The removed `/v1/agy/runs` route
+and its children fall through to 404. All protected routes require a model-scoped
+client key. Capabilities currently report schema version 3 and explicit
+unsupported features.
 
-`AI_ROUTER_MAX_CONCURRENT` / `AI_ROUTER_MAX_QUEUE` (2 / 8 by default) bound AGY.
-`AI_ROUTER_OPENAI_MAX_CONCURRENT` / `AI_ROUTER_OPENAI_MAX_QUEUE` (also 2 / 8)
-bound OpenAI. Their active/queued ceilings add together; global input/body and
-request-rate limits are unchanged. OpenAI is disabled unless
-`AI_ROUTER_OPENAI_ENABLED=true`. Native execution is AGY-only and remains off
-whenever OpenAI is enabled, until its state-volume denial is verified.
+## Monitor and Docker boundary
 
-OpenAI uses the public Responses API with `store:false` and `stream:true` for
-both gateway streaming modes. It preserves supported Responses `additional_tools`
-developer items and may return multiple function calls; the server never runs
-client tools. Encrypted reasoning items remain provider-provenanced in the local
-Responses item store. OpenAI Chat replay is a separate owner-scoped, memory-only
-cache: 24 hours, 16 MiB per client, 64 MiB globally, and 4,096 entries; it clears
-on restart. These account and transport capabilities remain unverified against
-a live subscription until operator O1/O2.
+`monitor::Telemetry` stores retained request metadata separately from a
+memory-only bounded request/response detail cache. The Unix socket is private
+and read-only. Persisted records include provider, endpoint, timings, sanitized
+error code, and observed usage. `startup_ms` measures elapsed time through
+accepted upstream streaming response headers for either provider; `first_output_ms`
+measures the first text delta or validated tool call. Private reasoning is not
+counted as first output. The six rejection counters count all attempts since
+process start; retained rejection records are sampled to 30 per minute.
 
-## Gateway integration
-
-Authenticate/limit requests before normalisation/runner. Cache actual provider
-probe results; no catalog/quota subprocess per HTTP call. Shared event-to-SSE
-renderers with stable IDs and correct finish/error events. Owner-scoped async
-native jobs, event replay bounded by max_output_bytes, TTL/maximum job count,
-cancel route, safe artifact listing/download. Reject native generation before
-sandbox verification and never accept caller-supplied raw provider IDs. Chat
-workspaces deleted on completion/cancellation; native workspaces on TTL/delete.
-Metrics never include event payloads. Tests use explicit fake provider path and
-synthetic keys; fixtures cannot launch signed-in host AGY.
-Model request logs include the router request ID, endpoint, model, and current
-client-tool names/count for inventory diagnostics. Prompts, tool descriptions,
-schemas, arguments and authentication values are not logged.
-`tool_diagnostics::validate_call` shares exact schema validation between the
-relay and supervisor. Rejections emit bounded `client_tool_rejected` JSON on
-gateway stderr with request/model/stage, selected tool, reason, schema paths,
-JSON types and missing schema-declared required fields. Raw validator errors,
-argument values and instance paths must never be formatted into these logs.
-The relay preserves rejected call data only in owned temporary files for
-supervisor validation; it never executes the tool or fabricates a successful
-result. Known tools with `arguments_not_object` / `schema_mismatch` receive up
-to two MCP `isError:true` feedback results, containing the bounded diagnostic
-and fixed correction instructions. The third rejection ends the request with
-`invalid_provider_tool_call`. Atomic, non-overwriting numbered publications
-`router-tool-rejection-{1..3}.json` carry attempts and share the budget across
-relay restarts/connections. The supervisor revalidates each attempt, logs it
-once, and revalidates the final handoff; only a valid final call produces a
-client ToolCall. Failed corrections do not enter client history. Deadlines,
-IO bounds, cancellation and native-tool boundaries apply throughout the same
-CLI process. `client_tool_rejected` includes attempt/opportunity counters;
-`client_tool_call_corrected` records successful recovery. Capabilities expose
-`client_tool_argument_correction` with `max_corrections:2`, `scope:request`,
-`same_run:true`, `unknown_tools:false`.
-The provider-facing MCP catalogue uses canonical request-local names
-`router_client_000` through `router_client_127`. The owned model catalogue maps
-each original `name` to `mcp_name` and the qualified direct `provider_name`
-(`mcp_ai-router_router_client_000`, etc.). MCP tools advertise
-`_meta.antigravity/alwaysLoad:true`, binding each function to the sole server
-without a model-selected routing envelope. Its private input schema contains
-one required `input` field holding the original client schema. CLI metadata
-such as `toolSummary` stays outside that object and is stripped by the CLI.
-Schemas without their own `$id` receive a private resource identity so local
-references keep their original root after nesting; caller identities are kept.
-The relay accepts exactly that envelope and validates the unwrapped arguments.
-The relay and stream decoder resolve aliases against the same immutable tool
-order, with no original-name fallback. Handoffs, schema validation, successful
-correction logs and API tool calls retain original client names. Correction
-feedback includes the private `provider_name` to retry. Direct stream steps
-alone cannot create client calls: a matching inert relay publication is required.
-Native provider operations,
-unknown aliases, nested dispatcher selections and other servers remain rejected.
-`Rejection::feedback` additionally exposes bounded provider-only `field_feedback`
-for additional-property violations: unexpected names, declared fields and exact
-object locations, with separate branch contexts and truncation/availability
-flags. These fields use `serde(skip)` and are excluded from custom Debug output;
-logging must never serialize them separately. Error-kind inspection and local
-schema-pointer traversal supply this guidance without formatting raw errors or
-copying argument values. The correction budget and final schema validation are
-unchanged.
-`AppState::drain(Duration) -> bool` waits for admission cleanup and telemetry
-recording before shutdown flush. `native::shutdown(&AppState) -> bool` cancels
-jobs and reports whether ownership-aware workspace cleanup completed. Failed
-or expired cleanup produces a nonzero gateway exit; Compose allows 30 seconds.
+The Compose gateway runs nonroot with a read-only root filesystem, dropped
+capabilities, and tmpfs `/run/ai-router` and `/tmp`. It mounts
+`ai-router-antigravity-auth`, `ai-router-openai-auth`, and
+`ai-router-telemetry` independently. The prior `ai-router-auth` CLI volume is
+preserved unmounted. No CLI binary, native sandbox, workspace runner, or MCP
+relay is installed in the gateway image. Compose commands use
+`--env-file /dev/null` to prevent implicit dotenv loading.

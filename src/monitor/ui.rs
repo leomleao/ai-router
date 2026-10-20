@@ -547,11 +547,7 @@ fn latency_panel(f: &mut Frame, area: Rect, s: &Snapshot, p: Palette) {
             duration(a.duration_p95_ms),
         ]),
         Row::new([
-            if area.width < 32 {
-                "Ready".into()
-            } else {
-                "AGY ready".into()
-            },
+            "Startup".into(),
             duration(a.startup_p50_ms),
             duration(a.startup_p95_ms),
         ]),
@@ -722,17 +718,22 @@ fn usage(f: &mut Frame, area: Rect, s: &Snapshot, app: &App, p: Palette) {
                 a.requests
                     .saturating_sub(a.complete_usage_records + a.partial_usage_records)
             )),
-            Line::from("Observed usage only; partial records may omit tokens.")
+            Line::from("All providers; partial records may omit tokens.")
                 .style(Style::default().fg(p.muted)),
             Line::from(format!(
-                "Requests by provider: AGY {} · OpenAI {}",
+                "Requests by provider: AGY {} · OpenAI {} · Other {}",
                 a.by_provider.get("agy").copied().unwrap_or(0),
-                a.by_provider.get("openai").copied().unwrap_or(0)
+                a.by_provider.get("openai").copied().unwrap_or(0),
+                a.by_provider
+                    .iter()
+                    .filter(|(provider, _)| !matches!(provider.as_str(), "agy" | "openai"))
+                    .map(|(_, count)| count)
+                    .sum::<usize>()
             )),
             Line::from(format!("ChatGPT Usage: {OPENAI_USAGE_URL}"))
                 .style(Style::default().fg(p.info)),
         ])
-        .block(p.block(" Token usage ")),
+        .block(p.block(" Token usage · all providers ")),
         tokens,
     );
     let direction = if area.width >= 100 {
@@ -833,9 +834,21 @@ fn quota_lines(s: &Snapshot, p: Palette) -> Vec<Line<'static>> {
             );
         }
     }
+    if let Some(advisory) = &s.antigravity_release {
+        lines.push(
+            Line::from("Release advisory · does not affect readiness")
+                .style(Style::default().fg(p.info)),
+        );
+        lines.push(Line::from(format!(
+            "Pinned {} · observed {} · {}",
+            advisory["pinned_version"].as_str().unwrap_or("unknown"),
+            advisory["observed_version"].as_str().unwrap_or("unknown"),
+            advisory["alerts"]
+        )));
+    }
     if !s.provider.models.is_empty() {
         lines.push(Line::from(""));
-        lines.push(Line::from("AGY models").style(Style::default().fg(p.info).bold()));
+        lines.push(Line::from("Antigravity models").style(Style::default().fg(p.info).bold()));
         for model in &s.provider.models {
             lines.push(Line::from(format!("  {} · {}", model.id, model.name)));
         }
@@ -859,13 +872,13 @@ fn provider(f: &mut Frame, area: Rect, s: &Snapshot, app: &App, p: Palette) {
         Layout::vertical([Constraint::Length(8), Constraint::Min(0)]).areas(area);
     let lines = vec![
         Line::from(format!(
-            "● AGY {} · version {}",
+            "● Antigravity {} · adapter {}",
             provider_state(&s.provider),
             s.provider.version
         ))
         .style(
             Style::default()
-                .fg(if s.provider.authenticated {
+                .fg(if provider_state(&s.provider) == "ready" {
                     p.good
                 } else {
                     p.bad
@@ -894,11 +907,13 @@ fn provider(f: &mut Frame, area: Rect, s: &Snapshot, app: &App, p: Palette) {
                 .map(|v| format!("{v}s"))
                 .unwrap_or_else(|| "unknown".into())
         ))
-        .style(Style::default().fg(if s.openai_provider.authenticated {
-            p.good
-        } else {
-            p.muted
-        })),
+        .style(
+            Style::default().fg(if provider_state(&s.openai_provider) == "ready" {
+                p.good
+            } else {
+                p.muted
+            }),
+        ),
         Line::from(format!("ChatGPT Usage: {OPENAI_USAGE_URL}")).style(Style::default().fg(p.info)),
         Line::from(format!(
             "History: {} days / {} events · persistence errors {}",
@@ -919,14 +934,16 @@ fn provider(f: &mut Frame, area: Rect, s: &Snapshot, app: &App, p: Palette) {
 }
 
 fn provider_state(provider: &crate::protocol::ProviderStatus) -> &str {
-    if provider.authenticated {
-        "ready"
-    } else if let Some(error) = provider.error.as_deref() {
+    if let Some(error) = provider.error.as_deref() {
         match error {
-            "disabled" => "disabled",
+            "disabled" | "provider_disabled" => "disabled",
             "provider_not_checked" => "not checked",
             other => other,
         }
+    } else if crate::providers::ready(provider, Utc::now()) {
+        "ready"
+    } else if provider.authenticated {
+        "stale"
     } else {
         "not authenticated"
     }
@@ -1130,7 +1147,7 @@ fn request_detail_lines(record: &RequestRecord, width: u16, p: Palette) -> Vec<L
         ),
         (
             format!(
-                "Latency: total {} · AGY ready {} · first output {}",
+                "Latency: total {} · startup {} · first output {}",
                 ms(Some(record.duration_ms)),
                 ms(record.startup_ms),
                 ms(record.first_output_ms)
@@ -1413,6 +1430,8 @@ mod tests {
     async fn provider_page_shows_both_providers_and_chatgpt_usage_link() {
         let mut snapshot = fixture().await;
         snapshot.openai_provider.authenticated = true;
+        snapshot.openai_provider.error = None;
+        snapshot.openai_provider.checked_at = Utc::now().to_rfc3339();
         snapshot.openai_provider.version = "preview".into();
         snapshot
             .openai_provider
@@ -1435,6 +1454,63 @@ mod tests {
         assert!(screen.contains("AGY"));
         assert!(screen.contains("OpenAI ready"));
         assert!(screen.contains("https://chatgpt.com/settings/usage"));
+    }
+
+    #[test]
+    fn provider_readiness_honors_errors_freshness_and_disabled_state() {
+        let mut status = crate::protocol::ProviderStatus {
+            authenticated: true,
+            checked_at: Utc::now().to_rfc3339(),
+            error: None,
+            ..Default::default()
+        };
+        assert_eq!(provider_state(&status), "ready");
+        status.checked_at = (Utc::now() - chrono::Duration::seconds(181)).to_rfc3339();
+        assert_eq!(provider_state(&status), "stale");
+        status.checked_at = "invalid".into();
+        assert_eq!(provider_state(&status), "stale");
+        status.error = Some("subscription_sharing_usage_limit_exceeded".into());
+        assert_eq!(
+            provider_state(&status),
+            "subscription_sharing_usage_limit_exceeded"
+        );
+        status.authenticated = false;
+        status.error = Some("provider_disabled".into());
+        assert_eq!(provider_state(&status), "disabled");
+    }
+
+    #[tokio::test]
+    async fn mixed_provider_dashboard_uses_neutral_timings_and_accounts_for_other_requests() {
+        let mut snapshot = fixture().await;
+        let record = snapshot.records.last_mut().unwrap();
+        record.provider = "openai".into();
+        record.model = "gpt-demo".into();
+        snapshot.aggregate.by_provider.insert("agy".into(), 27);
+        snapshot.aggregate.by_provider.insert("openai".into(), 1);
+        snapshot.aggregate.by_provider.insert("other".into(), 1);
+        snapshot.aggregate.by_provider.insert("future".into(), 1);
+        for page in [0, 1] {
+            let mut app = App::new(86400);
+            app.page = page;
+            let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+            terminal.draw(|f| draw(f, &app, &snapshot)).unwrap();
+            let screen = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
+            assert!(!screen.contains("AGY ready 80ms"));
+            if page == 0 {
+                assert!(screen.contains("Startup"));
+                assert!(screen.contains("Provider: openai"));
+                assert!(screen.contains("startup 80ms"));
+            } else {
+                assert!(screen.contains("Token usage · all providers"));
+                assert!(screen.contains("AGY 27 · OpenAI 1 · Other 2"));
+            }
+        }
     }
 
     #[test]
@@ -1498,7 +1574,7 @@ mod tests {
                 "failed",
                 "provider_timeout",
                 "total 1234ms",
-                "AGY ready 80ms",
+                "startup 80ms",
                 "first output 130ms",
                 "input 12000",
                 "output 345",
@@ -1531,7 +1607,7 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
         assert!(text.contains(&record.request_id) && text.contains(&record.model));
-        assert!(text.contains("token counts unknown") && text.contains("AGY ready unknown"));
+        assert!(text.contains("token counts unknown") && text.contains("startup unknown"));
         assert!(!text.contains("input 0"));
         let max_scroll = lines.len().saturating_sub(11) as u16;
         assert!(max_scroll > 0);

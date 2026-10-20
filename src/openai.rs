@@ -1,11 +1,11 @@
 //! ChatGPT plan inference through the public Responses API. No CLI credential reuse.
-use crate::{config::Config, openai_auth::AuthStore, protocol::*, runner::RunStream};
+use crate::{config::Config, openai_auth::AuthStore, protocol::*, provider_stream::RunStream};
 use chrono::Utc;
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
-    sync::{Arc, atomic::AtomicBool},
+    sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::sync::{Mutex, mpsc};
@@ -232,9 +232,6 @@ impl OpenAi {
         request: RunRequest,
         cancel: CancellationToken,
     ) -> Result<RunStream, ApiError> {
-        if request.profile != RunProfile::Model {
-            return Err(ApiError::unsupported("OpenAI native execution"));
-        }
         if !self.config.openai_enabled {
             return Err(failure(503, "provider_disabled"));
         }
@@ -273,12 +270,7 @@ impl OpenAi {
             }
             completion.cancel();
         });
-        Ok(RunStream {
-            events,
-            workspace: Default::default(),
-            workspace_owned: Arc::new(AtomicBool::new(false)),
-            finished,
-        })
+        Ok(RunStream { events, finished })
     }
 
     async fn watch_generation(&self, expected: Option<&str>) -> ApiError {
@@ -1263,10 +1255,6 @@ mod tests {
             events.push(event);
         }
         assert!(run.finished.is_cancelled());
-        assert!(
-            !run.workspace_owned
-                .load(std::sync::atomic::Ordering::Relaxed)
-        );
         events
     }
     #[tokio::test]

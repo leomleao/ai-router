@@ -1,0 +1,180 @@
+{
+  "schema_version": 1,
+  "adapter_revision": "omp-2220e581-antigravity-v1",
+  "review_date": "2026-10-20",
+  "provider_id": "agy",
+  "provider_label": "Antigravity",
+  "source": {
+    "repository": "https://github.com/can1357/oh-my-pi",
+    "commit": "2220e58146ebe31508e7a216242840d373e082d0",
+    "license": "MIT",
+    "files": [
+      "packages/ai/src/providers/google-gemini-cli.ts",
+      "packages/ai/src/providers/google-shared.ts",
+      "packages/ai/src/registry/oauth/google-antigravity.ts",
+      "packages/catalog/src/wire/gemini-headers.ts",
+      "packages/catalog/src/discovery/antigravity.ts",
+      "packages/catalog/src/compat/rules/auth/google-antigravity.kdl",
+      "packages/catalog/src/compat/rules/providers/google-antigravity.kdl",
+      "packages/catalog/src/compat/rules/classes/gemini.kdl",
+      "packages/catalog/src/compat/rules/taxonomy/_collapse.kdl",
+      "packages/catalog/src/compat/rules/classes/anthropic.kdl"
+    ],
+    "evidence_kind": "Pinned public OMP source and its recorded Antigravity Hub observations; not an independently documented official CLI protocol or proof of account compatibility.",
+    "notice": "THIRD_PARTY_NOTICES.md"
+  },
+  "identity": {
+    "user_agent": "antigravity/hub/2.19.1 (aidev_client; os_type=darwin; arch=arm64; cl=963137146)",
+    "version": "2.19.1",
+    "automatic_identity_updates": false,
+    "caller_identity_overrides": false,
+    "request_user_agent": "antigravity",
+    "request_type": "agent"
+  },
+  "destinations": {
+    "inference_origin": "https://daily-cloudcode-pa.googleapis.com",
+    "inference_path": "/v1internal:streamGenerateContent?alt=sse",
+    "model_path": "/v1internal:fetchAvailableModels",
+    "quota_path": "/v1internal:retrieveUserQuotaSummary",
+    "project_path": "/v1internal:loadCodeAssist",
+    "authorization_url": "https://accounts.google.com/o/oauth2/v2/auth",
+    "token_url": "https://oauth2.googleapis.com/token",
+    "userinfo_url": "https://www.googleapis.com/oauth2/v1/userinfo?alt=json",
+    "release_manifest_url": "https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest/latest-arm64-mac.yml",
+    "upstream_revision_url": "https://api.github.com/repos/can1357/oh-my-pi/commits/main",
+    "redirects": false,
+    "environment_http_proxies": false,
+    "automatic_endpoint_or_account_fallback": false
+  },
+  "authentication": {
+    "authority": "Independent router-owned Google OAuth consent and refresh lifecycle",
+    "registration_provenance": "Reviewed installed-application registration in the pinned public OMP source, selected explicitly by the operator; operator-owned environment registration is also supported.",
+    "legacy_cli_or_omp_credential_import": false,
+    "legacy_state_volume": "Preserved for explicit rollback; never opened by the direct adapter",
+    "automatic_tier_enrollment": false,
+    "existing_enrolled_project_required": true,
+    "account_generation_bound_dispatch": true,
+    "persistent_authentication_account_and_protocol_restrictions": true,
+    "dispatch_barrier": "Private shared cross-process dispatch lock is held through response headers; restrictions publish durable closing intent before exclusive drain. A completed closure returns only after previously admitted header dispatches drain; already-transmitted requests may have reached the provider.",
+    "registration": {
+      "packaging": "Base64-encoded public installed-app registration matching the pinned OMP source; not encryption and not personal user tokens",
+      "client_id_sha256": "bf00c418024ba6bf606ccdc37120976e41bc429dd1d46ecf16a729aa532626ea",
+      "client_secret_sha256": "1d2f041093fd95aa8995a038c711d50a7960da09a505381c09a745d6ad0ecc60",
+      "runtime_verification": "Compiled baseline checks decoded registration fingerprints; saved session client ID must match configuration before authenticated traffic, including unexpired tokens. Metadata drift never auto-updates registration."
+    }
+  },
+  "request_contract": {
+    "envelope_fields": [
+      "project",
+      "model",
+      "request",
+      "requestId",
+      "userAgent",
+      "requestType"
+    ],
+    "request_id_shape": "agent/<ephemeral-agent-uuid>/<unix-milliseconds>/<ephemeral-trajectory-uuid>/2",
+    "session_id_shape": "Negative decimal 63-bit value encoded as a string, derived stably from first user text and scoped to owner, exact model and account generation; bounded negative random fallback without a nonempty first user turn.",
+    "labels": [
+      "last_step_index",
+      "trajectory_id",
+      "used_claude",
+      "used_claude_conservative"
+    ],
+    "history": "Typed chronological user/model parts; leading system/developer instructions become systemInstruction parts. Mid-conversation system/developer changes are rejected rather than reordered.",
+    "text_only": true,
+    "tool_schema": "Original validated JSON Schema is preserved in parameters; unsupported upstream schema dialects are not silently weakened.",
+    "tool_mode": "VALIDATED when tools are supplied, and for Claude even without tools",
+    "tool_results": "Complete contiguous groups matched by original client ID and reordered to original call order. Claude retains function-part IDs; Gemini omits them according to its CCA contract.",
+    "unsigned_gemini_first_function_call_signature": "skip_thought_signature_validator",
+    "forced_or_named_tool_choice": false,
+    "tool_choice_none": "Omit the complete wire tool inventory and reject any unexpected returned call",
+    "response_schema": "Preserve full JSON Schema in model instructions; withhold provisional public output and validate the completed JSON locally",
+    "enforced_output_token_cap": false,
+    "effort": "Preserve exact raw model ID; reject an explicit effort conflicting with its suffix. Do not invent numeric budgets or fixed wire caps for these IDs.",
+    "native_agent_execution": false,
+    "automatic_generation_retries": false,
+    "claude_thinking_header": "anthropic-beta: interleaved-thinking-2025-05-14 on generation for the six reviewed Claude 5.5 tier IDs only",
+    "session_continuation_validation": "Stable scoped negative-decimal session IDs, canonical function-call parts and explicit private-state requests follow reviewed source behavior. The decisive live Claude continuation fix was omitting standalone empty visible text/signature parts; no endpoint or identity update was needed.",
+    "claude_private_thought_state": "For the six reviewed Claude 5.5 tier IDs, generationConfig.thinkingConfig.includeThoughts is true to receive private thought/signature replay state. No numeric thinking budget, level override, or hard output cap is inferred."
+  },
+  "model_ids_when_present_in_usable_raw_roster": [
+    "gemini-4-argon-low",
+    "gemini-4-argon-medium",
+    "gemini-4-argon-high",
+    "gemini-3.8-flash-low",
+    "gemini-3.8-flash-medium",
+    "gemini-3.8-flash-high",
+    "claude-opus-5-5-low",
+    "claude-opus-5-5-medium",
+    "claude-opus-5-5-high",
+    "claude-sonnet-5-5-low",
+    "claude-sonnet-5-5-medium",
+    "claude-sonnet-5-5-high",
+    "gpt-oss-120b-medium"
+  ],
+  "response_contract": {
+    "envelope": "SSE JSON data frames containing response or a sanitized in-band error",
+    "candidate_count": 1,
+    "text_policy": "Visible text preserved verbatim; no Flash JSON removal or thinking-fence healing",
+    "private_thoughts": "thought:true is private; thoughtSignature alone never makes visible text private. Reassemble typed blocks; Claude unsigned private blocks are omitted only from wire replay.",
+    "signature_only_empty_thoughts": "Retained as typed private parts",
+    "terminal_success": "STOP with visible text or complete validated client tools",
+    "terminal_incomplete": "MAX_TOKENS, with no client tool handoff or private replay publication",
+    "invalid_terminal": "Missing, duplicate, conflicting, safety/error, malformed-call and unsupported finishes fail the generation",
+    "tool_handoff": "Complete object arguments validated against current client tools only after a successful terminal",
+    "usage": "Input includes cached input; output includes candidates plus reasoning. Cached and reasoning details are subsets, not additional totals. Missing or inferred usage is explicitly partial.",
+    "function_call_replay": "Canonical functionCall part plus optional nonempty thoughtSignature only; omit upstream empty text/default thought fields to avoid conflicting oneof payloads.",
+    "live_empty_text_regression": {
+      "verified_on": "2026-10-20",
+      "environment": "operator-authorized local Docker",
+      "model": "claude-opus-5-5-medium",
+      "case": "Chat client-tool handoff and result continuation succeeded after omitting standalone empty visible replay parts.",
+      "failure_path": "messages.<index>.content.0.text.text: Field required",
+      "scope": "Correctness evidence for the reviewed local Claude continuation regression only. Exact model/revision acceptance is recorded separately in docs/validation.md; no matched performance claim is made."
+    }
+  },
+  "bounds": {
+    "transport_request_bytes": 2097152,
+    "transport_response_bytes": 16777216,
+    "sse_frame_bytes": 1048576,
+    "sse_events": 16384,
+    "response_parts": 4096,
+    "client_tools_or_generated_calls": 128,
+    "private_replay_total_bytes": 67108864,
+    "private_replay_per_client_bytes": 16777216,
+    "private_replay_ttl_seconds": 86400,
+    "original_absolute_deadline": "Carried through dispatch and streaming; no generation retry resets it"
+  },
+  "private_replay": {
+    "storage": "Bounded process memory only; never public output items, logs, telemetry or durable state",
+    "scope": [
+      "client owner",
+      "exact model",
+      "account generation",
+      "full public history prefix and instruction anchor",
+      "public assistant text and complete tool calls"
+    ],
+    "canonical_anchor": "SHA-256 of public wire contents and system instruction parts, excluding private thoughts/signatures and wire function IDs",
+    "cross_api": "Canonical public turns permit Chat Completions to Responses continuation",
+    "limitations": [
+      "Replay expires on restart, TTL or eviction and cannot cross account generations or models",
+      "Client-provided foreign reasoning is not accepted as Antigravity private replay",
+      "Ambiguous matching entries fail closed",
+      "Missing replay never imports another process's credentials or private reasoning"
+    ],
+    "empty_visible_parts": "Standalone empty visible text/signature parts remain private cache metadata and are omitted from wire replay; nonempty visible text and typed signature-only empty thoughts are retained."
+  },
+  "release_advisory": {
+    "authenticated": false,
+    "request_timeout_seconds": 5,
+    "response_bytes": 65536,
+    "stale_after_seconds": 10800,
+    "changed_failed_or_stale_metadata": "Advisory alerts only; never close auth gates, mutate identity or determine readiness"
+  },
+  "validation_scope": "Synthetic fixtures establish agreement with this baseline; actual Google authorization, project availability, model behavior and matched performance remain separate live acceptance evidence.",
+  "model_discovery_denylist": [
+    "chat_20706",
+    "chat_23310",
+    "gemini-2.5-pro"
+  ]
+}

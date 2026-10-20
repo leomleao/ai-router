@@ -13,9 +13,13 @@ dummy_env.update({
     "AI_ROUTER_KEYS": json.dumps([{"id": "policy-test", "sha256": "0" * 64, "scopes": ["model"]}]),
     "AI_ROUTER_PORT": "8090",
     "AI_ROUTER_TRUSTED_PROXIES": "",
+    "AI_ROUTER_GOOGLE_CLIENT_ID": "synthetic-policy-client-id",
+    "AI_ROUTER_GOOGLE_CLIENT_SECRET": "synthetic-policy-client-secret",
 })
 for name in (
     "AI_ROUTER_OPENAI_ENABLED",
+    "AI_ROUTER_ANTIGRAVITY_ENABLED",
+    "AI_ROUTER_STATE_DIR",
     "AI_ROUTER_OPENAI_STATE_DIR",
     "AI_ROUTER_OPENAI_MAX_CONCURRENT",
     "AI_ROUTER_OPENAI_MAX_QUEUE",
@@ -37,9 +41,12 @@ assert service["ports"][0]["host_ip"] == "127.0.0.1"
 assert service["ports"][0]["published"] == "8090"
 assert all(mount["type"] == "volume" for mount in service["volumes"])
 assert {mount["target"] for mount in service["volumes"]} == {
-    "/var/lib/ai-router/auth", "/var/lib/ai-router/openai-auth",
+    "/var/lib/ai-router/antigravity-auth", "/var/lib/ai-router/openai-auth",
     "/var/lib/ai-router/telemetry"}
-assert service["environment"]["AI_ROUTER_NATIVE_ENABLED"] == "false"
+assert service["environment"]["AI_ROUTER_ANTIGRAVITY_ENABLED"] == "true"
+assert service["environment"]["AI_ROUTER_STATE_DIR"] == "/var/lib/ai-router/antigravity-auth"
+assert service["environment"]["AI_ROUTER_GOOGLE_CLIENT_ID"] == "synthetic-policy-client-id"
+assert service["environment"]["AI_ROUTER_GOOGLE_CLIENT_SECRET"] == "synthetic-policy-client-secret"
 assert service["environment"]["AI_ROUTER_OPENAI_ENABLED"] == "false"
 assert service["environment"]["AI_ROUTER_OPENAI_STATE_DIR"] == "/var/lib/ai-router/openai-auth"
 openai_helper = (repo / "scripts/openai.sh").read_text()
@@ -62,10 +69,10 @@ with tempfile.TemporaryDirectory(prefix="ai-router-context-policy-") as tmp:
     (context / "allowed.txt").write_text("synthetic public fixture\n")
     checks = " && ".join("test ! -e /policy/" + name for name in protected)
     (context / "Dockerfile").write_text(
-        "FROM ai-router-agy:local\nCOPY . /policy\nRUN test -e /policy/allowed.txt && " + checks + "\n")
+        "FROM ai-router:local\nCOPY . /policy\nRUN test -e /policy/allowed.txt && " + checks + "\n")
     try:
         subprocess.run(["docker", "build", "-t", image, str(context)], check=True)
     finally:
         subprocess.run(["docker", "image", "rm", image], check=False,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-print("Docker policy checks passed: loopback, nonroot, named volumes, protected context paths excluded")
+print("Docker policy checks passed: loopback, nonroot, dedicated volumes, protected context paths excluded")

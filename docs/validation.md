@@ -1,5 +1,134 @@
 # Local validation
 
+## Direct model-only implementation (2026-10-20)
+
+The local implementation and independent review rounds completed. The previous
+CLI implementation remains on `archive/agy-cli-2026-10-20` at `4d23e015`.
+No live server, other user terminal, home-server Compose, push or remote deployment
+was used. The existing local gateway on 8091 and legacy AGY auth volume were
+left untouched. The direct test gateway uses loopback port 8092 and its own
+Antigravity state/telemetry volumes; OpenAI keeps its separate existing state.
+
+Final deterministic checks used explicit safe source/test mounts, synthetic
+credentials, and external networking disabled:
+
+- 181 Rust tests passed; the updated binary built successfully.
+- Real TCP contracts passed 38 official OpenAI SDK checks and 8 pinned Vercel
+  SDK checks, across reviewed Gemini and Claude profiles.
+- Monitor PTY checks passed: pages/scrolling, pause/range, disconnect/recovery,
+  themes, resizing, exit, and text/JSON output.
+- Clippy completed with two retained style warnings: constructor argument count
+  and a pre-existing test clone. No compilation errors.
+- Docker policy checks passed: nonroot/read-only, loopback, dedicated volumes,
+  and protected context exclusions tested with synthetic dummy files only.
+- Formatting, shell syntax, documentation links, `git diff --check`, and DAG
+  acyclicity passed (16 nodes, 20 dependencies).
+
+The CLI-free production image `ai-router:direct-local` built successfully. Runtime
+smoke checks verified UID 10001, installed attribution, no AGY binary, readiness,
+schema-v3 model-only capabilities, and removed native routes returning 404.
+All temporary diagnostic code was removed before this final build.
+
+### Public OAuth registration packaging and operations follow-up
+
+The reviewed public installed-app registration is now Base64-packaged like OMP;
+encoding is not encryption and no personal access/refresh token is bundled.
+The compiled protocol baseline includes decoded-registration SHA-256 fingerprints.
+Tests verify decoding, malformed data and fingerprint drift. Status exposes only
+registration provenance and integrity/matching booleans, never decoded values.
+
+A changed configured client ID now blocks admission, dispatch and cached access-token reuse even before expiration; synthetic coverage verifies those paths.
+Custom operator registrations remain supported. A matching saved client ID does
+not validate a changed client secret or prove live renewal; real refresh remains
+an explicit acceptance limit. Public update checks still run at startup and
+hourly and remain advisory, with all credential/protocol upgrades reviewed and
+applied through an explicit image rebuild. After replacing only the local 8092
+gateway, status reported `bundled_registration_valid:true`,
+`registration_source:reviewed_omp` and `session_registration_matches:true`.
+Saved sign-in remained available, discovery returned 13 Antigravity and 7 OpenAI
+models, and both upstream revision/version advisories were visible without
+affecting readiness. See the [operations runbook](operations.md).
+
+### Authorized local provider checks
+
+Separate Google consent using the approved pinned OMP registration succeeded;
+project resolution and exact discovery returned 13 reviewed Antigravity IDs and
+7 independent OpenAI IDs. Recreating the direct gateway preserved sign-in and
+restored discovery. No raw saved session or protected secret file was inspected.
+
+After the empty-text replay fix, each of `gemini-3.8-flash-high`,
+`claude-opus-5-5-medium`, and `claude-sonnet-5-5-high` passed 15 live official SDK
+checks: authenticated discovery, Chat/Responses text and streaming, both JSON
+schema modes, both tool handoffs and complete client-owned tool-result round
+trips, call IDs/arguments, and disconnect. Flash Low passed the same 15 checks
+earlier in development; it was not rerun after the final replay fix. The final
+image also passed an Opus
+tool round trip after temporary diagnostics were removed. OpenAI `gpt-6-luna`
+continued answering independently. `gemini-4-argon-medium` returned upstream
+429 quota errors on both attempts; no success or fallback is claimed for Argon.
+
+Review and live validation resolved dotted-ID rejection, exposure of unreviewed
+image/internal SKUs, Claude header/private-state differences, default fields on
+function-call parts, and empty visible replay parts. The last caused a nested
+Anthropic `text.text: Field required` error; omitting empty visible text parts
+at wire emission fixed the live Claude tool-result continuation. Private signed
+state remains memory-only and never enters public outputs or persisted logs.
+Auth reviews also fixed cross-process dispatch closure, cancellation epochs,
+refresh-lock contention, and prompt handling of validated OAuth denial.
+
+### Remaining release gates
+
+Correctness checks above do not establish a matched speedup. No authenticated
+CLI/direct A/B comparison was run: the existing CLI gateway was left untouched,
+and its raw client key was not read from files. The loopback-only
+[comparison helper](../tests/latency_compare.py) is ready for an operator to
+supply the existing client key through stdin. Its synthetic tests cover redirect
+refusal, proxy bypass, bounded SSE and deadlines; a same-direct-gateway control
+pair passed, which is explicitly **not** a CLI comparison. Early short-prompt
+samples during development are not acceptance evidence for the final protocol.
+
+Real token expiration/rotating refresh and comprehensive account recovery remain
+untested against Google; races and durable restriction recovery are covered by
+synthetic tests. Wider model/media acceptance, hard output caps and forced tool
+selection are not claimed. The temporary local smoke client is removed from the
+final gateway configuration; existing model client digest records are preserved.
+See the [plan](direct-antigravity-plan.md), [DAG](direct-antigravity-dag.md), and
+[auth contract](direct-auth-contract.md) for these release gates.
+
+The sections below are historical validation records for earlier CLI-based
+revisions. They do not establish acceptance of this direct revision.
+
+## Provider monitor correction and replacement planning (2026-10-20)
+
+The monitor now uses neutral startup labels, identifies combined usage totals,
+counts Other/unknown provider records, honours stale/disabled provider state,
+and publishes effective OpenAI restrictions/account-generation state consistently
+with model admission and capability errors. See the
+[review](monitor-provider-review.md) for findings and retained compatibility.
+
+Final checks ran in an isolated Docker test container, with synthetic state,
+explicit source/manifest/test mounts and external networking disabled:
+
+- 130 library + 25 HTTP + 15 runner tests passed (170 total).
+- The updated binary built successfully; monitor PTY checks passed for pages,
+  scrolling, pause/range, disconnect/recovery, themes, resize, exit and text/JSON.
+- Rust formatting and `git diff --check` passed.
+- Local documentation links resolve; the implementation DAG is acyclic
+  (16 nodes, 20 dependencies).
+
+The initial full-test container mounted its synthetic temporary directory with
+Docker's default `noexec`, preventing the HTTP spy fixture from executing. The
+same suite passed after correcting that test-only mount to permit its generated
+fixture. Production mount settings were not changed.
+
+The current CLI implementation was preserved locally on
+`archive/agy-cli-2026-10-20` at `4d23e015`. The
+[replacement plan](direct-antigravity-plan.md) and
+[DAG](direct-antigravity-dag.md) were independently reviewed. They are planning
+artifacts: no direct adapter, live credential migration, production restart,
+server Compose deployment or push occurred in this round. Existing server-login
+reuse is a feasibility gate, not a verified capability.
+
 ## Dual-provider checkpoint (2026-10-20)
 
 The dual-provider implementation has passed deterministic local integration

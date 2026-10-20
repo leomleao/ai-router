@@ -1,13 +1,12 @@
 use crate::{
+    antigravity::Antigravity,
     auth::{self, RateLimiter},
     config::{Config, KeyConfig},
     items::{self, ItemStore},
     monitor::{CapturedPayload, RequestRecord, Telemetry},
-    native::{self, RunStore},
     openai::OpenAi,
     protocol::*,
-    providers::{self, ProviderId, Registry, Snapshot},
-    runner::Runner,
+    providers::{ProviderId, Registry, Snapshot},
 };
 use axum::{
     Extension, Json, Router,
@@ -26,7 +25,6 @@ use std::{
     collections::HashSet,
     convert::Infallible,
     net::{IpAddr, SocketAddr},
-    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -39,13 +37,12 @@ use uuid::Uuid;
 
 pub struct AppState {
     pub config: Arc<Config>,
-    pub runner: Runner,
+    pub antigravity: Antigravity,
     pub telemetry: Arc<Telemetry>,
     pub provider: RwLock<ProviderStatus>,
     pub openai: OpenAi,
     pub openai_provider: RwLock<ProviderStatus>,
     registry: std::sync::Mutex<Registry>,
-    pub runs: RunStore,
     items: ItemStore,
     pub shutdown: CancellationToken,
     slots: Arc<Semaphore>,
@@ -53,7 +50,6 @@ pub struct AppState {
     openai_queued: AtomicUsize,
     agy_queued: AtomicUsize,
     body_slots: Arc<Semaphore>,
-    heavy_slots: Arc<Semaphore>,
     active: AtomicUsize,
     queued: AtomicUsize,
     drained: Notify,
@@ -64,7 +60,11 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(config: Arc<Config>, runner: Runner, telemetry: Arc<Telemetry>) -> Arc<Self> {
+    pub fn new(
+        config: Arc<Config>,
+        antigravity: Antigravity,
+        telemetry: Arc<Telemetry>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             slots: Arc::new(Semaphore::new(config.max_concurrent)),
             openai_slots: Arc::new(Semaphore::new(config.openai_max_concurrent)),
@@ -74,16 +74,14 @@ impl AppState {
             openai_provider: RwLock::new(ProviderStatus::default()),
             registry: std::sync::Mutex::new(Registry::default()),
             body_slots: Arc::new(Semaphore::new(32)),
-            heavy_slots: Arc::new(Semaphore::new(8)),
             preauth: RateLimiter::new(config.preauth_per_minute, 4096),
             global: RateLimiter::new(config.global_preauth_per_minute, 1),
             clients: RateLimiter::new(config.per_key_per_minute, config.keys.len().max(1)),
             rejection_logs: RateLimiter::new(30, 1),
             config,
-            runner,
+            antigravity,
             telemetry,
             provider: RwLock::new(ProviderStatus::default()),
-            runs: RunStore::default(),
             items: ItemStore::default(),
             shutdown: CancellationToken::new(),
             active: AtomicUsize::new(0),
@@ -94,7 +92,7 @@ impl AppState {
 
     pub async fn refresh_agy(&self) {
         self.items.prune();
-        let status = tokio::time::timeout(Duration::from_secs(10), self.runner.probe())
+        let status = tokio::time::timeout(Duration::from_secs(10), self.antigravity.probe())
             .await
             .unwrap_or_else(|_| ProviderStatus {
                 checked_at: Utc::now().to_rfc3339(),
@@ -105,8 +103,8 @@ impl AppState {
             .lock()
             .unwrap()
             .remember(ProviderId::Agy, &status);
-        self.telemetry.set_provider(status.clone()).await;
         *self.provider.write().await = status;
+        self.publish_agy_monitor_status().await;
     }
 
     pub async fn refresh_openai(&self) {
@@ -122,9 +120,25 @@ impl AppState {
                 .lock()
                 .unwrap()
                 .remember(ProviderId::OpenAi, &status);
-            self.telemetry.set_openai_provider(status.clone()).await;
             *self.openai_provider.write().await = status;
+            self.publish_openai_monitor_status().await;
+        } else {
+            let status = ProviderStatus {
+                checked_at: Utc::now().to_rfc3339(),
+                error: Some("provider_disabled".into()),
+                ..Default::default()
+            };
+            self.telemetry.set_openai_provider(status).await;
         }
+    }
+
+    /// Publish effective OpenAI availability to operational telemetry without
+    /// probing the provider. The catalogue can remain authenticated after a
+    /// request latches an account or plan restriction, so telemetry must apply
+    /// the same local availability and account-generation checks as admission.
+    pub async fn publish_openai_monitor_status(&self) {
+        let status = self.effective_openai_status().await;
+        self.telemetry.set_openai_provider(status).await;
     }
 
     pub async fn refresh_provider(&self) {
@@ -136,29 +150,88 @@ impl AppState {
         // The registration generation travels with its catalogue. Read that
         // pair before inspecting current authorization so a newly discovered
         // account cannot make the prior account's catalogue appear ready.
-        let mut openai = self.openai_provider.read().await.clone();
-        if self.config.openai_enabled {
-            let available = tokio::time::timeout(Duration::from_millis(100), async {
-                if self.openai.availability_error().await.is_some() {
-                    return false;
-                }
-                self.openai.generation().await.is_ok_and(|generation| {
-                    openai.registration_generation.as_ref() == Some(&generation)
-                })
-            })
-            .await
-            .unwrap_or(false);
-            if !available {
-                openai.authenticated = false;
-            }
-        }
-        let agy = self.provider.read().await;
+        let openai = self.effective_openai_status().await;
+        let agy = self.effective_agy_status().await;
         self.registry.lock().unwrap().snapshot(
             &agy,
             &openai,
             self.config.openai_enabled,
             Utc::now(),
         )
+    }
+
+    pub async fn publish_agy_monitor_status(&self) {
+        self.telemetry
+            .set_provider(self.effective_agy_status().await)
+            .await;
+    }
+    async fn effective_agy_status(&self) -> ProviderStatus {
+        let mut status = self.provider.read().await.clone();
+        let check = tokio::time::timeout(Duration::from_millis(100), async {
+            if let Some(error) = self.antigravity.availability_error().await {
+                return Err(error);
+            }
+            let generation = self.antigravity.generation().await?;
+            if status.registration_generation.as_ref() != Some(&generation) {
+                return Err(error(
+                    503,
+                    "provider_account_changed",
+                    "Antigravity account changed; rediscovery is required",
+                ));
+            }
+            Ok(())
+        })
+        .await;
+        match check {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                status.authenticated = false;
+                status.error = Some(error.code);
+            }
+            Err(_) => {
+                status.authenticated = false;
+                status.error = Some("provider_status_timeout".into());
+            }
+        }
+        status
+    }
+
+    async fn effective_openai_status(&self) -> ProviderStatus {
+        let mut status = self.openai_provider.read().await.clone();
+        if !self.config.openai_enabled {
+            status.authenticated = false;
+            status.error = Some("provider_disabled".into());
+            return status;
+        }
+        let available = tokio::time::timeout(Duration::from_millis(100), async {
+            if let Some(error) = self.openai.availability_error().await {
+                return Err(error);
+            }
+            match self.openai.generation().await {
+                Ok(generation) if status.registration_generation.as_ref() == Some(&generation) => {
+                    Ok(())
+                }
+                Ok(_) => Err(error(
+                    503,
+                    "provider_account_changed",
+                    "OpenAI account changed; provider discovery is required",
+                )),
+                Err(error) => Err(error),
+            }
+        })
+        .await;
+        match available {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                status.authenticated = false;
+                status.error = Some(error.code);
+            }
+            Err(_) => {
+                status.authenticated = false;
+                status.error = Some("provider_status_timeout".into());
+            }
+        }
+        status
     }
 
     async fn resolve_model(&self, model: &str) -> Result<ProviderId, ApiError> {
@@ -175,26 +248,19 @@ impl AppState {
                 return Err(error);
             }
         }
+        if let Ok(ProviderId::Agy) = resolved.as_ref() {
+            self.antigravity.model_availability(model).await?;
+        }
+        if resolved
+            .as_ref()
+            .is_err_and(|e| e.code == "provider_unavailable")
+            && snapshot.owner(model) == Some(ProviderId::Agy)
+        {
+            if let Some(error) = self.antigravity.availability_error().await {
+                return Err(error);
+            }
+        }
         resolved
-    }
-
-    pub async fn require_model(&self, model: &str) -> Result<(), ApiError> {
-        let status = self.provider.read().await;
-        if !providers::ready(&status, Utc::now()) {
-            return Err(error(
-                503,
-                "provider_unavailable",
-                "AGY is not ready; operator authentication may be required",
-            ));
-        }
-        if !status.models.iter().any(|m| m.id == model) {
-            return Err(error(
-                400,
-                "model_not_found",
-                "Choose a model returned by /v1/models",
-            ));
-        }
-        Ok(())
     }
 
     async fn runtime(&self) {
@@ -262,8 +328,8 @@ impl AppState {
         self.openai_slots.close();
     }
 
-    /// Admission is released only after the final record and owned workspace
-    /// cleanup. Wait for those tasks before flushing during shutdown.
+    /// Admission is released after provider completion and final telemetry.
+    /// Drain these tasks before flushing during shutdown.
     pub async fn drain(&self, timeout: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
@@ -331,30 +397,12 @@ pub struct RequestContext {
     pub recorded: AtomicBool,
 }
 
-fn hold_response(response: Response, permit: OwnedSemaphorePermit) -> Response {
-    let (parts, body) = response.into_parts();
-    let stream = async_stream::stream! {
-        let _permit=permit;let mut input=body.into_data_stream();
-        use futures_util::StreamExt;
-        while let Some(chunk)=input.next().await {yield chunk;}
-    };
-    Response::from_parts(parts, axum::body::Body::from_stream(stream))
-}
-
 pub fn router(state: Arc<AppState>) -> Router {
     let protected = Router::new()
         .route("/v1/models", get(models))
         .route("/v1/capabilities", get(capabilities))
         .route("/v1/chat/completions", post(chat))
         .route("/v1/responses", post(responses))
-        .route("/v1/agy/runs", post(native::create))
-        .route(
-            "/v1/agy/runs/{id}",
-            get(native::status).delete(native::cancel),
-        )
-        .route("/v1/agy/runs/{id}/events", get(native::events))
-        .route("/v1/agy/runs/{id}/artifacts", get(native::artifacts))
-        .route("/v1/agy/runs/{id}/artifacts/{*path}", get(native::download))
         .fallback(unsupported)
         .layer(middleware::from_fn_with_state(state.clone(), protect));
     Router::new()
@@ -446,11 +494,7 @@ async fn protect(
         )
         .await;
     }
-    let scope = if request.uri().path().starts_with("/v1/agy/") {
-        "native"
-    } else {
-        "model"
-    };
+    let scope = "model";
     if !key.scopes.iter().any(|s| s == scope) {
         return rejection_response(
             &state,
@@ -499,22 +543,6 @@ async fn protect(
         };
         request = Request::from_parts(parts, axum::body::Body::from(bytes));
     }
-    let heavy = if request.method() == axum::http::Method::GET
-        && request.uri().path().starts_with("/v1/agy/")
-    {
-        match state.heavy_slots.clone().try_acquire_owned() {
-            Ok(permit) => Some(permit),
-            Err(_) => {
-                return rejection_response(
-                    &state,
-                    error(429, "busy", "Too many native response streams"),
-                )
-                .await;
-            }
-        }
-    } else {
-        None
-    };
     let context = Arc::new(RequestContext {
         selection: std::sync::Mutex::new(None),
         id: Uuid::new_v4().to_string(),
@@ -526,8 +554,6 @@ async fn protect(
         "chat"
     } else if request.uri().path() == "/v1/responses" {
         "responses"
-    } else if request.uri().path().starts_with("/v1/agy/") {
-        "native"
     } else {
         "api"
     };
@@ -552,14 +578,7 @@ async fn protect(
                 provider: selection
                     .as_ref()
                     .map(|(provider, _)| provider.clone())
-                    .unwrap_or_else(|| {
-                        if endpoint == "native" {
-                            "agy"
-                        } else {
-                            "unknown"
-                        }
-                        .into()
-                    }),
+                    .unwrap_or_else(|| "unknown".into()),
                 endpoint: endpoint.into(),
                 started_at: Utc::now().to_rfc3339(),
                 duration_ms: context.started.elapsed().as_millis() as u64,
@@ -580,11 +599,7 @@ async fn protect(
             .headers_mut()
             .insert("retry-after", "10".parse().unwrap());
     }
-    if let Some(permit) = heavy {
-        hold_response(response, permit)
-    } else {
-        response
-    }
+    response
 }
 
 async fn rejection_response(state: &AppState, e: ApiError) -> Response {
@@ -624,7 +639,7 @@ async fn unsupported() -> ApiError {
     error(
         404,
         "unsupported_endpoint",
-        "This endpoint is not supported by the configured CLI adapter",
+        "This endpoint is not supported by the model-only router",
     )
 }
 
@@ -637,30 +652,24 @@ async fn models(State(state): State<Arc<AppState>>) -> Json<Value> {
 
 async fn capabilities(State(state): State<Arc<AppState>>) -> Json<Value> {
     let snapshot = state.snapshot().await;
-    let provider = state.provider.read().await;
-    let openai = state.openai_provider.read().await;
-    let mut value = json!({"provider":"agy", "cli_version":provider.version, "expected_cli_version":state.config.expected_agy_version, "provider_ready":providers::ready(&provider,Utc::now()),
-        "profiles":{"model":{"chat_completions":true,"responses":true,"streaming":true,"text":true,"json_schema":true,"client_tools":true,"max_tool_calls_per_turn":1,"parallel_tool_execution":false,"media_input":false,
-                    "client_tool_argument_correction":{"max_corrections":crate::relay::MAX_TOOL_CORRECTIONS,"scope":"request","same_run":true,"unknown_tools":false},
-                    "item_references":{"enabled":true,"storage":"memory","default_store":true,"ttl_seconds":items::TTL_SECONDS,"max_items":items::MAX_ITEMS,"max_bytes":items::MAX_BYTES,"per_client_items":items::CLIENT_ITEMS,"per_client_bytes":items::CLIENT_BYTES,"cleared_on_restart":true,"eviction":"oldest_first"},
-                    "prompt_cache_controls":{"mode":"ignored","retention_guarantee":false,"parameters":["prompt_cache_key","prompt_cache_retention"]},
-                    "output_token_budget":{"mode":"prompt_guidance","hard_limit":false,"limits_reasoning_tokens":false,"parameters":["max_output_tokens","max_tokens","max_completion_tokens"]}},
-                    "native":{"enabled":state.config.native_enabled && !state.config.openai_enabled,"requires_operator_sandbox_verification":true,"runs":true,"uploaded_files":true,"artifacts":true,"continuation":false}},
-        "unsupported":["sampling_controls","forced_tool_choice","embeddings","audio","image_generation_api","realtime","batches","fine_tuning","provider_management"],
-        "verification":{"adapter_contract":"automated_fixtures","real_model_and_client_loops":"operator_gate","native_sandbox":"operator_gate"},
-        "models":provider.models,"per_model":provider.models.iter().map(|m|json!({"id":m.id,"cli_version":provider.version,"model_profile_verification":"operator_gate","native_profile_verification":"operator_gate"})).collect::<Vec<_>>(),"quota":provider.quota,"checked_at":provider.checked_at});
-    value["schema_version"] = json!(2);
-    value["admission"] = json!({"total_max_concurrent":state.config.max_concurrent + if state.config.openai_enabled {state.config.openai_max_concurrent} else {0}, "providers":{"agy":{"max_concurrent":state.config.max_concurrent,"max_queue":state.config.max_queue},"openai":{"enabled":state.config.openai_enabled,"max_concurrent":state.config.openai_max_concurrent,"max_queue":state.config.openai_max_queue}}});
-    value["providers"] = json!({
-        "agy": {"enabled":true,"ready":snapshot.entries.iter().any(|entry|entry.provider==ProviderId::Agy),"version":provider.version,"checked_at":provider.checked_at,"error":provider.error,"quota":provider.quota},
-        "openai": {"enabled":state.config.openai_enabled,"ready":snapshot.entries.iter().any(|entry|entry.provider==ProviderId::OpenAi),"version":openai.version,"checked_at":openai.checked_at,"error":openai.error,"quota":openai.quota,"usage_url":"https://chatgpt.com/settings/usage","upstream":"responses","upstream_store":false,"upstream_stream":true,"client_tools":true,"media_input":false,"output_token_budget":{"mode":"prompt_guidance","hard_limit":false},"unsupported":["sampling_controls","hosted_tools","native"],"reasoning_effort":"model_dependent"}
-    });
-    value["model_conflicts"] = json!(snapshot.conflicts);
-    value["per_model"] = json!(snapshot.entries.iter().map(|entry| match entry.provider {
-        ProviderId::Agy => json!({"id":entry.model.id,"provider":"agy","cli_version":provider.version,"model_profile_verification":"operator_gate","native_profile_verification":"operator_gate","chat_completions":true,"responses":true,"client_tools":true,"max_tool_calls_per_turn":1,"parallel_tool_execution":false,"output_token_budget":{"mode":"prompt_guidance"}}),
-        ProviderId::OpenAi => json!({"id":entry.model.id,"provider":"openai","chat_completions":true,"responses":true,"streaming":true,"client_tools":true,"native":false,"media_input":false,"output_token_budget":{"mode":"prompt_guidance","hard_limit":false},"model_profile_verification":"operator_gate"}),
-    }).collect::<Vec<_>>());
-    Json(value)
+    let agy = state.effective_agy_status().await;
+    let openai = state.effective_openai_status().await;
+    let release = state.antigravity.release.snapshot().await;
+    Json(json!({
+        "schema_version":3,"provider":"model-router","native":false,
+        "profiles":{"model":{"chat_completions":true,"responses":true,"streaming":true,"text":true,"json_schema":true,"client_tools":true,"parallel_tool_execution":false,"media_input":false,
+            "output_token_budget":{"mode":"prompt_guidance","hard_limit":false,"limits_reasoning_tokens":false},
+            "prompt_cache_controls":{"mode":"ignored","retention_guarantee":false},
+            "item_references":{"enabled":true,"storage":"memory","default_store":true,"ttl_seconds":items::TTL_SECONDS,"max_items":items::MAX_ITEMS,"max_bytes":items::MAX_BYTES,"per_client_items":items::CLIENT_ITEMS,"per_client_bytes":items::CLIENT_BYTES,"cleared_on_restart":true}}},
+        "providers":{
+            "agy":{"enabled":state.config.antigravity_enabled,"ready":snapshot.entries.iter().any(|e|e.provider==ProviderId::Agy),"adapter":agy.version,"baseline":crate::antigravity_auth::BASELINE_REVISION,"checked_at":agy.checked_at,"error":agy.error,"quota":agy.quota,"transport":"direct","fallback":false,"release_advisory":release},
+            "openai":{"enabled":state.config.openai_enabled,"ready":snapshot.entries.iter().any(|e|e.provider==ProviderId::OpenAi),"version":openai.version,"checked_at":openai.checked_at,"error":openai.error,"quota":openai.quota,"usage_url":"https://chatgpt.com/settings/usage","upstream":"responses","upstream_store":false,"upstream_stream":true,"client_tools":true,"media_input":false,"output_token_budget":{"mode":"prompt_guidance","hard_limit":false},"unsupported":["sampling_controls","hosted_tools","native"],"reasoning_effort":"model_dependent"}},
+        "admission":{"total_max_concurrent":state.config.max_concurrent+if state.config.openai_enabled {state.config.openai_max_concurrent}else{0},"providers":{"agy":{"max_concurrent":state.config.max_concurrent,"max_queue":state.config.max_queue},"openai":{"enabled":state.config.openai_enabled,"max_concurrent":state.config.openai_max_concurrent,"max_queue":state.config.openai_max_queue}}},
+        "unsupported":["native","media_input","forced_tool_choice","sampling_controls","embeddings","audio","image_generation_api","realtime","batches","fine_tuning","provider_management"],
+        "verification":{"adapter_contract":"automated_fixtures","live_direct_provider":"operator_validation_required"},
+        "model_conflicts":snapshot.conflicts,
+        "per_model":snapshot.entries.iter().map(|e|json!({"id":e.model.id,"provider":e.provider.as_str(),"chat_completions":true,"responses":true,"streaming":true,"client_tools":true,"native":false,"media_input":false,"output_token_budget":{"mode":"prompt_guidance","hard_limit":false}})).collect::<Vec<_>>()
+    }))
 }
 
 async fn chat(
@@ -762,11 +771,10 @@ async fn generate_body(
         .ok_or_else(|| ApiError::bad_request("model must be a string"))?;
     let selected = state.resolve_model(model_id).await?;
     *context.selection.lock().unwrap() = Some((selected.as_str().into(), model_id.to_owned()));
-    let pinned_generation = if selected == ProviderId::OpenAi {
-        Some(state.openai.generation().await?)
-    } else {
-        None
-    };
+    let pinned_generation = Some(match selected {
+        ProviderId::OpenAi => state.openai.generation().await?,
+        ProviderId::Agy => state.antigravity.generation().await?,
+    });
     let item_scope = format!(
         "{}:{}",
         selected.as_str(),
@@ -804,12 +812,15 @@ async fn generate_body(
             "The selected model ownership changed while queued",
         ));
     }
-    if selected == ProviderId::OpenAi && Some(state.openai.generation().await?) != pinned_generation
-    {
+    let current_generation = match selected {
+        ProviderId::OpenAi => state.openai.generation().await?,
+        ProviderId::Agy => state.antigravity.generation().await?,
+    };
+    if Some(current_generation) != pinned_generation {
         return Err(error(
             503,
             "provider_unavailable",
-            "The selected ChatGPT registration changed while queued",
+            "The selected provider account changed while queued",
         ));
     }
     let cancel = state.shutdown.child_token();
@@ -829,7 +840,7 @@ async fn generate_body(
         .ok_or_else(|| error(504, "provider_timeout", "Request deadline exceeded"))?;
     request.remaining_ms = Some(remaining.as_millis().min(u128::from(u64::MAX)) as u64);
     let mut run = match selected {
-        ProviderId::Agy => state.runner.start(request, cancel.clone()).await?,
+        ProviderId::Agy => state.antigravity.start(request, cancel.clone()).await?,
         ProviderId::OpenAi => state.openai.start(request, cancel.clone()).await?,
     };
     let owner = key.id.clone();
@@ -841,8 +852,6 @@ async fn generate_body(
         if responses { "responses" } else { "chat" },
         id.clone(),
         started,
-        run.workspace.clone(),
-        run.workspace_owned.clone(),
         cancel,
         run.finished.clone(),
         admission,
@@ -1002,8 +1011,6 @@ pub struct CompletionGuard {
     state: Arc<AppState>,
     record: RequestRecord,
     started: Instant,
-    workspace: Option<PathBuf>,
-    workspace_owned: Arc<AtomicBool>,
     cancel: CancellationToken,
     finished: CancellationToken,
     admission: Option<Admission>,
@@ -1016,8 +1023,6 @@ impl CompletionGuard {
         endpoint: &str,
         request_id: String,
         started: Instant,
-        workspace: PathBuf,
-        workspace_owned: Arc<AtomicBool>,
         cancel: CancellationToken,
         finished: CancellationToken,
         admission: Admission,
@@ -1042,15 +1047,10 @@ impl CompletionGuard {
                 usage_partial: true,
             },
             started,
-            workspace: Some(workspace),
-            workspace_owned,
             cancel,
             finished,
             admission: Some(admission),
         }
-    }
-    pub fn preserve_workspace(&mut self) {
-        self.workspace = None;
     }
     pub fn capture_response(&mut self, value: &Value) {
         self.response = Some(CapturedPayload::capture(value));
@@ -1107,12 +1107,10 @@ impl Drop for CompletionGuard {
         let record = self.record.clone();
         let response = self.response.take();
         let state = self.state.clone();
-        let workspace = self.workspace.take();
-        let workspace_owned = self.workspace_owned.clone();
         let finished = self.finished.clone();
         let admission = self.admission.take();
         tokio::spawn(async move {
-            let stopped = tokio::time::timeout(Duration::from_secs(30), finished.cancelled())
+            let _stopped = tokio::time::timeout(Duration::from_secs(30), finished.cancelled())
                 .await
                 .is_ok();
             state
@@ -1120,13 +1118,6 @@ impl Drop for CompletionGuard {
                 .finish_detail(&record.request_id, response)
                 .await;
             state.telemetry.record(record).await;
-            if stopped && workspace_owned.load(Ordering::Acquire) {
-                if let Some(workspace) = workspace {
-                    if tokio::fs::remove_dir_all(workspace).await.is_ok() {
-                        workspace_owned.store(false, Ordering::Release);
-                    }
-                }
-            }
             drop(admission);
         });
     }
@@ -1328,7 +1319,7 @@ mod tests {
             .unwrap(),
         );
         let config = Arc::new(config);
-        let state = AppState::new(config.clone(), Runner::new(config), telemetry);
+        let state = AppState::new(config.clone(), Antigravity::new(config), telemetry);
         (temp, state)
     }
     #[tokio::test]
@@ -1347,8 +1338,12 @@ mod tests {
         assert!(state.drain(Duration::from_secs(1)).await);
     }
     #[tokio::test]
-    async fn disabled_openai_and_stale_agy_are_not_ready() {
+    async fn disabled_openai_and_unauthenticated_antigravity_are_not_ready() {
         let (_temp, state) = test_state();
+        state.publish_openai_monitor_status().await;
+        let monitor_status = state.telemetry.snapshot().await.openai_provider;
+        assert!(!monitor_status.authenticated);
+        assert_eq!(monitor_status.error.as_deref(), Some("provider_disabled"));
         *state.provider.write().await = ProviderStatus {
             authenticated: true,
             checked_at: (Utc::now() - chrono::Duration::seconds(181)).to_rfc3339(),
@@ -1361,7 +1356,7 @@ mod tests {
         assert!(state.snapshot().await.entries.is_empty());
         assert_eq!(
             state.resolve_model("synthetic").await.unwrap_err().code,
-            "provider_unavailable"
+            "agy_auth_required"
         );
     }
 
@@ -1461,6 +1456,55 @@ mod tests {
         ));
         ([("content-type", "text/event-stream")], wire).into_response()
     }
+    async fn mock_direct_response(Json(body): Json<Value>) -> Response {
+        // Gemini's reviewed CCA profile uses ordered groups without wire IDs.
+        if !body["model"].as_str().unwrap().starts_with("claude-") {
+            for turn in body["request"]["contents"].as_array().unwrap() {
+                for part in turn["parts"].as_array().unwrap() {
+                    assert!(part.pointer("/functionCall/id").is_none());
+                    assert!(part.pointer("/functionResponse/id").is_none());
+                }
+            }
+        }
+        let text = body.to_string();
+        if text.contains("direct-quota-fixture") {
+            return StatusCode::TOO_MANY_REQUESTS.into_response();
+        }
+        if text.contains("direct-protocol-fixture") {
+            return ([("content-type", "text/event-stream")], "data: {}\n\n").into_response();
+        }
+        if text.contains("direct-invalid-schema-fixture") {
+            return ([("content-type","text/event-stream")],"data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"not JSON\"}]},\"finishReason\":\"STOP\"}]}}\n\n").into_response();
+        }
+
+        let continuing = body
+            .pointer("/request/contents")
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .any(|turn| {
+                turn["parts"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|part| part.get("functionResponse").is_some())
+            });
+        let parts = if text.contains("tools-fixture")
+            && !continuing
+            && body.pointer("/request/tools").is_some()
+        {
+            json!([{"text":"private reasoning","thought":true,"thoughtSignature":"c2lnbmF0dXJl"},
+                {"functionCall":{"name":"lookup","args":{"q":"one"}}},
+                {"functionCall":{"name":"lookup","args":{"q":"two"}}}])
+        } else {
+            json!([{"text":if text.contains("schema-fixture") {"{\"answer\":\"valid\"}"} else if continuing {"tool results accepted"} else {"Hello from fixture"}}])
+        };
+        let wire = format!(
+            "data: {}\n\n",
+            json!({"response":{"candidates":[{"content":{"role":"model","parts":parts},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":4,"candidatesTokenCount":6,"totalTokenCount":10}}})
+        );
+        ([("content-type", "text/event-stream")], wire).into_response()
+    }
     impl DualHarness {
         async fn new() -> Self {
             Self::with_timeout(5).await
@@ -1469,8 +1513,6 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let mut config = Config::for_test(root.path());
             config.openai_enabled = true;
-            config.agy_bin =
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-agy");
             config.request_timeout_secs = timeout_seconds;
             config.preauth_per_minute = 10000;
             config.global_preauth_per_minute = 10000;
@@ -1487,7 +1529,10 @@ mod tests {
                     Json(json!({"models":[{"slug":"synthetic-openai","display_name":"Synthetic OpenAI","visibility":"list"}]})).into_response()
                 }
             }))
-                .route("/responses", post(mock_openai_response)).with_state(captured.clone());
+                .route("/responses", post(mock_openai_response))
+                .route("/v1internal:fetchAvailableModels",post(||async {Json(json!({"models":{"gemini-4-argon-medium":{"displayName":"Gemini fixture"},"claude-sonnet-5-5-high":{"displayName":"Claude fixture"}}}))}))
+                .route("/v1internal:streamGenerateContent",post(mock_direct_response))
+                .with_state(captured.clone());
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let server = tokio::spawn(async move {
@@ -1501,7 +1546,10 @@ mod tests {
                 )
                 .unwrap(),
             );
-            let mut state = AppState::new(config.clone(), Runner::new(config.clone()), telemetry);
+            let mut state =
+                AppState::new(config.clone(), Antigravity::new(config.clone()), telemetry);
+            Arc::get_mut(&mut state).unwrap().antigravity =
+                Antigravity::synthetic(config.clone(), format!("http://{address}")).await;
             Arc::get_mut(&mut state).unwrap().openai = OpenAi::synthetic(
                 config,
                 format!("http://{address}"),
@@ -1675,16 +1723,40 @@ mod tests {
             .await;
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{wire}");
         assert!(!wire.contains("synthetic-provider-private-detail"));
+        // The catalogue probe remains healthy, but the latched usage limit
+        // must be reflected in the monitor's effective status.
+        assert!(h.state.openai_provider.read().await.authenticated);
+        h.state.publish_openai_monitor_status().await;
+        let monitor_status = h.state.telemetry.snapshot().await.openai_provider;
+        assert!(!monitor_status.authenticated);
+        assert_eq!(
+            monitor_status.error.as_deref(),
+            Some("subscription_sharing_usage_limit_exceeded")
+        );
         // A successful model discovery cannot clear a plan-usage latch.
         h.state.refresh_openai().await;
+        let monitor_status = h.state.telemetry.snapshot().await.openai_provider;
+        assert!(!monitor_status.authenticated);
+        assert_eq!(
+            monitor_status.error.as_deref(),
+            Some("subscription_sharing_usage_limit_exceeded")
+        );
+        let (status, wire) = h.call("/v1/capabilities", None).await;
+        assert_eq!(status, StatusCode::OK, "{wire}");
+        let capabilities: Value = serde_json::from_str(&wire).unwrap();
+        assert_eq!(capabilities["providers"]["openai"]["ready"], false);
+        assert_eq!(
+            capabilities["providers"]["openai"]["error"],
+            "subscription_sharing_usage_limit_exceeded"
+        );
         let (_, wire) = h.call("/v1/models", None).await;
         assert!(!wire.contains("synthetic-openai"));
-        assert!(wire.contains("gemini-3-pro"));
+        assert!(wire.contains("gemini-4-argon-medium"));
         let (status, wire) = h
             .call(
                 "/v1/chat/completions",
                 Some(
-                    json!({"model":"gemini-3-pro","messages":[{"role":"user","content":"hello"}]}),
+                    json!({"model":"gemini-4-argon-medium","messages":[{"role":"user","content":"hello"}]}),
                 ),
             )
             .await;
@@ -1699,12 +1771,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn monitor_openai_status_rejects_a_catalogue_from_another_generation() {
+        let h = DualHarness::new().await;
+        {
+            let mut status = h.state.openai_provider.write().await;
+            status.registration_generation = Some("synthetic-old-generation".into());
+        }
+        h.state.publish_openai_monitor_status().await;
+        let monitor_status = h.state.telemetry.snapshot().await.openai_provider;
+        assert!(!monitor_status.authenticated);
+        assert_eq!(
+            monitor_status.error.as_deref(),
+            Some("provider_account_changed")
+        );
+    }
+
+    #[tokio::test]
     async fn probes_publish_independently_and_outages_isolate_in_both_directions() {
         let h = DualHarness::new().await;
         *h.state.provider.write().await = ProviderStatus::default();
         let (_, wire) = h.call("/v1/models", None).await;
         assert!(wire.contains("synthetic-openai"));
-        assert!(!wire.contains("gemini-3-pro"));
+        assert!(!wire.contains("gemini-4-argon-medium"));
         h.model_mode.store(2, Ordering::SeqCst);
         let state = h.state.clone();
         let refresh = tokio::spawn(async move {
@@ -1726,7 +1814,7 @@ mod tests {
         h.state.refresh_openai().await;
         let (_, wire) = h.call("/v1/models", None).await;
         assert!(!wire.contains("synthetic-openai"));
-        assert!(wire.contains("gemini-3-pro"));
+        assert!(wire.contains("gemini-4-argon-medium"));
         let (status, wire) = h
             .call(
                 "/v1/responses",
@@ -1804,6 +1892,130 @@ mod tests {
         assert_eq!(
             response_object("synthetic", 0, "agy-synthetic", &empty, false)["output"][0]["type"],
             "message"
+        );
+    }
+    #[tokio::test]
+    async fn official_sdks_cover_direct_gateway_over_real_tcp() {
+        use tokio::io::AsyncWriteExt;
+        let h = DualHarness::new().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = h.app.clone();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        for (program, path, model) in [
+            ("python3", "tests/sdk_contract.py", "gemini-4-argon-medium"),
+            ("python3", "tests/sdk_contract.py", "claude-sonnet-5-5-high"),
+            ("node", "tests/n8n_contract.mjs", "gemini-4-argon-medium"),
+            ("node", "tests/n8n_contract.mjs", "claude-sonnet-5-5-high"),
+        ] {
+            let mut child = tokio::process::Command::new(program)
+                .arg(path)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(
+                    json!({"base_url":format!("http://{address}/v1"),"model":model})
+                        .to_string()
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let output = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{program}: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        server.abort();
+        h.state.stop();
+        assert!(h.state.drain(Duration::from_secs(2)).await);
+    }
+
+    #[tokio::test]
+    async fn stale_antigravity_snapshot_hides_only_its_models() {
+        let h = DualHarness::new().await;
+        h.state.provider.write().await.checked_at =
+            (Utc::now() - chrono::Duration::seconds(181)).to_rfc3339();
+        let (_, body) = h.call("/v1/models", None).await;
+        assert!(!body.contains("gemini-4-argon-medium"));
+        assert!(body.contains("synthetic-openai"));
+        assert_eq!(
+            h.state
+                .resolve_model("gemini-4-argon-medium")
+                .await
+                .unwrap_err()
+                .code,
+            "provider_unavailable"
+        );
+    }
+    #[tokio::test]
+    async fn direct_quota_protocol_and_schema_failures_have_distinct_scope() {
+        let h = DualHarness::new().await;
+        let request = |input: &str| json!({"model":"gemini-4-argon-medium","input":input});
+        let (status, _) = h
+            .call("/v1/responses", Some(request("direct-quota-fixture")))
+            .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(h.state.antigravity.availability_error().await.is_none());
+        assert_eq!(
+            h.state
+                .antigravity
+                .model_availability("gemini-4-argon-medium")
+                .await
+                .unwrap_err()
+                .status,
+            429
+        );
+        let (status, _) = h
+            .call(
+                "/v1/responses",
+                Some(json!({"model":"claude-sonnet-5-5-high","input":"hello"})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let h = DualHarness::new().await;
+        let mut body = request("direct-invalid-schema-fixture");
+        body["text"] =
+            json!({"format":{"type":"json_schema","name":"x","schema":{"type":"object"}}});
+        assert_eq!(
+            h.call("/v1/responses", Some(body)).await.0,
+            StatusCode::BAD_GATEWAY
+        );
+        assert!(h.state.antigravity.availability_error().await.is_none());
+        assert_eq!(
+            h.call("/v1/responses", Some(request("hello"))).await.0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            h.call("/v1/responses", Some(request("direct-protocol-fixture")))
+                .await
+                .0,
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            h.state.antigravity.availability_error().await.unwrap().code,
+            "agy_protocol_blocked"
+        );
+        assert_eq!(
+            h.call(
+                "/v1/responses",
+                Some(json!({"model":"synthetic-openai","input":"hello"}))
+            )
+            .await
+            .0,
+            StatusCode::OK
         );
     }
 }

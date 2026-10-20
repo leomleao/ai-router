@@ -14,15 +14,17 @@ services:
     environment:
       # Digests only. Operator exports JSON in the calling shell; no env_file.
       AI_ROUTER_KEYS: "${AI_ROUTER_KEYS:?Export digest records before starting}"
-      AI_ROUTER_NATIVE_ENABLED: "false"
-      AI_ROUTER_EXPECTED_AGY_VERSION: "1.4.3"
+      AI_ROUTER_ANTIGRAVITY_ENABLED: "${AI_ROUTER_ANTIGRAVITY_ENABLED:-true}"
+      AI_ROUTER_STATE_DIR: /var/lib/ai-router/antigravity-auth
+      AI_ROUTER_GOOGLE_CLIENT_ID: "${AI_ROUTER_GOOGLE_CLIENT_ID:-}"
+      AI_ROUTER_GOOGLE_CLIENT_SECRET: "${AI_ROUTER_GOOGLE_CLIENT_SECRET:-}"
       AI_ROUTER_TRUSTED_PROXIES: "${AI_ROUTER_TRUSTED_PROXIES:-}"
       AI_ROUTER_OPENAI_ENABLED: "${AI_ROUTER_OPENAI_ENABLED:-false}"
       AI_ROUTER_OPENAI_STATE_DIR: /var/lib/ai-router/openai-auth
       AI_ROUTER_OPENAI_MAX_CONCURRENT: "${AI_ROUTER_OPENAI_MAX_CONCURRENT:-2}"
       AI_ROUTER_OPENAI_MAX_QUEUE: "${AI_ROUTER_OPENAI_MAX_QUEUE:-8}"
     volumes:
-      - auth:/var/lib/ai-router/auth
+      - antigravity-auth:/var/lib/ai-router/antigravity-auth
       - openai-auth:/var/lib/ai-router/openai-auth
       - telemetry:/var/lib/ai-router/telemetry
     tmpfs:
@@ -38,8 +40,10 @@ services:
     stop_grace_period: 30s
 
 volumes:
-  auth:
-    name: ai-router-auth
+  # The legacy ai-router-auth AGY CLI volume is intentionally retained outside
+  # this Compose project for rollback; never mount it into the direct adapter.
+  antigravity-auth:
+    name: ai-router-antigravity-auth
   openai-auth:
     name: ai-router-openai-auth
   telemetry:

@@ -84,6 +84,8 @@ pub struct Aggregate {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Snapshot {
+    #[serde(default)]
+    pub antigravity_release: Option<serde_json::Value>,
     pub generated_at: String,
     pub active: usize,
     pub queued: usize,
@@ -102,6 +104,7 @@ pub struct Snapshot {
 }
 
 struct State {
+    antigravity_release: Option<serde_json::Value>,
     records: VecDeque<RequestRecord>,
     provider: ProviderStatus,
     openai_provider: ProviderStatus,
@@ -114,6 +117,7 @@ struct State {
 impl Default for State {
     fn default() -> Self {
         Self {
+            antigravity_release: None,
             records: VecDeque::new(),
             provider: ProviderStatus::default(),
             openai_provider: ProviderStatus::default(),
@@ -360,11 +364,13 @@ impl Telemetry {
         let records: Vec<_> = state.records.iter().cloned().collect();
         let active = state.active;
         let queued = state.queued;
+        let antigravity_release = state.antigravity_release.clone();
         let provider = state.provider.clone();
         let openai_provider = state.openai_provider.clone();
         let persistence_errors = state.persistence_errors;
         drop(state);
         Snapshot {
+            antigravity_release,
             generated_at: Utc::now().to_rfc3339(),
             active,
             queued,
@@ -395,6 +401,45 @@ impl Telemetry {
         }
     }
 
+    pub async fn set_antigravity_release(&self, value: serde_json::Value) {
+        // Public release metadata only: no arbitrary upstream bodies enter telemetry.
+        let mut out = serde_json::json!({"advisory":true,"affects_readiness":false});
+        for key in [
+            "pinned_version",
+            "observed_version",
+            "pinned_revision",
+            "observed_revision",
+            "checked_at",
+        ] {
+            if let Some(text) = value
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| {
+                    s.len() <= 64
+                        && s.bytes().all(|b| {
+                            b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':' | b'+')
+                        })
+                })
+            {
+                out[key] = serde_json::json!(text);
+            }
+        }
+        let alerts = value
+            .get("alerts")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .filter(|s| {
+                s.len() <= 80
+                    && s.bytes()
+                        .all(|b| b.is_ascii_lowercase() || matches!(b, b'_' | b'-'))
+            })
+            .take(8)
+            .collect::<Vec<_>>();
+        out["alerts"] = serde_json::json!(alerts);
+        self.state.lock().await.antigravity_release = Some(out);
+    }
     pub async fn set_provider(&self, provider: ProviderStatus) {
         self.ensure_worker();
         self.state.lock().await.provider = sanitise_provider(provider);
@@ -815,7 +860,7 @@ fn render(snapshot: &Snapshot) -> String {
     let a = &snapshot.aggregate;
     let c = &snapshot.counts_since_start;
     let mut text = format!(
-        "AI router  {}\nAGY {}  authenticated={}  checked={}  age={}s\nOpenAI {}  authenticated={}  checked={}  age={}s\nActive={}  queued={}  requests={}  failures={}  auth failures={}\nRequests by provider: AGY={} OpenAI={} other={}\nLatency p50/p95={} / {} ms  AGY ready={} / {} ms  first output={} / {} ms\nObserved tokens input={} output={} total={} (complete={} partial={})\nRetention={} days / {} events  persistence errors={}\n",
+        "AI router  {}\nAGY {}  authenticated={}  checked={}  age={}s\nOpenAI {}  authenticated={}  checked={}  age={}s\nActive={}  queued={}  requests={}  failures={}  auth failures={}\nRequests by provider: AGY={} OpenAI={} other={}\nLatency (all providers) p50/p95={} / {} ms  startup={} / {} ms  first output={} / {} ms\nObserved tokens (all providers) input={} output={} total={} (complete={} partial={})\nRetention={} days / {} events  persistence errors={}\n",
         snapshot.generated_at,
         snapshot.provider.version,
         snapshot.provider.authenticated,
@@ -832,7 +877,11 @@ fn render(snapshot: &Snapshot) -> String {
         a.auth_failures,
         a.by_provider.get("agy").copied().unwrap_or(0),
         a.by_provider.get("openai").copied().unwrap_or(0),
-        a.by_provider.get("other").copied().unwrap_or(0),
+        a.by_provider
+            .iter()
+            .filter(|(provider, _)| !matches!(provider.as_str(), "agy" | "openai"))
+            .map(|(_, count)| count)
+            .sum::<usize>(),
         fmt_metric(a.duration_p50_ms),
         fmt_metric(a.duration_p95_ms),
         fmt_metric(a.startup_p50_ms),
@@ -852,6 +901,11 @@ fn render(snapshot: &Snapshot) -> String {
         "Rejected since {}: total={} auth={} rate={} scope={} input={} busy={} other={} (reset on restart; recent rejection history is sampled)\n",
         c.started_at, c.total, c.auth, c.rate, c.scope, c.input, c.busy, c.other,
     ));
+    if let Some(advisory) = &snapshot.antigravity_release {
+        text.push_str(&format!(
+            "Antigravity release advisory (does not affect readiness): {advisory}\n"
+        ));
+    }
     if let Some(error) = &snapshot.provider.error {
         text.push_str(&format!("AGY status: {error}\n"));
     }
@@ -991,6 +1045,9 @@ mod tests {
         let text = render(&snapshot);
         assert!(text.contains("OpenAI preview-1"));
         assert!(text.contains("Requests by provider: AGY=0 OpenAI=1"));
+        assert!(text.contains("Latency (all providers) p50/p95=100 / 100 ms  startup=10 / 10 ms"));
+        assert!(text.contains("Observed tokens (all providers)"));
+        assert!(!text.contains("AGY ready="));
         assert!(text.contains("https://chatgpt.com/settings/usage"));
     }
 

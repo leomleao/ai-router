@@ -1,7 +1,193 @@
 # Alternative implementation: direct Antigravity provider with compatibility guards
 
-Status: exploratory proposal; not implemented or selected for production.
-Research date: 2026-10-04.
+Status: direct model-only implementation present on 2026-10-20; local validation
+and live acceptance in progress. No supported renewable-token handoff was found
+in public interfaces; operator selected a separate OMP-registration sign-in.
+Research refreshed: 2026-10-20. Historical research below dates to 2026-10-04.
+
+## Current decision and refreshed evidence
+
+The operator selected a complete replacement of AGY subprocess inference on
+`main`, including removal of native-agent endpoints. The current implementation
+is preserved locally as `archive/agy-cli-2026-10-20`, pointing to
+`4d23e015ba273ed1600ec43c7815f791b4c04286`. This branch has not been pushed.
+OpenAI remains a separate provider. Direct-provider work is described in the [plan](direct-antigravity-plan.md) and
+[DAG](direct-antigravity-dag.md).
+
+The operator also selected a pinned reviewed protocol: new releases generate
+alerts, while actual protocol/authentication failures stop affected traffic.
+This supersedes the historical proposal's automatic shutdown on every public
+release or unavailable release manifest. A public manifest must never silently
+change the advertised client identity.
+
+The local OMP executable was identified without running it or accessing its
+configuration/authentication state. Its package version could not be established
+reliably through static metadata. The findings below concern verified upstream
+source, not a claim about that installed executable.
+
+### Inspected upstream
+
+- Pinned implementation reference: [`2220e58146ebe31508e7a216242840d373e082d0`](https://github.com/can1357/oh-my-pi/commit/2220e58146ebe31508e7a216242840d373e082d0),
+  committed 2026-10-19 23:50:20 +02:00; coding-agent package version 18.12.3.
+- Latest reviewed public HEAD on 2026-10-20:
+  [`4bca62d432b28e11f1479c7fd217546a182ab6db`](https://github.com/can1357/oh-my-pi/commit/4bca62d432b28e11f1479c7fd217546a182ab6db).
+  Compared all ten baseline-related inference, conversion, identity, discovery,
+  OAuth and model-compatibility paths against the pinned reference. Nine were
+  byte-identical. The only changed path, `classes/anthropic.kdl`, narrows server
+  compaction to the `anthropic-messages` API on other provider routes; it does
+  not change Antigravity's CCA request or replay contract.
+- Release-tag revision:
+  [`53a0377db6845e0dae606146130766ec92d407fd`](https://github.com/can1357/oh-my-pi/commit/53a0377db6845e0dae606146130766ec92d407fd).
+- Compared against the earlier document's `6d8552d` and v18.1.10 references.
+  Source comparison used public source without saved-authentication access.
+  Subsequent operator-authorized local Docker evaluation is distinguished below.
+
+The newer release/revision observations produce advisory alerts. This comparison
+did not change the pinned protocol, endpoint or `2.19.1` identity automatically.
+
+### Local wire finding: empty visible replay parts
+
+Local Docker evaluation on 2026-10-20 exposed a real Claude tool-continuation
+failure that the synthetic upstream initially missed. Opus 5.5 returned a valid
+client tool call, but replaying its result produced HTTP 400. The nested
+Anthropic validation message reported
+`messages.<index>.content.0.text.text: Field required`.
+
+The adapter retained a standalone empty visible text/signature part in private
+replay and sent it back alongside the function call. Omitting these empty visible
+parts from the wire resolved an actual Opus 5.5 Chat tool handoff and result
+round trip. The missing-field path is consistent with CCA omitting a zero-valued
+protobuf text field while still constructing an Anthropic text block; that
+backend translation mechanism is an inference, rather than inspected service
+implementation.
+
+The fix keeps private replay metadata in bounded memory, preserves typed empty
+`thought:true` parts with signatures, and preserves all nonempty visible text,
+including whitespace. Function-call replay is also canonicalized to its
+`functionCall` payload plus an optional nonempty signature, avoiding a second
+empty text payload. Reviewed Claude tiers request private thought/signature
+state through `includeThoughts:true`, without guessed thinking budgets or output
+caps. Session IDs follow the source's stable negative-decimal pattern, scoped to
+the router owner, exact model and account generation.
+
+Stable session IDs and private-state requests were retained as source-aligned
+behavior; they did not independently resolve this rejection. A controlled test
+omitting Claude function-part IDs also failed, so that candidate was reverted:
+Claude keeps IDs, while Gemini uses ordered groups without wire IDs. This
+distinguishes the successful empty-visible-part fix from unproven explanations.
+Subsequent coordinator-run local live suites passed 15 checks for each of
+`claude-opus-5-5-medium`, `claude-sonnet-5-5-high`,
+and `gemini-3.8-flash-high`. Flash Low passed the same 15 checks earlier in
+development and was not rerun after the final replay fix. These cover streaming and
+nonstreaming Chat/Responses text, both JSON-schema interfaces, both tool handoffs
+and complete result round trips, and client disconnects. These correctness
+checks do not substitute for a matched latency comparison.
+
+### What explains the potential speed benefit
+
+OMP sends typed conversation data directly to Cloud Code Assist's streaming
+endpoint. It avoids AGY subprocess creation, isolated custom-agent discovery,
+prompt-encoded conversation replay and the inert MCP relay used by this router.
+See the [inference adapter](https://github.com/can1357/oh-my-pi/blob/2220e58146ebe31508e7a216242840d373e082d0/packages/ai/src/providers/google-gemini-cli.ts).
+This supports a mechanism for lower overhead; it does not establish a speedup
+for matched model, effort, context, tools and output. Reasoning and upstream
+queue time remain outside the transport's control.
+
+### Changes that matter since the original research
+
+| Change | Consequence for this router |
+| --- | --- |
+| [Rejected discovery distinguished from transient failure](https://github.com/can1357/oh-my-pi/commit/cc0ee3d761) | Do not recover an explicitly rejected account through another endpoint. |
+| [Disabled model rows removed](https://github.com/can1357/oh-my-pi/commit/158ec02202) | Validate the authenticated roster before advertising IDs; backend-listed does not necessarily mean usable. |
+| [Tool results restored to call order](https://github.com/can1357/oh-my-pi/commit/a5ff299b20), [including associated images](https://github.com/can1357/oh-my-pi/commit/a8c6867be9) | Preserve caller IDs and reorder results only according to the original call group where the wire protocol requires it. |
+| [Reasoning replay and text signatures](https://github.com/can1357/oh-my-pi/commit/8d0e4bb9ee), [empty-thought signatures](https://github.com/can1357/oh-my-pi/commit/343b480362), [signature-only thoughts](https://github.com/can1357/oh-my-pi/commit/ab7a952d7a) | Test opaque state across text/tool turns, including empty thought parts. |
+| [Claude image constraints](https://github.com/can1357/oh-my-pi/commit/58153d0cad) | Media needs separate bounds and contracts; text support does not establish image support. |
+
+The request identity/version helper is unchanged since `6d8552d`. It still
+discovers a public version dynamically, allows environment overrides, and falls
+back to a predefined identity. Pinning OMP alone does not pin that behaviour.
+[Source](https://github.com/can1357/oh-my-pi/blob/2220e58146ebe31508e7a216242840d373e082d0/packages/catalog/src/wire/gemini-headers.ts).
+
+### Policies and edge cases to address before porting
+
+These are source findings, not live reproductions or a claim that every OMP
+policy is a defect in its agent-oriented use case.
+
+| Finding | Required treatment |
+| --- | --- |
+| Fixed wire profiles overwrite the requested output-token limit. | Preserve truthful budget capabilities. Do not advertise a hard cap without independent enforcement/evidence. |
+| Gemini tool mode `ANY`/`NONE` has backend limitations; OMP uses a tool-only prompt workaround. | Keep unsupported forced/named tool modes rejected initially. Remove inventory for `none`, validate returned calls, and fail on violations. |
+| Flash leak handling can remove a legitimate leading JSON object with a string `thought` member; thinking-fence healing also rewrites content. | Preserve visible text verbatim. Do not inherit agent-specific content heuristics. |
+| The custom CCA signature-only branch signs the current block without checking `thought:true`, or drops the signature when no block exists; shared handling was fixed separately. | Write dedicated synthetic fixtures for empty signed thoughts after text and before tools; preserve typed block identity. |
+| Empty-stream retry uses a fetch without the initial response-header watchdog. | Apply the original absolute deadline to every attempt and every phase. Default generation dispatch to one attempt. |
+| Discovery accepts an object with no recognized roster fields as a successful empty result. | Distinguish a valid empty catalogue from malformed data before publishing a new snapshot. |
+
+Inference findings above come from the
+[custom adapter](https://github.com/can1357/oh-my-pi/blob/2220e58146ebe31508e7a216242840d373e082d0/packages/ai/src/providers/google-gemini-cli.ts),
+[shared conversion code](https://github.com/can1357/oh-my-pi/blob/2220e58146ebe31508e7a216242840d373e082d0/packages/ai/src/providers/google-shared.ts),
+and [discovery](https://github.com/can1357/oh-my-pi/blob/2220e58146ebe31508e7a216242840d373e082d0/packages/catalog/src/discovery/antigravity.ts).
+
+Quota prefers a summary endpoint and can fall back to a legacy probe, including
+after rejection. Inference/discovery can also fail over across production and
+sandbox endpoints. A router account restriction must stop those additional
+attempts, not just reject the current chat call.
+[Quota source](https://github.com/can1357/oh-my-pi/blob/2220e58146ebe31508e7a216242840d373e082d0/packages/ai/src/usage/google-antigravity.ts).
+Image generation is a separate transport/parser path and must remain excluded
+until it passes the same checks.
+[Image source](https://github.com/can1357/oh-my-pi/blob/2220e58146ebe31508e7a216242840d373e082d0/packages/ai/src/images/google-antigravity.ts).
+
+### Model IDs and authentication
+
+The [wire variant table](https://github.com/can1357/oh-my-pi/blob/2220e58146ebe31508e7a216242840d373e082d0/packages/catalog/src/compat/rules/taxonomy/_collapse.kdl)
+contains the current 13 public IDs: the three Argon tiers, three Flash 3.8
+tiers, three Opus 5.5 tiers, three Sonnet 5.5 tiers, and
+`gpt-oss-120b-medium`. Preserve exact usable wire IDs; do not import OMP's
+collapse into five logical selection IDs. The actual account roster still gates
+advertising and dispatch. Numeric reasoning budgets are not established by an
+ID suffix alone; conflicting caller effort must not silently select another ID.
+
+OMP uses independent Google consent through a bundled OAuth registration, not
+an import of CLI credentials. It also obtains project metadata and can perform
+remote free-tier onboarding. These operations need explicit design and the same
+restricted transport as inference. A bundled OAuth client secret is not proof
+that the registration is appropriate for a separate application, and the
+generic flow engine supports optional PKCE, but the inspected Antigravity rule
+does not enable it.
+[OAuth configuration](https://github.com/can1357/oh-my-pi/blob/2220e58146ebe31508e7a216242840d373e082d0/packages/catalog/src/compat/rules/auth/google-antigravity.kdl),
+[flow engine](https://github.com/can1357/oh-my-pi/blob/2220e58146ebe31508e7a216242840d373e082d0/packages/ai/src/registry/engine/oauth-code.ts),
+[project provisioning](https://github.com/can1357/oh-my-pi/blob/2220e58146ebe31508e7a216242840d373e082d0/packages/ai/src/registry/oauth/google-antigravity.ts).
+
+Google documents shared sign-in across its official App, CLI, IDEs and SDK.
+This does not document an export or renewable token-provider interface for an
+independent Rust backend client.
+[Official authentication guide](https://www.antigravity.google/docs/install/).
+The reuse-first public-interface investigation found no documented renewable
+handoff suitable for the direct adapter. No saved tokens, keychain, protected
+files or OMP configuration were inspected. The operator selected independent
+Google consent using the reviewed OMP registration, and local Docker sign-in
+and project discovery succeeded. This is fresh authorization, rather than
+credential import. The legacy AGY auth volume remains preserved for rollback;
+no live-server migration was performed.
+If evidence requires secret-file contents, the operator performs that step
+outside Codex. Do not make raw-file extraction a prerequisite disguised as an
+implementation detail.
+
+Selective translation of substantial OMP code requires retaining the applicable
+MIT notice. This project additionally requires source commit/path provenance
+when code is incorporated.
+[License](https://github.com/can1357/oh-my-pi/blob/2220e58146ebe31508e7a216242840d373e082d0/LICENSE).
+Google's terms were rechecked on 2026-10-20: section 6 still restricts third-party
+Antigravity access; the opening paragraph has specified enterprise exceptions.
+Protocol compatibility does not establish permission or account safety.
+[Current terms](https://antigravity.google/terms).
+
+## Historical proposal (2026-10-04)
+
+The remaining sections preserve the original reasoning and stricter guard
+proposal. Where they differ, the current decisions and linked replacement plan
+take precedence. In particular, direct mode will replace the CLI on `main`,
+native execution is being removed, and public-release alerts alone will not
+disable a pinned implementation.
 
 This records a possible alternative to the official `agy` subprocess adapter.
 It does not replace the decisions in [PLAN.md](../PLAN.md). The current router
@@ -212,9 +398,9 @@ inference testing is authorized by this document.
 
 ## Existing foundations and sources
 
-The current router already pins official AGY downloads and checks their SHA-512
-digests in [scripts/install-agy.sh](../scripts/install-agy.sh), verifies the CLI
-version and initial public tool inventory in [src/runner.rs](../src/runner.rs),
+The archived CLI implementation pins official AGY downloads and checks their SHA-512
+digests in `scripts/install-agy.sh` on `archive/agy-cli-2026-10-20`, verifies the CLI
+version and initial public tool inventory in `src/runner.rs` on that archived branch,
 and checks provider readiness before admitting generation. These provide a
 starting point for stronger compatibility checks on either implementation.
 
