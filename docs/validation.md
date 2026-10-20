@@ -1,5 +1,10 @@
 # Local validation
 
+The subsequent [n8n compatibility regression review](n8n-compatibility.md) records
+the schema fix, diagnostic privacy checks, restored CLI coverage, and separate
+Vercel/LangChain client matrices. Historical counts below describe the earlier
+implementation baseline.
+
 ## Direct model-only implementation (2026-10-20)
 
 The local implementation and independent review rounds completed. The previous

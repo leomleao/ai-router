@@ -70,7 +70,7 @@ establish equivalent quality. This small local sample is an operator
 comparison aid, not a performance claim or a substitute for a larger matched
 acceptance run. It exits nonzero if any request in the comparison fails.
 
-## Antigravity sign-in
+## Unified provider sign-in
 
 Antigravity uses a new router-owned Google sign-in. The operator approved the
 reviewed pinned OMP OAuth registration for this flow. Existing AGY CLI state is
@@ -82,7 +82,7 @@ unmounted for rollback.
 Run login before starting the gateway, or stop it first:
 
 ```sh
-./scripts/antigravity.sh login
+./scripts/login.sh agy
 ```
 
 The one-off helper uses the same image and only the Antigravity auth volume.
@@ -92,7 +92,7 @@ forward, then run the helper on the host:
 
 ```sh
 ssh -L 1456:127.0.0.1:1456 USER@SERVER
-./scripts/antigravity.sh login --port 1456
+./scripts/login.sh agy login --port 1456
 ```
 
 Keep the SSH session open until the browser callback completes. Export optional
@@ -103,12 +103,20 @@ credential files. Login verifies an existing account/project and does not
 automatically enroll a tier or change account provisioning. If provisioning is
 needed, complete it through the official application and sign in again.
 
-Inspect status with `./scripts/antigravity.sh status`. `logout` removes the
+Inspect status with `./scripts/login.sh agy status`. `logout` removes the
 router's local session without remote revocation. `resume` clears the saved
 restriction state for the current account generation. Login, logout, and resume
 are blocked while the gateway is running so only one process changes the
 credential store at a time. Do not delete either Antigravity volume during
 rollback or migration.
+
+The unified helper also accepts `agy status|logout|resume`; status uses `docker
+exec` while the gateway is running and a network-disabled one-off container
+when stopped. OpenAI status and account listing follow the same rule. Both
+providers share the helper's strict action/option validation, loopback-only
+callback publication, and stopped-gateway requirement for state mutations.
+OpenAI logout and resume use outbound networking for remote revocation or grant
+renewal; they do not publish callback ports. Other non-login one-offs are offline.
 
 ### Upstream release advisory and manual updates
 
@@ -157,18 +165,21 @@ or another provider after a failure.
 
 OpenAI has its own OAuth lifecycle and `ai-router-openai-auth` volume. It is
 disabled unless `AI_ROUTER_OPENAI_ENABLED=true` is exported when starting the
-gateway. Sign in separately:
+gateway. Use the same entry point with the provider selector:
 
 ```sh
-./scripts/openai.sh login
+./scripts/login.sh openai
 AI_ROUTER_OPENAI_ENABLED=true docker compose --env-file /dev/null up -d
-./scripts/openai.sh status
+./scripts/login.sh openai status
 ```
 
 The helper's default callback port is 1455. When using Docker on a remote host,
 forward that port over SSH and keep the tunnel open. Use `--port N` or
 `AI_ROUTER_OPENAI_CALLBACK_PORT` to select another free port. Use
-`./scripts/openai.sh accounts` to list saved registrations. Account selection,
+`./scripts/login.sh openai accounts` to list saved registrations. Select an
+account with `./scripts/login.sh openai select ID`. The compatibility wrappers
+`scripts/antigravity.sh` and `scripts/openai.sh` call the same implementation.
+Account selection,
 login, logout, and resume require the gateway to be stopped; the helper checks
 this before changing the shared volume. OpenAI account or plan restrictions
 leave Antigravity available, and Antigravity restrictions leave OpenAI

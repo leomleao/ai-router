@@ -18,7 +18,9 @@
       "packages/catalog/src/compat/rules/providers/google-antigravity.kdl",
       "packages/catalog/src/compat/rules/classes/gemini.kdl",
       "packages/catalog/src/compat/rules/taxonomy/_collapse.kdl",
-      "packages/catalog/src/compat/rules/classes/anthropic.kdl"
+      "packages/catalog/src/compat/rules/classes/anthropic.kdl",
+      "packages/ai/src/utils/schema/normalize.ts",
+      "packages/ai/src/utils/schema/fields.ts"
     ],
     "evidence_kind": "Pinned public OMP source and its recorded Antigravity Hub observations; not an independently documented official CLI protocol or proof of account compatibility.",
     "notice": "THIRD_PARTY_NOTICES.md"
@@ -82,7 +84,7 @@
     ],
     "history": "Typed chronological user/model parts; leading system/developer instructions become systemInstruction parts. Mid-conversation system/developer changes are rejected rather than reordered.",
     "text_only": true,
-    "tool_schema": "Original validated JSON Schema is preserved in parameters; unsupported upstream schema dialects are not silently weakened.",
+    "tool_schema": "CCA-compatible legacy parameters hints: resolve local refs and project supported types, properties, items, required and string enums; full original schema is retained in descriptions and enforced locally before any client handoff. Provider hints do not enforce every JSON Schema constraint.",
     "tool_mode": "VALIDATED when tools are supplied, and for Claude even without tools",
     "tool_results": "Complete contiguous groups matched by original client ID and reordered to original call order. Claude retains function-part IDs; Gemini omits them according to its CCA contract.",
     "unsigned_gemini_first_function_call_signature": "skip_thought_signature_validator",

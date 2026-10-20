@@ -32,7 +32,8 @@ RUN cargo build --locked --release
 FROM node:24.10.0-bookworm-slim AS n8n-contract-deps
 WORKDIR /opt/n8n-contract
 RUN npm install --ignore-scripts --no-audit --no-fund --save-exact \
-    ai@7.0.66 @ai-sdk/openai@4.0.20 zod@4.1.8
+    ai@7.0.66 @ai-sdk/openai@4.0.20 zod@4.1.8 \
+    @langchain/openai@1.4.4 @langchain/core@1.2.8
 COPY tests/n8n_contract.mjs ./n8n_contract.mjs
 
 # Local deterministic tests only. The production image contains neither Python nor Node.
@@ -49,7 +50,8 @@ ENV PATH=/opt/test-venv/bin:$PATH
 COPY --from=n8n-contract-deps /usr/local/bin/node /usr/local/bin/node
 COPY --from=n8n-contract-deps /opt/n8n-contract /opt/n8n-contract
 COPY tests ./tests
-RUN cargo test --locked && python3 tests/monitor_tui.py
+COPY scripts/login.sh scripts/antigravity.sh scripts/openai.sh ./scripts/
+RUN cargo test --locked && python3 tests/monitor_tui.py && python3 tests/login_contract.py
 
 FROM runtime AS gateway
 COPY THIRD_PARTY_NOTICES.md /usr/share/doc/ai-router/THIRD_PARTY_NOTICES.md

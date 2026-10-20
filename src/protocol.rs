@@ -10,6 +10,9 @@ use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ApiError {
+    // Never serialize provider payloads into public errors or durable records.
+    #[serde(skip)]
+    pub(crate) diagnostics: Option<FailureDiagnostics>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_request_id: Option<String>,
     pub status: u16,
@@ -17,9 +20,33 @@ pub struct ApiError {
     pub message: String,
 }
 
+/// Safe metadata may be logged. Provider bodies are bounded, memory-only, and
+/// deliberately absent from Debug, Serialize and the public response body.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct FailureDiagnostics {
+    pub metadata: Value,
+    pub private_body: Option<Value>,
+}
+impl FailureDiagnostics {
+    pub fn metadata(metadata: Value) -> Self {
+        Self {
+            metadata,
+            private_body: None,
+        }
+    }
+}
+impl std::fmt::Debug for FailureDiagnostics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FailureDiagnostics")
+            .field("metadata", &self.metadata)
+            .finish_non_exhaustive()
+    }
+}
+
 impl ApiError {
     pub fn new(status: u16, code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
+            diagnostics: None,
             upstream_request_id: None,
             status,
             code: code.into(),

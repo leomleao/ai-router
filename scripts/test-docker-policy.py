@@ -49,9 +49,14 @@ assert service["environment"]["AI_ROUTER_GOOGLE_CLIENT_ID"] == "synthetic-policy
 assert service["environment"]["AI_ROUTER_GOOGLE_CLIENT_SECRET"] == "synthetic-policy-client-secret"
 assert service["environment"]["AI_ROUTER_OPENAI_ENABLED"] == "false"
 assert service["environment"]["AI_ROUTER_OPENAI_STATE_DIR"] == "/var/lib/ai-router/openai-auth"
-openai_helper = (repo / "scripts/openai.sh").read_text()
-assert '"127.0.0.1:$port:$port"' in openai_helper
-assert "ai-router-openai-auth" in openai_helper
+login_helper = (repo / "scripts/login.sh").read_text()
+assert '127.0.0.1:$port:$port' in login_helper
+assert 'AI_ROUTER_OPENAI_VOLUME:-ai-router-openai-auth' in login_helper
+assert 'AI_ROUTER_ANTIGRAVITY_VOLUME:-ai-router-antigravity-auth' in login_helper
+assert '--env AI_ROUTER_GOOGLE_CLIENT_ID --env AI_ROUTER_GOOGLE_CLIENT_SECRET' in login_helper
+assert 'exec "$script_dir/login.sh" agy "$@"' in (repo / "scripts/antigravity.sh").read_text()
+assert 'exec "$script_dir/login.sh" openai "$@"' in (repo / "scripts/openai.sh").read_text()
+subprocess.run(["python3", str(repo / "tests/login_contract.py")], check=True)
 
 image = "ai-router-context-policy:" + uuid.uuid4().hex
 with tempfile.TemporaryDirectory(prefix="ai-router-context-policy-") as tmp:

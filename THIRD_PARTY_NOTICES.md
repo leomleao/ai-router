@@ -8,6 +8,8 @@ The Antigravity adapter translates selected protocol behaviour from
 
 - `packages/ai/src/providers/google-gemini-cli.ts`
 - `packages/ai/src/providers/google-shared.ts`
+- `packages/ai/src/utils/schema/normalize.ts`
+- `packages/ai/src/utils/schema/fields.ts`
 - `packages/catalog/src/wire/gemini-headers.ts`
 - `packages/catalog/src/compat/rules/auth/google-antigravity.kdl`
 - `packages/ai/src/registry/oauth/google-antigravity.ts`

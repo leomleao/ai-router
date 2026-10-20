@@ -116,18 +116,23 @@ impl AntigravityTransport {
             self.auth
                 .block_for_generation(Restriction::Protocol, &token.generation)
                 .await?;
-            return Err(ApiError::new(
+            let mut error = ApiError::new(
                 503,
                 "agy_redirect_refused",
                 "Antigravity returned an unexpected redirect; protocol review required",
+            );
+            error.upstream_request_id = request_id;
+            error.diagnostics = Some(crate::protocol::FailureDiagnostics::metadata(
+                serde_json::json!({"phase":"http_headers","upstream_status":status.as_u16(),"reason":"redirect_refused"}),
             ));
+            return Err(error);
         }
         let content_type = response
             .headers()
             .get("content-type")
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
-        let guarded = GuardedResponse {
+        let mut guarded = GuardedResponse {
             response,
             auth: self.auth.clone(),
             generation: token.generation.clone(),
@@ -153,6 +158,9 @@ impl AntigravityTransport {
                     .block_for_generation(kind, &token.generation)
                     .await?;
             }
+            // Restrictions publish before optional diagnostics: a slow error
+            // body must never keep the authenticated dispatch gate open.
+            let diagnostics = guarded.error_details(op, &token.access_token).await;
             let mut error = match status.as_u16() {
                 401 => ApiError::new(
                     503,
@@ -191,6 +199,7 @@ impl AntigravityTransport {
                 ),
             };
             error.upstream_request_id = guarded.request_id.clone();
+            error.diagnostics = Some(diagnostics);
             return Err(error);
         }
         let expected = if op == Operation::Generate {
@@ -206,11 +215,16 @@ impl AntigravityTransport {
             self.auth
                 .block_for_generation(Restriction::Protocol, &token.generation)
                 .await?;
-            return Err(ApiError::new(
+            let mut error = ApiError::new(
                 503,
                 "agy_protocol_blocked",
                 "Antigravity response media type changed; protocol review required",
+            );
+            error.upstream_request_id = guarded.request_id;
+            error.diagnostics = Some(crate::protocol::FailureDiagnostics::metadata(
+                serde_json::json!({"phase":"http_headers","upstream_status":status.as_u16(),"reason":"unexpected_media_type"}),
             ));
+            return Err(error);
         }
         Ok(guarded)
     }
@@ -227,6 +241,119 @@ pub struct GuardedResponse {
     pub content_type: Option<String>,
 }
 impl GuardedResponse {
+    async fn error_details(
+        &mut self,
+        op: Operation,
+        bearer: &str,
+    ) -> crate::protocol::FailureDiagnostics {
+        const LIMIT: usize = 16 * 1024;
+        let deadline = self
+            .deadline
+            .min(Instant::now() + Duration::from_millis(500));
+        let mut bytes = Vec::new();
+        let outcome = loop {
+            tokio::select! { biased;
+                _ = self.cancellation.cancelled() => break "cancelled",
+                _ = tokio::time::sleep_until(deadline.into()) => break "timeout",
+                chunk = self.response.chunk() => match chunk {
+                    Ok(Some(chunk)) => {
+                        let remaining = LIMIT.saturating_sub(bytes.len());
+                        bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                        if chunk.len() > remaining { break "truncated"; }
+                    }
+                    Ok(None) => break "complete",
+                    Err(_) => break "disconnected",
+                }
+            }
+        };
+        let parsed = serde_json::from_slice::<Value>(&bytes).ok();
+        // Free-form provider messages and field paths can echo user data. Only
+        // fixed status names and known schema keywords enter persisted logs.
+        let status = parsed
+            .as_ref()
+            .and_then(|v| v.pointer("/error/status"))
+            .and_then(Value::as_str)
+            .filter(|v| {
+                matches!(
+                    *v,
+                    "INVALID_ARGUMENT"
+                        | "UNAUTHENTICATED"
+                        | "PERMISSION_DENIED"
+                        | "RESOURCE_EXHAUSTED"
+                        | "NOT_FOUND"
+                        | "INTERNAL"
+                        | "UNAVAILABLE"
+                        | "DEADLINE_EXCEEDED"
+                        | "FAILED_PRECONDITION"
+                )
+            });
+        let keywords: Vec<_> = [
+            "$schema",
+            "additionalProperties",
+            "$defs",
+            "$ref",
+            "anyOf",
+            "oneOf",
+            "allOf",
+            "patternProperties",
+            "nullable",
+        ]
+        .into_iter()
+        .filter(|keyword| {
+            bytes
+                .windows(keyword.len())
+                .any(|w| w == keyword.as_bytes())
+        })
+        .collect();
+        let media = self.content_type.as_deref().map(|v| {
+            v.split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase()
+        });
+        let media = match media.as_deref() {
+            Some("application/json") => "json",
+            Some("text/event-stream") => "sse",
+            Some("text/html") => "html",
+            Some("text/plain") => "text",
+            None => "missing",
+            _ => "other",
+        };
+        let retry_after = self
+            .response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .filter(|s| !s.is_empty() && s.len() <= 10 && s.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|s| s.parse::<u64>().ok());
+        let metadata = serde_json::json!({"phase":"http_response","operation":format!("{op:?}"),
+            "media_type":media,"retry_after_seconds":retry_after,
+            "upstream_status":self.response.status().as_u16(),"body_bytes":bytes.len(),
+            "body_read":outcome,"body_json":parsed.is_some(),"provider_status":status,
+            "schema_keyword_mentions":keywords});
+        // Strip the actual dispatch credential even if an upstream message
+        // echoes it under an arbitrary field. The monitor then applies its
+        // usual recursive credential-key redaction to this private capture.
+        let private_body = if bytes.is_empty() {
+            None
+        } else {
+            let text = String::from_utf8_lossy(&bytes);
+            let scrubbed = if bearer.is_empty() {
+                text.into_owned()
+            } else {
+                text.replace(bearer, "[redacted]")
+            };
+            Some(
+                serde_json::from_str(&scrubbed)
+                    .unwrap_or_else(|_| serde_json::json!({"raw_text":scrubbed})),
+            )
+        };
+        crate::protocol::FailureDiagnostics {
+            metadata,
+            private_body,
+        }
+    }
     pub async fn chunk(&mut self) -> Result<Option<Vec<u8>>, ApiError> {
         loop {
             // The persistent timestamp survives both fast chunks and repeated chunk()
@@ -315,6 +442,84 @@ mod tests {
         }
         assert_eq!(CCA_ORIGIN, "https://daily-cloudcode-pa.googleapis.com");
     }
+    #[tokio::test]
+    async fn rejection_details_are_bounded_private_and_do_not_leak_the_dispatch_token() {
+        use axum::http::{HeaderMap, StatusCode};
+        for shape in ["json", "oversize", "malformed", "slow"] {
+            let (origin,server)=mock(Router::new().route("/v1internal:streamGenerateContent",post(move |headers:HeaderMap| async move {
+                let bearer=headers["authorization"].to_str().unwrap().strip_prefix("Bearer ").unwrap();
+                let body=match shape {
+                    "json" => serde_json::json!({"error":{"code":400,"status":"INVALID_ARGUMENT",
+                        "message":format!("additionalProperties: private prompt {bearer}"),"token":"private credential"}}).to_string(),
+                    "oversize" => "x".repeat(20000),
+                    "slow" => {
+                        let stream=async_stream::stream! {
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            yield Ok::<_,std::convert::Infallible>("never");
+                        };
+                        return (StatusCode::BAD_REQUEST,axum::body::Body::from_stream(stream));
+                    },
+                    _ => "not JSON private prompt".into(),
+                };
+                (StatusCode::BAD_REQUEST,axum::body::Body::from(body))
+            }))).await;
+            let d = tempfile::tempdir().unwrap();
+            let auth = AntigravityAuth::synthetic(d.path().join("state"), origin).await;
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let token = auth.token(deadline).await.unwrap();
+            let started = Instant::now();
+            let error = AntigravityTransport::new(auth.clone())
+                .post_json(
+                    Operation::Generate,
+                    &serde_json::json!({}),
+                    &token,
+                    deadline,
+                )
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(error.code, "provider_invalid_request");
+            let details = error.diagnostics.as_ref().unwrap();
+            assert!(details.metadata["body_bytes"].as_u64().unwrap() <= 16384);
+            assert!(!details.metadata.to_string().contains("private"));
+            assert!(!format!("{error:?}").contains("private prompt"));
+            assert!(
+                !serde_json::to_string(&error)
+                    .unwrap()
+                    .contains("private prompt")
+            );
+            assert!(!error.response_body().to_string().contains("private prompt"));
+            if shape == "json" {
+                assert_eq!(details.metadata["provider_status"], "INVALID_ARGUMENT");
+                assert!(
+                    !details
+                        .private_body
+                        .as_ref()
+                        .unwrap()
+                        .to_string()
+                        .contains(&token.access_token)
+                );
+                let capture = crate::monitor::CapturedPayload::capture(
+                    details.private_body.as_ref().unwrap(),
+                );
+                assert!(!capture.json.contains("private credential"));
+            } else if shape == "slow" {
+                assert!(details.private_body.is_none());
+            } else {
+                assert!(details.private_body.as_ref().unwrap()["raw_text"].is_string());
+            }
+            if shape == "oversize" {
+                assert_eq!(details.metadata["body_read"], "truncated");
+            }
+            if shape == "slow" {
+                assert_eq!(details.metadata["body_read"], "timeout");
+                assert!(started.elapsed() < Duration::from_secs(1));
+            }
+            assert!(auth.availability_error().await.is_none());
+            server.abort();
+        }
+    }
+
     #[tokio::test]
     async fn synthetic_redirect_is_never_followed() {
         let (origin, server) = mock(Router::new().route(

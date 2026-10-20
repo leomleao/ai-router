@@ -383,6 +383,7 @@ impl Drop for Admission {
 
 pub fn error(status: u16, code: &str, message: &str) -> ApiError {
     ApiError {
+        diagnostics: None,
         upstream_request_id: None,
         status,
         code: code.into(),
@@ -658,7 +659,7 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> Json<Value> {
     Json(json!({
         "schema_version":3,"provider":"model-router","native":false,
         "profiles":{"model":{"chat_completions":true,"responses":true,"streaming":true,"text":true,"json_schema":true,"client_tools":true,"parallel_tool_execution":false,"media_input":false,
-            "output_token_budget":{"mode":"prompt_guidance","hard_limit":false,"limits_reasoning_tokens":false},
+            "output_token_budget":{"mode":"prompt_guidance","hard_limit":false,"limits_reasoning_tokens":false,"parameters":["max_output_tokens","max_tokens","max_completion_tokens"]},
             "prompt_cache_controls":{"mode":"ignored","retention_guarantee":false},
             "item_references":{"enabled":true,"storage":"memory","default_store":true,"ttl_seconds":items::TTL_SECONDS,"max_items":items::MAX_ITEMS,"max_bytes":items::MAX_BYTES,"per_client_items":items::CLIENT_ITEMS,"per_client_bytes":items::CLIENT_BYTES,"cleared_on_restart":true}}},
         "providers":{
@@ -830,6 +831,11 @@ async fn generate_body(
         json!({
             "event":"model_request", "request_id":id,
             "endpoint":if responses { "responses" } else { "chat" }, "model":model,
+            "provider":selected.as_str(),
+            "input_item_count":request.input.len(),
+            "input_bytes":serde_json::to_vec(&request.input).map_or(0,|v|v.len()),
+            "instruction_bytes":serde_json::to_vec(&request.instructions).map_or(0,|v|v.len()),
+            "tool_schema_bytes":request.tools.iter().map(|t|t.parameters.to_string().len()).sum::<usize>(),
             "client_tool_count":request.tools.len(),
             "client_tool_names":request.tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>()
         })
@@ -1079,7 +1085,22 @@ impl CompletionGuard {
                 self.record.usage_partial = result.usage_partial;
             }
             RunEvent::Error(e) => {
-                self.capture_response(&e.response_body());
+                let mut captured = e.response_body();
+                if let Some(diagnostics) = &e.diagnostics {
+                    captured["diagnostics"] = diagnostics.metadata.clone();
+                    if let Some(body) = &diagnostics.private_body {
+                        captured["upstream_response"] = body.clone();
+                    }
+                }
+                self.capture_response(&captured);
+                eprintln!(
+                    "{}",
+                    json!({"event":"provider_request_failed",
+                    "request_id":self.record.request_id,"model":self.record.model,"provider":self.record.provider,
+                    "endpoint":self.record.endpoint,"elapsed_ms":self.started.elapsed().as_millis() as u64,
+                    "status":e.status,"code":e.code,"upstream_request_id":e.upstream_request_id,
+                    "diagnostics":e.diagnostics.as_ref().map(|d| &d.metadata)})
+                );
                 self.record.status = if e.code == "request_cancelled" {
                     "cancelled"
                 } else {
@@ -1456,7 +1477,41 @@ mod tests {
         ));
         ([("content-type", "text/event-stream")], wire).into_response()
     }
+    // Independent legacy CCA validator: a permissive mock previously hid
+    // production INVALID_ARGUMENT errors for ordinary n8n JSON Schemas.
+    fn valid_cca_schema(value: &Value) -> bool {
+        let Some(fields) = value.as_object() else {
+            return false;
+        };
+        fields.iter().all(|(key, value)| match key.as_str() {
+            "type" => value.as_str().is_some_and(|s| {
+                matches!(
+                    s,
+                    "object" | "array" | "string" | "boolean" | "integer" | "number"
+                )
+            }),
+            "title" | "description" => value.is_string(),
+            "enum" | "required" => value
+                .as_array()
+                .is_some_and(|items| items.iter().all(Value::is_string)),
+            "properties" => value
+                .as_object()
+                .is_some_and(|map| map.values().all(valid_cca_schema)),
+            "items" => valid_cca_schema(value),
+            _ => false,
+        })
+    }
     async fn mock_direct_response(Json(body): Json<Value>) -> Response {
+        if let Some(tools) = body.pointer("/request/tools").and_then(Value::as_array) {
+            for tool in tools {
+                for declaration in tool["functionDeclarations"].as_array().unwrap() {
+                    if !valid_cca_schema(&declaration["parameters"]) {
+                        return (StatusCode::BAD_REQUEST, Json(json!({"error":{"code":400,
+                            "status":"INVALID_ARGUMENT","message":"Unknown name in function_declarations.parameters: $schema/additionalProperties"}}))).into_response();
+                    }
+                }
+            }
+        }
         // Gemini's reviewed CCA profile uses ordered groups without wire IDs.
         if !body["model"].as_str().unwrap().starts_with("claude-") {
             for turn in body["request"]["contents"].as_array().unwrap() {
@@ -1467,6 +1522,12 @@ mod tests {
             }
         }
         let text = body.to_string();
+        if text.contains("direct-rejection-fixture") {
+            return (StatusCode::BAD_REQUEST, [("x-request-id","synthetic-upstream-id")], Json(json!({"error":{
+                "code":400,"status":"INVALID_ARGUMENT","message":"Unknown name $schema; private echoed prompt",
+                "details":[{"fieldViolations":[{"field":"request.tools[0].parameters","description":"additionalProperties unsupported"}]}]
+            }}))).into_response();
+        }
         if text.contains("direct-quota-fixture") {
             return StatusCode::TOO_MANY_REQUESTS.into_response();
         }
@@ -1513,6 +1574,12 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let mut config = Config::for_test(root.path());
             config.openai_enabled = true;
+            use sha2::{Digest, Sha256};
+            config.keys.push(crate::config::KeyConfig {
+                id: "other".into(),
+                sha256: format!("{:x}", Sha256::digest(b"other-test-key")),
+                scopes: vec!["model".into()],
+            });
             config.request_timeout_secs = timeout_seconds;
             config.preauth_per_minute = 10000;
             config.global_preauth_per_minute = 10000;
@@ -1567,6 +1634,50 @@ mod tests {
                 server,
                 model_mode,
             }
+        }
+        async fn send(
+            &self,
+            method: axum::http::Method,
+            path: &str,
+            body: Option<Value>,
+            key: Option<&str>,
+        ) -> Response {
+            use tower::ServiceExt;
+            let mut request = Request::builder()
+                .method(method)
+                .uri(path)
+                .header("content-type", "application/json");
+            if let Some(key) = key {
+                request = request.header("authorization", format!("Bearer {key}"));
+            }
+            self.app
+                .clone()
+                .oneshot(
+                    request
+                        .body(axum::body::Body::from(
+                            body.map(|v| v.to_string()).unwrap_or_default(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        }
+        async fn json(
+            &self,
+            method: axum::http::Method,
+            path: &str,
+            body: Option<Value>,
+            key: Option<&str>,
+        ) -> (StatusCode, Value) {
+            use http_body_util::BodyExt;
+            let response = self.send(method, path, body, key).await;
+            let status = response.status();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            (status, serde_json::from_slice(&bytes).unwrap())
+        }
+        async fn post(&self, path: &str, body: Value) -> (StatusCode, Value) {
+            self.json(axum::http::Method::POST, path, Some(body), Some("test-key"))
+                .await
         }
         async fn call(&self, path: &str, body: Option<Value>) -> (StatusCode, String) {
             use http_body_util::BodyExt;
@@ -1907,6 +2018,16 @@ mod tests {
             ("python3", "tests/sdk_contract.py", "claude-sonnet-5-5-high"),
             ("node", "tests/n8n_contract.mjs", "gemini-4-argon-medium"),
             ("node", "tests/n8n_contract.mjs", "claude-sonnet-5-5-high"),
+            (
+                "node",
+                "tests/n8n_langchain_contract.mjs",
+                "gemini-4-argon-medium",
+            ),
+            (
+                "node",
+                "tests/n8n_langchain_contract.mjs",
+                "claude-sonnet-5-5-high",
+            ),
         ] {
             let mut child = tokio::process::Command::new(program)
                 .arg(path)
@@ -1937,10 +2058,100 @@ mod tests {
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
+            println!(
+                "{}: {}",
+                model,
+                String::from_utf8_lossy(&output.stdout).trim()
+            );
         }
         server.abort();
         h.state.stop();
         assert!(h.state.drain(Duration::from_secs(2)).await);
+    }
+
+    #[test]
+    fn cca_mock_rejects_original_n8n_schema_and_accepts_projection() {
+        let schema = json!({"$schema":"http://json-schema.org/draft-07/schema#","type":"object",
+            "properties":{"$schema":{"type":"string"}},"additionalProperties":false});
+        assert!(!valid_cca_schema(&schema));
+        assert!(valid_cca_schema(&crate::antigravity_schema::parameters(
+            &schema
+        )));
+    }
+
+    #[tokio::test]
+    async fn provider_rejection_has_private_details_but_generic_public_error() {
+        use http_body_util::BodyExt;
+        let h = DualHarness::new().await;
+        for streaming in [false, true] {
+            let response = h
+                .send(
+                    axum::http::Method::POST,
+                    "/v1/responses",
+                    Some(json!({"model":"gemini-4-argon-medium",
+                "input":"direct-rejection-fixture","stream":streaming})),
+                    Some("test-key"),
+                )
+                .await;
+            let id = response.headers()["x-request-id"]
+                .to_str()
+                .unwrap()
+                .to_owned();
+            assert_eq!(
+                response.status(),
+                if streaming {
+                    StatusCode::OK
+                } else {
+                    StatusCode::BAD_REQUEST
+                }
+            );
+            let wire = String::from_utf8(
+                response
+                    .into_body()
+                    .collect()
+                    .await
+                    .unwrap()
+                    .to_bytes()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert!(wire.contains("synthetic-upstream-id"));
+            assert!(!wire.contains("private echoed prompt"));
+            assert!(!wire.contains("upstream_response"));
+            assert!(h.state.drain(Duration::from_secs(2)).await);
+            let detail = h
+                .state
+                .telemetry
+                .request_detail(&id)
+                .await
+                .unwrap()
+                .response
+                .unwrap();
+            let captured: Value = serde_json::from_str(&detail.json).unwrap();
+            assert!(
+                captured["upstream_response"]["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("private echoed prompt")
+            );
+            assert_eq!(
+                captured["diagnostics"]["provider_status"],
+                "INVALID_ARGUMENT"
+            );
+        }
+        h.state.telemetry.flush().await;
+        let persisted =
+            std::fs::read_to_string(h.state.config.telemetry_dir.join("telemetry.json")).unwrap();
+        assert!(!persisted.contains("private echoed prompt"));
+        assert!(!persisted.contains("direct-rejection-fixture"));
+        assert!(!persisted.contains("fieldViolations"));
+        let (status, _) = h
+            .call(
+                "/v1/responses",
+                Some(json!({"model":"gemini-4-argon-medium","input":"hello"})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     #[tokio::test]
@@ -2017,5 +2228,8 @@ mod tests {
             .0,
             StatusCode::OK
         );
+    }
+    mod compatibility_contract {
+        include!("api_contract_tests.rs");
     }
 }

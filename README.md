@@ -5,7 +5,7 @@ It routes exact model IDs to a direct Antigravity adapter or, when enabled,
 the independent OpenAI Responses provider. The gateway runs model requests
 only; it does not run client tools, native agents, uploads, or artifacts.
 
-The former AGY CLI implementation is preserved on the local
+The former AGY CLI implementation is preserved on the published
 `archive/agy-cli-2026-10-20` branch. Its `ai-router-auth` volume remains
 unmounted for rollback. The direct adapter uses its own
 `ai-router-antigravity-auth` volume.
@@ -43,13 +43,13 @@ record in the shell used to start Compose:
 
 ```sh
 export AI_ROUTER_KEYS='[{"id":"n8n","sha256":"REPLACE_WITH_GENERATED_DIGEST","scopes":["model"]}]'
-./scripts/antigravity.sh login
+./scripts/login.sh agy
 docker compose --env-file /dev/null up -d
 curl --fail http://127.0.0.1:8090/health
 curl --fail http://127.0.0.1:8090/ready
 ```
 
-The Antigravity helper starts a one-off container with the dedicated auth
+The unified helper starts a one-off container with the selected provider's dedicated auth
 volume. It performs a fresh router-owned Google sign-in using the reviewed,
 pinned OMP OAuth registration. It does not import the prior AGY CLI profile.
 The callback defaults to port 1456 and is published on host loopback; select an
@@ -58,13 +58,15 @@ over SSH and keep the tunnel open while login runs:
 
 ```sh
 ssh -L 1456:127.0.0.1:1456 USER@SERVER
-./scripts/antigravity.sh login --port 1456
+./scripts/login.sh agy login --port 1456
 ```
 
-The gateway must be stopped before login, logout, or resume changes Antigravity
-account state. The helper checks this condition. For OpenAI, login separately
-with `./scripts/openai.sh login`; set `AI_ROUTER_OPENAI_ENABLED=true` in the
-process environment before starting Compose to enable that provider.
+The gateway must be stopped before login, logout, resume, or account selection
+changes provider state. The helper checks this condition. Use
+`./scripts/login.sh openai` for OpenAI sign-in, then set
+`AI_ROUTER_OPENAI_ENABLED=true` in the process environment before starting
+Compose to enable that provider. `scripts/antigravity.sh` and
+`scripts/openai.sh` remain compatibility wrappers around the unified helper.
 
 ## API
 

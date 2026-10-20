@@ -4,8 +4,8 @@
 //! 2220e58146ebe31508e7a216242840d373e082d0, packages/ai/src/providers/
 //! google-gemini-cli.ts and google-shared.ts, plus packages/catalog/src/wire/
 //! gemini-headers.ts. See THIRD_PARTY_NOTICES.md for the upstream notice.
-//! Conversion deliberately preserves visible text and JSON Schema rather than
-//! importing OMP's content healing or lossy schema-normalization heuristics.
+//! Visible text is preserved. Tool schemas use CCA-compatible provider hints;
+//! the original JSON Schema remains authoritative for local handoff validation.
 use crate::protocol::{ApiError, RunRequest, ToolCall, Usage};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -18,11 +18,22 @@ const MAX_STREAM_BYTES: usize = 64 * 1024 * 1024;
 const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 
 fn invalid(code: &'static str) -> ApiError {
-    ApiError::new(
+    let mut error = ApiError::new(
         502,
         code,
         "Antigravity returned an invalid or unsupported response",
-    )
+    );
+    error.diagnostics = Some(crate::protocol::FailureDiagnostics::metadata(
+        json!({"phase":"wire_validation","reason":code}),
+    ));
+    error
+}
+fn invalid_tool(reason: &'static str) -> ApiError {
+    let mut error = invalid("invalid_provider_tool_call");
+    error.diagnostics = Some(crate::protocol::FailureDiagnostics::metadata(
+        json!({"phase":"tool_validation","reason":reason}),
+    ));
+    error
 }
 
 fn text_content(value: &Value) -> Result<String, ApiError> {
@@ -537,7 +548,17 @@ pub fn serialize(request: &RunRequest, project: &str, replay: &[Value]) -> Resul
             if !names.insert(&tool.name) {
                 return Err(ApiError::bad_request("Duplicate tool definition"));
             }
-            declarations.push(json!({"name":tool.name,"description":tool.description,"parameters":tool.parameters}));
+            let parameters = crate::antigravity_schema::parameters(&tool.parameters);
+            let description = if parameters != tool.parameters {
+                format!(
+                    "{}\nClient argument contract (JSON Schema; all constraints apply):\n{}",
+                    tool.description, tool.parameters
+                )
+            } else {
+                tool.description.clone()
+            };
+            declarations
+                .push(json!({"name":tool.name,"description":description,"parameters":parameters}));
         }
         body["tools"] = json!([{"functionDeclarations":declarations}]);
         body["toolConfig"] = json!({"functionCallingConfig":{"mode":"VALIDATED"}});
@@ -826,34 +847,38 @@ impl Decoder {
         let mut retained = part.clone();
         if let Some(call) = part.get("functionCall") {
             if part["thought"] == true || part.get("text").is_some_and(|v| v != "") {
-                return Err(invalid("invalid_provider_tool_call"));
+                return Err(invalid_tool("conflicting_function_part"));
             }
             if self.calls.len() >= MAX_TOOLS {
                 return Err(invalid("provider_tool_limit"));
             }
             let call_object = call
                 .as_object()
-                .ok_or_else(|| invalid("invalid_provider_tool_call"))?;
+                .ok_or_else(|| invalid_tool("function_call_not_object"))?;
             if call_object
                 .keys()
                 .any(|key| !matches!(key.as_str(), "id" | "name" | "args"))
             {
-                return Err(invalid("invalid_provider_tool_call"));
+                return Err(invalid_tool("unexpected_function_call_fields"));
             }
-            let name = call["name"]
-                .as_str()
-                .ok_or_else(|| invalid("invalid_provider_tool_call"))?;
             let arguments = call.get("args").cloned().unwrap_or_else(|| json!({}));
             crate::tool_diagnostics::validate_call(
                 &self.request.tools,
                 call.get("name"),
                 &arguments,
             )
-            .map_err(|_| invalid("invalid_provider_tool_call"))?;
+            .map_err(|rejection| {
+                let mut error = invalid("invalid_provider_tool_call");
+                error.diagnostics = Some(crate::protocol::FailureDiagnostics::metadata(
+                    json!({"phase":"tool_validation","validation":rejection}),
+                ));
+                error
+            })?;
+            let name = call["name"].as_str().expect("validated client tool name");
             let id = if let Some(id) = call.get("id") {
                 id.as_str()
                     .filter(|id| valid_id(id))
-                    .ok_or_else(|| invalid("invalid_provider_tool_call"))?
+                    .ok_or_else(|| invalid_tool("invalid_function_call_id"))?
                     .to_owned()
             } else {
                 format!("call_{}", uuid::Uuid::new_v4().simple())
@@ -950,7 +975,7 @@ impl Decoder {
             .as_deref()
             .ok_or_else(|| invalid("missing_provider_terminal"))?;
         if !self.request.parallel_tool_calls && self.calls.len() > 1 {
-            return Err(invalid("invalid_provider_tool_call"));
+            return Err(invalid_tool("parallel_calls_disabled"));
         }
         let complete = reason == "STOP";
         if complete && self.text.is_empty() && self.calls.is_empty() {
@@ -997,7 +1022,7 @@ fn stream_error(value: &Value) -> ApiError {
             Some("RESOURCE_EXHAUSTED") => 429,
             _ => 502,
         });
-    match status {
+    let mut error = match status {
         401 => ApiError::new(
             401,
             "provider_authentication_failed",
@@ -1019,7 +1044,11 @@ fn stream_error(value: &Value) -> ApiError {
             "Antigravity returned an upstream error",
         ),
         _ => invalid("provider_stream_error"),
-    }
+    };
+    error.diagnostics = Some(crate::protocol::FailureDiagnostics::metadata(json!({
+        "phase":"sse_error","provider_code":status,
+    })));
+    error
 }
 
 fn usage(metadata: &Value) -> Result<(Usage, bool), ApiError> {
@@ -1125,13 +1154,13 @@ mod tests {
     }
 
     #[test]
-    fn tool_schemas_are_preserved_without_lossy_normalization() {
+    fn tool_schema_projection_keeps_the_original_contract_for_local_validation() {
         let mut request = tools_request();
         request.tools[0].parameters = json!({"type":"object","$defs":{"City":{"type":"string","const":"London"}},"properties":{"city":{"$ref":"#/$defs/City"}},"required":["city"],"additionalProperties":false});
         let body = serialize(&request, "project-test", &[]).unwrap();
         assert_eq!(
             body["request"]["tools"][0]["functionDeclarations"][0]["parameters"],
-            request.tools[0].parameters
+            crate::antigravity_schema::parameters(&request.tools[0].parameters)
         );
         assert_eq!(
             body["request"]["toolConfig"]["functionCallingConfig"]["mode"],
@@ -1317,6 +1346,48 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn projected_tool_schema_still_enforces_original_constraints_and_reports_safe_rejections() {
+        let mut request = tools_request();
+        request.tools[0].parameters = json!({"$schema":"http://json-schema.org/draft-07/schema#","type":"object",
+            "$defs":{"City":{"type":"string","const":"London"}},"properties":{"city":{"$ref":"#/$defs/City"}},
+            "required":["city"],"additionalProperties":false});
+        let wire = serialize(&request, "synthetic", &[]).unwrap();
+        assert!(
+            !wire["request"]["tools"][0]["functionDeclarations"][0]["parameters"]
+                .to_string()
+                .contains("additionalProperties")
+        );
+        assert!(
+            decode(
+                &request,
+                &terminal(json!([{"functionCall":{"name":"weather","args":{"city":"London"}}}]))
+            )
+            .is_ok()
+        );
+        for (name, args, reason) in [
+            ("weather", json!({"city":"Paris"}), "schema_mismatch"),
+            (
+                "weather",
+                json!({"city":"London","extra":"private argument"}),
+                "schema_mismatch",
+            ),
+            ("undeclared", json!({}), "unknown_tool"),
+        ] {
+            let error = decode(
+                &request,
+                &terminal(json!([{"functionCall":{"name":name,"args":args}}])),
+            )
+            .err()
+            .unwrap();
+            assert_eq!(error.code, "invalid_provider_tool_call");
+            let details = error.diagnostics.unwrap().metadata;
+            assert_eq!(details["validation"]["reason"], reason);
+            assert!(!details.to_string().contains("private argument"));
+            assert!(!details.to_string().contains("Paris"));
+        }
     }
 
     #[test]
@@ -1564,7 +1635,7 @@ mod tests {
         );
         assert_eq!(
             body["request"]["tools"][0]["functionDeclarations"][0]["parameters"],
-            request.tools[0].parameters
+            crate::antigravity_schema::parameters(&request.tools[0].parameters)
         );
         assert!(
             body["request"]["tools"][0]["functionDeclarations"][0]
