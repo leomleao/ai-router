@@ -1,37 +1,46 @@
 # ai-router
 
-A Rust HTTP gateway over the official Antigravity (`agy`) CLI. It is intended
-for n8n, Hermes, and OpenAI-compatible applications using an existing Google
-AI Pro login. Google authentication stays inside the official CLI.
+A Rust HTTP gateway for n8n, Hermes, and other OpenAI-compatible clients. Exact
+model IDs route to either the official Antigravity (`agy`) CLI or the optional
+OpenAI ChatGPT-plan provider. AGY uses the operator's existing Google AI Pro
+login; OpenAI uses its separate, opt-in OAuth flow and state volume.
 
-See [PLAN.md](PLAN.md) for the implementation plan and design decisions.
+See [PLAN.md](PLAN.md) for the AGY design and the
+[OpenAI subscription implementation checkpoint](docs/openai-subscription-plan.md)
+and [task DAG](docs/openai-subscription-dag.md) for dual-provider status.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
     C[n8n / Hermes / HTTP client] --> P[HTTPS reverse proxy]
-    P --> R[127.0.0.1:8090 → Rust gateway]
-    R --> A[Authentication, limits, validation]
-    A --> M[Shared AGY subprocess supervisor]
+    P --> GW[127.0.0.1:8090 → Rust gateway]
+    GW --> A[Authentication, limits, validation]
+    A --> X[Exact model registry and provider admission]
+    X --> M[AGY subprocess supervisor]
+    X --> O[OpenAI Responses adapter, disabled by default]
     M --> G[Official AGY 1.4.3]
     G --> S[Google subscription]
-    M --> T[Private monitor socket]
+    X --> T[Private monitor socket]
     G --> V[Named AGY state volume]
+    O --> OV[Separate OpenAI auth volume]
     M --> W[Temporary request workspaces]
 ```
 
-Both OpenAI API styles share one runner. Model requests replay submitted
-history in a fresh workspace, use a fixed agent without default components,
-and disable slash expansion. A zero-token CLI management check verifies the
-parsed custom agent before user prompts are sent. A private inert MCP relay offers client-supplied
-tools: it captures one validated call, stops AGY, and returns `tool_calls` or a
-Responses `function_call`. The client executes the tool and sends its result
-with the full history. No client tool runs on this server.
+Both client API styles use the same exact-ID provider routing. AGY model
+requests replay submitted history in a fresh workspace, use a fixed agent
+without default components, and disable slash expansion. A zero-token CLI
+management check verifies the parsed custom agent before user prompts are sent.
+AGY's private inert MCP relay offers client tools one validated call at a time;
+OpenAI handles Responses function calls directly and may return multiple calls.
+The client executes tools and sends results with the full history. The server
+does not execute client tools.
 
-Native runs are separate and require a `native` key scope. They expose
+Native runs are AGY-only and require a `native` key scope. They expose
 structured CLI progress, explicitly uploaded files, and owner-scoped artifacts.
-Native execution is disabled until real sandbox containment has been verified.
+Native execution is disabled in Compose. Keep it disabled whenever OpenAI is
+enabled until containment proves AGY subprocesses and native tools cannot read
+the OpenAI state volume. With OpenAI off, the existing AGY native gate applies.
 No host directories, Docker socket, or arbitrary caller-defined MCP servers,
 hooks, agents, executable paths, or CLI arguments are exposed.
 
@@ -103,8 +112,9 @@ OpenAI-compatible/custom endpoint provider and a discovered model ID.
 The gateway rejects active sampling controls such as `temperature` and `top_p`.
 Responses `max_output_tokens` and Chat `max_tokens` or `max_completion_tokens`
 accept positive integer budgets as **best-effort answer-length instructions**.
-AGY has no verified hard generation-token cap: answers may exceed the requested
-budget, and these fields do not cap reasoning tokens or account usage. Output,
+These gateway budgets are disclosed prompt guidance, not hard output-token
+caps. Answers may exceed the requested budget, and these fields do not cap
+reasoning tokens or account usage. Output,
 JSON and tool calls are never cut to fit the hint, and reported usage remains
 the actual provider usage. Successful budget-bearing responses include
 `X-AI-Router-Token-Budget-Mode: prompt-guidance`; `/v1/capabilities` reports the
@@ -120,8 +130,9 @@ requests carrying either non-null hint include
 `X-AI-Router-Prompt-Cache-Controls: ignored`; `/v1/capabilities` reports this
 limitation. Provider-reported cached-token usage is preserved.
 
-Parallel tool calls are permitted in requests, but this adapter returns at most
-one call per turn. Forced/required tool selection is currently unsupported.
+AGY returns at most one client tool call per turn. OpenAI Responses can return
+multiple function calls and supported `additional_tools` developer items.
+Forced/required tool selection remains unsupported.
 
 In n8n Chat, select tools for the current conversation; creating a tool in the
 library alone does not attach it to an existing chat. Each gateway request
@@ -147,11 +158,11 @@ Every `/v1` route requires `Authorization: Bearer <client-key>`.
 | Route | Behaviour |
 | --- | --- |
 | `GET /health` | Minimal public liveness, no provider details |
-| `GET /ready` | Minimal readiness; 503 when CLI/auth probe is unavailable |
-| `GET /v1/models` | Discovered catalogue from the pinned official CLI |
+| `GET /ready` | Minimal readiness; 200 when at least one enabled provider has a routable model |
+| `GET /v1/models` | Exact-ID union of currently available provider catalogues |
 | `GET /v1/capabilities` | Adapter capabilities, limitations, quota freshness, verification gates |
-| `POST /v1/chat/completions` | Text, streaming, client tools, final structured output |
-| `POST /v1/responses` | Same runner, Responses objects and typed SSE events |
+| `POST /v1/chat/completions` | Provider-routed text, streaming, client tools, final structured output |
+| `POST /v1/responses` | Provider-routed Responses objects and typed SSE events |
 | `POST /v1/agy/runs` | Owner-scoped asynchronous native run; disabled by default |
 | `GET /v1/agy/runs/{id}` | Run status and result |
 | `DELETE /v1/agy/runs/{id}` | Cancel an active run; delete a terminal run and its workspace |
@@ -257,11 +268,17 @@ feature works headlessly; use the [capability matrix](docs/capabilities.md).
   administration or provider-management endpoint exists.
 
 Default limits: 60 pre-auth requests per IP/minute, 600 globally/minute,
-30 per key/minute, 2 active generations, 8 waiting, a 1 MiB body, 8 MiB provider
-output, and a 120-second run deadline. Limits are configurable and validated.
-Native stays off in the shipped Compose file. Docker's default seccomp may
-prevent the CLI sandbox from starting; do not solve that by granting unrestricted
-privileges. See the native verification gate in the operations guide.
+30 per key/minute, a 1 MiB body, 8 MiB provider output, and a 120-second run
+deadline remain gateway-wide. `AI_ROUTER_MAX_CONCURRENT` and
+`AI_ROUTER_MAX_QUEUE` are AGY's active/waiting budgets (defaults 2/8); OpenAI
+has separate `AI_ROUTER_OPENAI_MAX_CONCURRENT` and `AI_ROUTER_OPENAI_MAX_QUEUE`
+budgets (defaults 2/8). The combined active/queued ceiling is the sum of both
+provider budgets. OpenAI is disabled unless `AI_ROUTER_OPENAI_ENABLED=true`.
+Native stays off in the shipped Compose file and must remain off whenever
+OpenAI is enabled until the OpenAI state volume is covered by containment
+verification. Docker's default seccomp may prevent the CLI sandbox from
+starting; do not solve that by granting unrestricted privileges. See the native
+verification gate in the operations guide.
 
 ## Testing
 

@@ -31,6 +31,13 @@ fn runner(config: Config) -> Runner {
 }
 fn request(prompt: &str) -> RunRequest {
     RunRequest {
+        owner: String::new(),
+        parallel_tool_calls: false,
+        remaining_ms: None,
+        input: Vec::new(),
+        instructions: Vec::new(),
+        provider_generation: None,
+        endpoint: String::new(),
         request_id: uuid::Uuid::new_v4().simple().to_string(),
         model: "gemini-3-pro".into(),
         prompt: prompt.into(),

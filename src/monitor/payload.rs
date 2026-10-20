@@ -62,6 +62,17 @@ fn redact(value: &mut Value, depth: usize) {
                         | "accesstoken"
                         | "refreshtoken"
                         | "idtoken"
+                        | "idtokenhint"
+                        | "encryptedcontent"
+                        | "codeverifier"
+                        | "pkceverifier"
+                        | "authorizationcode"
+                        | "oauthcode"
+                        | "devicecode"
+                        | "nonce"
+                        | "oauthnonce"
+                        | "state"
+                        | "oauthstate"
                         | "clientsecret"
                         | "credentials"
                 ) || key.ends_with("password")
@@ -80,6 +91,14 @@ fn redact(value: &mut Value, depth: usize) {
             for value in items {
                 redact(value, depth + 1);
             }
+        }
+        Value::String(text)
+            if text
+                .trim_start()
+                .to_ascii_lowercase()
+                .starts_with("https://auth.openai.com") =>
+        {
+            *text = "[redacted OAuth URL]".into();
         }
         Value::String(text) if matches!(text.trim_start().chars().next(), Some('{' | '[')) => {
             if let Ok(mut embedded) = serde_json::from_str::<Value>(text) {
@@ -152,5 +171,30 @@ mod tests {
                 .await
                 .is_none()
         );
+    }
+
+    #[test]
+    fn redacts_oauth_material_and_authorization_urls_without_changing_prompt_text() {
+        let payload = CapturedPayload::capture(&json!({
+            "code_verifier": "synthetic-verifier",
+            "authorization_code": "synthetic-code",
+            "id_token_hint": "synthetic-id-token",
+            "nonce": "synthetic-nonce",
+            "encrypted_content": "synthetic-encrypted-content",
+            "callback": "https://auth.openai.com/authorize?code=synthetic-code&id_token_hint=synthetic-id-token",
+            "input": "Keep this ordinary prompt intact."
+        }));
+        for secret in [
+            "synthetic-verifier",
+            "synthetic-code",
+            "synthetic-id-token",
+            "synthetic-nonce",
+            "synthetic-encrypted-content",
+            "auth.openai.com",
+        ] {
+            assert!(!payload.json.contains(secret), "leaked {secret}");
+        }
+        assert!(payload.json.contains("[redacted OAuth URL]"));
+        assert!(payload.json.contains("Keep this ordinary prompt intact."));
     }
 }

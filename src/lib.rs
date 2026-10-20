@@ -9,3 +9,7 @@ pub mod protocol;
 pub mod relay;
 pub mod runner;
 mod tool_diagnostics;
+
+pub mod openai;
+pub mod openai_auth;
+pub mod providers;

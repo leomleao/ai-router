@@ -6,9 +6,9 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 router \
     && useradd --uid 10001 --gid 10001 --home-dir /var/lib/ai-router/auth --no-create-home --shell /bin/bash router \
-    && mkdir -p /var/lib/ai-router/auth /var/lib/ai-router/telemetry /run/ai-router/workspaces \
+    && mkdir -p /var/lib/ai-router/auth /var/lib/ai-router/openai-auth /var/lib/ai-router/telemetry /run/ai-router/workspaces \
     && chown -R router:router /var/lib/ai-router /run/ai-router \
-    && chmod 0700 /var/lib/ai-router/auth /var/lib/ai-router/telemetry /run/ai-router
+    && chmod 0700 /var/lib/ai-router/auth /var/lib/ai-router/openai-auth /var/lib/ai-router/telemetry /run/ai-router
 COPY scripts/install-agy.sh /tmp/install-agy.sh
 RUN sh /tmp/install-agy.sh "$TARGETARCH" && rm /tmp/install-agy.sh
 ENV HOME=/var/lib/ai-router/auth \
@@ -16,6 +16,10 @@ ENV HOME=/var/lib/ai-router/auth \
     AGY_CLI_OSC7501=off \
     AI_ROUTER_AGY_BIN=/usr/local/bin/agy \
     AI_ROUTER_STATE_DIR=/var/lib/ai-router/auth \
+    AI_ROUTER_OPENAI_ENABLED=false \
+    AI_ROUTER_OPENAI_STATE_DIR=/var/lib/ai-router/openai-auth \
+    AI_ROUTER_OPENAI_MAX_CONCURRENT=2 \
+    AI_ROUTER_OPENAI_MAX_QUEUE=8 \
     AI_ROUTER_WORKSPACE_DIR=/run/ai-router/workspaces \
     AI_ROUTER_TELEMETRY_DIR=/var/lib/ai-router/telemetry \
     AI_ROUTER_MONITOR_SOCKET=/run/ai-router/monitor.sock \
@@ -48,9 +52,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends python3 python3
     && rm -rf /var/lib/apt/lists/* \
     && python3 -m venv /opt/test-venv \
     && /opt/test-venv/bin/pip install --no-cache-dir openai==3.24.0 pyte==0.8.2 \
-    && mkdir -p /var/lib/ai-router/auth /var/lib/ai-router/telemetry /run/ai-router \
+    && mkdir -p /var/lib/ai-router/auth /var/lib/ai-router/openai-auth /var/lib/ai-router/telemetry /run/ai-router \
     && chown -R 10001:10001 /var/lib/ai-router /run/ai-router \
-    && chmod 0700 /var/lib/ai-router/auth /var/lib/ai-router/telemetry /run/ai-router
+    && chmod 0700 /var/lib/ai-router/auth /var/lib/ai-router/openai-auth /var/lib/ai-router/telemetry /run/ai-router
 ENV PATH=/opt/test-venv/bin:$PATH
 COPY --from=n8n-contract-deps /usr/local/bin/node /usr/local/bin/node
 COPY --from=n8n-contract-deps /opt/n8n-contract /opt/n8n-contract

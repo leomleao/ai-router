@@ -1024,7 +1024,7 @@ async fn invalid_keys_and_unsupported_inputs_never_start_generation() {
         assert_eq!(value["error"]["code"], "unsupported_parameter");
         assert_eq!(
             value["error"]["message"],
-            "text.verbosity is not supported by the AGY adapter"
+            "text.verbosity is not supported by this adapter"
         );
         assert!(harness.workspaces().is_empty());
     }
@@ -1361,7 +1361,13 @@ async fn native_gate_ownership_artifacts_and_synthetic_links_are_enforced() {
 async fn wait_descendant(workspace: &Path) -> libc::pid_t {
     for _ in 0..300 {
         if let Ok(value) = tokio::fs::read_to_string(workspace.join("descendant.pid")).await {
-            return value.parse().unwrap();
+            // The synthetic writer creates the file before its small write;
+            // existence alone does not mean its PID has been published yet.
+            if !value.is_empty() {
+                let pid: libc::pid_t = value.parse().expect("invalid synthetic descendant PID");
+                assert!(pid > 0);
+                return pid;
+            }
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }

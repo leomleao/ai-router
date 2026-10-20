@@ -20,6 +20,10 @@ pub struct Config {
     pub agy_bin: PathBuf,
     pub expected_agy_version: String,
     pub state_dir: PathBuf,
+    pub openai_enabled: bool,
+    pub openai_state_dir: PathBuf,
+    pub openai_max_concurrent: usize,
+    pub openai_max_queue: usize,
     pub workspace_dir: PathBuf,
     pub telemetry_dir: PathBuf,
     pub monitor_socket: PathBuf,
@@ -59,6 +63,16 @@ impl Config {
         let agy_bin = value("AI_ROUTER_AGY_BIN", "/usr/local/bin/agy")?.into();
         let expected_agy_version = value("AI_ROUTER_EXPECTED_AGY_VERSION", "1.4.3")?;
         let state_dir = value("AI_ROUTER_STATE_DIR", "/var/lib/ai-router/auth")?.into();
+        let openai_enabled = match value("AI_ROUTER_OPENAI_ENABLED", "false")?.as_str() {
+            "true" => true,
+            "false" => false,
+            _ => return Err("AI_ROUTER_OPENAI_ENABLED must be true or false".to_owned()),
+        };
+        let openai_state_dir = value(
+            "AI_ROUTER_OPENAI_STATE_DIR",
+            "/var/lib/ai-router/openai-auth",
+        )?
+        .into();
         let workspace_dir = value("AI_ROUTER_WORKSPACE_DIR", "/run/ai-router/workspaces")?.into();
         let telemetry_dir =
             value("AI_ROUTER_TELEMETRY_DIR", "/var/lib/ai-router/telemetry")?.into();
@@ -99,6 +113,10 @@ impl Config {
             agy_bin,
             expected_agy_version,
             state_dir,
+            openai_enabled,
+            openai_state_dir,
+            openai_max_concurrent: number!("AI_ROUTER_OPENAI_MAX_CONCURRENT", "2"),
+            openai_max_queue: number!("AI_ROUTER_OPENAI_MAX_QUEUE", "8"),
             workspace_dir,
             telemetry_dir,
             monitor_socket,
@@ -128,21 +146,27 @@ impl Config {
         for (name, path) in [
             ("AGY_BIN", &self.agy_bin),
             ("STATE_DIR", &self.state_dir),
+            ("OPENAI_STATE_DIR", &self.openai_state_dir),
             ("WORKSPACE_DIR", &self.workspace_dir),
             ("TELEMETRY_DIR", &self.telemetry_dir),
             ("MONITOR_SOCKET", &self.monitor_socket),
         ] {
             validate_path(name, path)?;
         }
-        let storage = [&self.state_dir, &self.workspace_dir, &self.telemetry_dir];
+        let storage = [
+            &self.state_dir,
+            &self.openai_state_dir,
+            &self.workspace_dir,
+            &self.telemetry_dir,
+        ];
         for (i, path) in storage.iter().enumerate() {
             for other in storage.iter().skip(i + 1) {
                 if path.starts_with(other) || other.starts_with(path) {
-                    return Err("Authentication, workspaces, and telemetry paths must be separate directories".to_owned());
+                    return Err("AGY authentication, OpenAI authentication, workspaces, and telemetry paths must be separate directories".to_owned());
                 }
             }
             if self.monitor_socket.starts_with(path) {
-                return Err("Monitor socket must be outside authentication, workspaces, and telemetry directories".to_owned());
+                return Err("Monitor socket must be outside AGY authentication, OpenAI authentication, workspaces, and telemetry directories".to_owned());
             }
         }
         let versions: Vec<_> = self.expected_agy_version.split('.').collect();
@@ -185,6 +209,13 @@ impl Config {
         )?;
         bounds("MAX_CONCURRENT", self.max_concurrent as u64, 1, 64)?;
         bounds("MAX_QUEUE", self.max_queue as u64, 0, 1024)?;
+        bounds(
+            "OPENAI_MAX_CONCURRENT",
+            self.openai_max_concurrent as u64,
+            1,
+            64,
+        )?;
+        bounds("OPENAI_MAX_QUEUE", self.openai_max_queue as u64, 0, 1024)?;
         bounds("REQUEST_TIMEOUT_SECS", self.request_timeout_secs, 1, 3600)?;
         bounds("ARTIFACT_TTL_SECS", self.artifact_ttl_secs, 1, 86400)?;
         bounds(
@@ -218,6 +249,10 @@ impl Config {
             agy_bin: root.join("fake-agy"),
             expected_agy_version: "1.4.3".to_owned(),
             state_dir: root.join("auth"),
+            openai_enabled: false,
+            openai_state_dir: root.join("openai-auth"),
+            openai_max_concurrent: 2,
+            openai_max_queue: 8,
             workspace_dir: root.join("workspaces"),
             telemetry_dir: root.join("telemetry"),
             monitor_socket: root.join("monitor.sock"),
@@ -343,6 +378,13 @@ mod tests {
         assert!(Config::from_lookup(|_| Ok(None)).is_err());
         let config = config_with("AI_ROUTER_NATIVE_ENABLED", "false").unwrap();
         assert_eq!(config.max_queue, 8);
+        assert!(!config.openai_enabled);
+        assert_eq!(
+            config.openai_state_dir,
+            Path::new("/var/lib/ai-router/openai-auth")
+        );
+        assert_eq!(config.openai_max_concurrent, 2);
+        assert_eq!(config.openai_max_queue, 8);
         assert!(!config.native_enabled);
         assert_eq!(config.keys[0].id, "test");
     }
@@ -352,6 +394,14 @@ mod tests {
             ("AI_ROUTER_WORKSPACE_DIR", "relative"),
             ("AI_ROUTER_STATE_DIR", "/tmp/../auth"),
             ("AI_ROUTER_STATE_DIR", "/tmp/credentials/auth"),
+            ("AI_ROUTER_OPENAI_ENABLED", "yes"),
+            ("AI_ROUTER_OPENAI_STATE_DIR", "/tmp/auth/../openai"),
+            (
+                "AI_ROUTER_OPENAI_STATE_DIR",
+                "/var/lib/ai-router/auth/openai",
+            ),
+            ("AI_ROUTER_OPENAI_MAX_CONCURRENT", "0"),
+            ("AI_ROUTER_OPENAI_MAX_QUEUE", "99999999"),
             ("AI_ROUTER_MAX_CONCURRENT", "0"),
             ("AI_ROUTER_MAX_QUEUE", "99999999"),
             ("AI_ROUTER_NATIVE_ENABLED", "yes"),
@@ -373,6 +423,9 @@ mod tests {
         config.workspace_dir = config.state_dir.join("runs");
         assert!(config.validate().is_err());
         config.workspace_dir = PathBuf::from("/tmp/router-test/workspaces");
+        config.openai_state_dir = config.state_dir.join("openai");
+        assert!(config.validate().is_err());
+        config.openai_state_dir = PathBuf::from("/tmp/router-test/openai-auth");
         config.trusted_proxies = vec!["127.0.0.1".parse().unwrap(); 2];
         assert!(config.validate().is_err());
     }

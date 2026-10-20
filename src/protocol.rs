@@ -10,6 +10,8 @@ use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ApiError {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_request_id: Option<String>,
     pub status: u16,
     pub code: String,
     pub message: String,
@@ -18,6 +20,7 @@ pub struct ApiError {
 impl ApiError {
     pub fn new(status: u16, code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
+            upstream_request_id: None,
             status,
             code: code.into(),
             message: message.into(),
@@ -36,7 +39,7 @@ impl ApiError {
         Self::new(
             400,
             "unsupported_parameter",
-            format!("{field} is not supported by the AGY adapter"),
+            format!("{field} is not supported by this adapter"),
         )
     }
     pub fn response_body(&self) -> Value {
@@ -47,7 +50,12 @@ impl ApiError {
             429 => "rate_limit_error",
             _ => "server_error",
         };
-        json!({"error":{"message":self.message,"type":error_type,"code":self.code}})
+        let mut value =
+            json!({"error":{"message":self.message,"type":error_type,"code":self.code}});
+        if let Some(id) = &self.upstream_request_id {
+            value["error"]["upstream_request_id"] = json!(id);
+        }
+        value
     }
 }
 
@@ -98,6 +106,20 @@ pub enum RunProfile {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RunRequest {
+    #[serde(default)]
+    pub owner: String,
+    #[serde(default)]
+    pub parallel_tool_calls: bool,
+    #[serde(default)]
+    pub remaining_ms: Option<u64>,
+    #[serde(default)]
+    pub input: Vec<Value>,
+    #[serde(default)]
+    pub instructions: Vec<Value>,
+    #[serde(default)]
+    pub provider_generation: Option<String>,
+    #[serde(default)]
+    pub endpoint: String,
     pub request_id: String,
     pub model: String,
     pub prompt: String,
@@ -111,6 +133,10 @@ pub struct RunRequest {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RunResult {
+    #[serde(default)]
+    pub output_items: Vec<Value>,
+    #[serde(default)]
+    pub upstream_request_id: Option<String>,
     pub text: String,
     pub structured_output: Option<Value>,
     pub conversation_id: String,
@@ -141,6 +167,8 @@ pub struct ModelInfo {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProviderStatus {
+    #[serde(skip)]
+    pub registration_generation: Option<String>,
     pub version: String,
     pub authenticated: bool,
     pub models: Vec<ModelInfo>,
@@ -151,6 +179,7 @@ pub struct ProviderStatus {
 impl Default for ProviderStatus {
     fn default() -> Self {
         Self {
+            registration_generation: None,
             version: String::new(),
             authenticated: false,
             models: Vec::new(),
@@ -282,7 +311,12 @@ pub fn normalize_chat(value: Value, request_id: String) -> Result<RunRequest, Ap
             "At least one conversation message is required",
         ));
     }
-    let request = make_request(request_id, model, transcript, system, tools, schema, effort)?;
+    let mut request = make_request(request_id, model, transcript, system, tools, schema, effort)?;
+    request.endpoint = "chat".into();
+    request.parallel_tool_calls = root
+        .get("parallel_tool_calls")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
     apply_output_token_hint(request, root, false)
 }
 
@@ -398,6 +432,25 @@ pub fn normalize_response(value: Value, request_id: String) -> Result<RunRequest
                 }
                 transcript.push(item);
             }
+            "reasoning" => {
+                allowed_fields(
+                    data,
+                    &["type", "id", "summary", "encrypted_content", "status"],
+                    "reasoning item",
+                )?;
+                validate_item_metadata(data)?;
+                let encrypted = required_string(data, "encrypted_content")?;
+                bounded_text(encrypted)?;
+                if encrypted.is_empty() {
+                    return Err(ApiError::bad_request("Empty encrypted reasoning"));
+                }
+                if data.get("summary").is_some_and(|v| !v.is_array()) {
+                    return Err(ApiError::bad_request("reasoning.summary must be an array"));
+                }
+                bounded_text(&item.to_string())?;
+                leading = false;
+                transcript.push(item);
+            }
             _ => return Err(ApiError::unsupported("input item type")),
         }
     }
@@ -406,7 +459,12 @@ pub fn normalize_response(value: Value, request_id: String) -> Result<RunRequest
             "At least one conversation input item is required",
         ));
     }
-    let request = make_request(request_id, model, transcript, system, tools, schema, effort)?;
+    let mut request = make_request(request_id, model, transcript, system, tools, schema, effort)?;
+    request.endpoint = "responses".into();
+    request.parallel_tool_calls = root
+        .get("parallel_tool_calls")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
     apply_output_token_hint(request, root, true)
 }
 
@@ -440,6 +498,7 @@ fn apply_output_token_hint(
         request.system.push_str(&format!(
             "\n\nRouter answer-length guidance (best effort): Aim for an approximate visible answer length of at most {budget} tokens. Keep the answer concise. Preserve correctness, complete JSON matching any required schema, and complete tool-call arguments even if they require a longer answer. This is length guidance only; do not change reasoning effort.\n"
         ));
+        request.instructions.push(json!({"role":"developer", "content": format!("Aim for a visible answer of approximately {budget} tokens or fewer. Preserve correct complete JSON and tool arguments. This is answer-length guidance, not an enforced usage limit.")}));
         bounded_text(&request.system)?;
     }
     Ok(request)
@@ -460,6 +519,7 @@ fn make_request(
             .map_err(|_| ApiError::internal("Could not render conversation"))?
     );
     bounded_text(&prompt)?;
+    let instructions = system.clone();
     let system = if system.is_empty() {
         String::new()
     } else {
@@ -471,6 +531,13 @@ fn make_request(
     };
     bounded_text(&system)?;
     Ok(RunRequest {
+        owner: String::new(),
+        parallel_tool_calls: true,
+        remaining_ms: None,
+        input: transcript,
+        instructions,
+        provider_generation: None,
+        endpoint: String::new(),
         request_id,
         model,
         prompt,
@@ -1114,6 +1181,15 @@ mod tests {
                 assert!(request.system.contains(&format!("at most {budget} tokens")));
                 assert!(request.system.contains("best effort"));
                 assert!(request.system.contains("complete tool-call arguments"));
+                assert_eq!(request.instructions.len(), expected.instructions.len() + 1);
+                let guidance = request.instructions.pop().unwrap();
+                assert!(
+                    guidance["content"]
+                        .as_str()
+                        .unwrap()
+                        .contains(&format!("{budget} tokens"))
+                );
+                assert_eq!(request.instructions, expected.instructions);
                 request.system = expected.system.clone();
                 assert_eq!(
                     serde_json::to_value(request).unwrap(),

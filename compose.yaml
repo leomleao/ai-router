@@ -17,8 +17,13 @@ services:
       AI_ROUTER_NATIVE_ENABLED: "false"
       AI_ROUTER_EXPECTED_AGY_VERSION: "1.4.3"
       AI_ROUTER_TRUSTED_PROXIES: "${AI_ROUTER_TRUSTED_PROXIES:-}"
+      AI_ROUTER_OPENAI_ENABLED: "${AI_ROUTER_OPENAI_ENABLED:-false}"
+      AI_ROUTER_OPENAI_STATE_DIR: /var/lib/ai-router/openai-auth
+      AI_ROUTER_OPENAI_MAX_CONCURRENT: "${AI_ROUTER_OPENAI_MAX_CONCURRENT:-2}"
+      AI_ROUTER_OPENAI_MAX_QUEUE: "${AI_ROUTER_OPENAI_MAX_QUEUE:-8}"
     volumes:
       - auth:/var/lib/ai-router/auth
+      - openai-auth:/var/lib/ai-router/openai-auth
       - telemetry:/var/lib/ai-router/telemetry
     tmpfs:
       - /run/ai-router:rw,nosuid,nodev,noexec,size=256m,uid=10001,gid=10001,mode=0700
@@ -35,5 +40,7 @@ services:
 volumes:
   auth:
     name: ai-router-auth
+  openai-auth:
+    name: ai-router-openai-auth
   telemetry:
     name: ai-router-telemetry

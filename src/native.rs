@@ -193,6 +193,13 @@ pub async fn create(
         jobs.insert(id.clone(), job.clone());
     }
     let request = RunRequest {
+        owner: String::new(),
+        parallel_tool_calls: false,
+        remaining_ms: None,
+        input: Vec::new(),
+        instructions: Vec::new(),
+        provider_generation: None,
+        endpoint: String::new(),
         request_id: id,
         model,
         prompt,

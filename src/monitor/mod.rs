@@ -38,9 +38,13 @@ pub struct CountsSinceStart {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RequestRecord {
+    #[serde(default)]
+    pub upstream_request_id: Option<String>,
     pub request_id: String,
     pub client_id: String,
     pub model: String,
+    #[serde(default = "legacy_provider")]
+    pub provider: String,
     pub endpoint: String,
     pub started_at: String,
     pub duration_ms: u64,
@@ -73,6 +77,8 @@ pub struct Aggregate {
     pub startup_p95_ms: Option<u64>,
     pub by_client: BTreeMap<String, usize>,
     pub by_model: BTreeMap<String, usize>,
+    #[serde(default)]
+    pub by_provider: BTreeMap<String, usize>,
     pub by_error: BTreeMap<String, usize>,
 }
 
@@ -82,7 +88,11 @@ pub struct Snapshot {
     pub active: usize,
     pub queued: usize,
     pub provider: ProviderStatus,
+    #[serde(default)]
+    pub openai_provider: ProviderStatus,
     pub provider_age_seconds: Option<u64>,
+    #[serde(default)]
+    pub openai_provider_age_seconds: Option<u64>,
     pub aggregate: Aggregate,
     pub counts_since_start: CountsSinceStart,
     pub records: Vec<RequestRecord>,
@@ -94,6 +104,7 @@ pub struct Snapshot {
 struct State {
     records: VecDeque<RequestRecord>,
     provider: ProviderStatus,
+    openai_provider: ProviderStatus,
     active: usize,
     queued: usize,
     persistence_errors: u64,
@@ -105,6 +116,7 @@ impl Default for State {
         Self {
             records: VecDeque::new(),
             provider: ProviderStatus::default(),
+            openai_provider: ProviderStatus::default(),
             active: 0,
             queued: 0,
             persistence_errors: 0,
@@ -349,6 +361,7 @@ impl Telemetry {
         let active = state.active;
         let queued = state.queued;
         let provider = state.provider.clone();
+        let openai_provider = state.openai_provider.clone();
         let persistence_errors = state.persistence_errors;
         drop(state);
         Snapshot {
@@ -363,7 +376,16 @@ impl Telemetry {
                         .max(0)) as u64
                 },
             ),
+            openai_provider_age_seconds: DateTime::parse_from_rfc3339(&openai_provider.checked_at)
+                .ok()
+                .map(|checked| {
+                    (Utc::now()
+                        .signed_duration_since(checked)
+                        .num_seconds()
+                        .max(0)) as u64
+                }),
             provider,
+            openai_provider,
             aggregate: aggregate(&records),
             counts_since_start: self.rejection_counts(),
             records,
@@ -373,20 +395,14 @@ impl Telemetry {
         }
     }
 
-    pub async fn set_provider(&self, mut provider: ProviderStatus) {
+    pub async fn set_provider(&self, provider: ProviderStatus) {
         self.ensure_worker();
-        provider.version = identifier(&provider.version, 32);
-        provider.models.truncate(500);
-        for model in &mut provider.models {
-            model.id = identifier(&model.id, 128);
-            model.name = identifier(&model.name, 128);
-        }
-        provider.error = provider.error.map(|error| identifier(&error, 80));
-        if DateTime::parse_from_rfc3339(&provider.checked_at).is_err() {
-            provider.checked_at = String::new();
-        }
-        provider.quota = provider.quota.and_then(sanitise_quota);
-        self.state.lock().await.provider = provider;
+        self.state.lock().await.provider = sanitise_provider(provider);
+    }
+
+    pub async fn set_openai_provider(&self, provider: ProviderStatus) {
+        self.ensure_worker();
+        self.state.lock().await.openai_provider = sanitise_provider(provider);
     }
 
     pub async fn set_runtime(&self, active: usize, queued: usize) {
@@ -394,6 +410,21 @@ impl Telemetry {
         state.active = active;
         state.queued = queued;
     }
+}
+
+fn sanitise_provider(mut provider: ProviderStatus) -> ProviderStatus {
+    provider.version = identifier(&provider.version, 32);
+    provider.models.truncate(500);
+    for model in &mut provider.models {
+        model.id = identifier(&model.id, 128);
+        model.name = identifier(&model.name, 128);
+    }
+    provider.error = provider.error.map(|error| identifier(&error, 80));
+    if DateTime::parse_from_rfc3339(&provider.checked_at).is_err() {
+        provider.checked_at = String::new();
+    }
+    provider.quota = provider.quota.and_then(sanitise_quota);
+    provider
 }
 
 impl Drop for Telemetry {
@@ -465,6 +496,10 @@ fn identifier(value: &str, max: usize) -> String {
         .collect()
 }
 
+fn legacy_provider() -> String {
+    "agy".to_owned()
+}
+
 fn sanitise_record(mut record: RequestRecord) -> Option<RequestRecord> {
     let started = DateTime::parse_from_rfc3339(&record.started_at).ok()?;
     if started > Utc::now() + chrono::Duration::minutes(5) {
@@ -474,6 +509,10 @@ fn sanitise_record(mut record: RequestRecord) -> Option<RequestRecord> {
     record.request_id = identifier(&record.request_id, 80);
     record.client_id = identifier(&record.client_id, 64);
     record.model = identifier(&record.model, 128);
+    record.upstream_request_id = record.upstream_request_id.map(|id| identifier(&id, 256));
+    if !matches!(record.provider.as_str(), "agy" | "openai") {
+        record.provider = "other".to_owned();
+    }
     record.endpoint = identifier(&record.endpoint, 80);
     record.status = identifier(&record.status, 32);
     record.error_code = record.error_code.map(|value| identifier(&value, 80));
@@ -562,6 +601,10 @@ fn aggregate(records: &[RequestRecord]) -> Aggregate {
             .entry(record.client_id.clone())
             .or_default() += 1;
         *result.by_model.entry(record.model.clone()).or_default() += 1;
+        *result
+            .by_provider
+            .entry(record.provider.clone())
+            .or_default() += 1;
         durations.push(record.duration_ms);
         if let Some(first) = record.first_output_ms {
             first_output.push(first);
@@ -772,17 +815,24 @@ fn render(snapshot: &Snapshot) -> String {
     let a = &snapshot.aggregate;
     let c = &snapshot.counts_since_start;
     let mut text = format!(
-        "AI router  {}\nAGY {}  authenticated={}  checked={}  age={}s\nActive={}  queued={}  requests={}  failures={}  auth failures={}\nLatency p50/p95={} / {} ms  AGY ready={} / {} ms  first output={} / {} ms\nObserved tokens input={} output={} total={} (complete={} partial={})\nRetention={} days / {} events  persistence errors={}\n",
+        "AI router  {}\nAGY {}  authenticated={}  checked={}  age={}s\nOpenAI {}  authenticated={}  checked={}  age={}s\nActive={}  queued={}  requests={}  failures={}  auth failures={}\nRequests by provider: AGY={} OpenAI={} other={}\nLatency p50/p95={} / {} ms  AGY ready={} / {} ms  first output={} / {} ms\nObserved tokens input={} output={} total={} (complete={} partial={})\nRetention={} days / {} events  persistence errors={}\n",
         snapshot.generated_at,
         snapshot.provider.version,
         snapshot.provider.authenticated,
         snapshot.provider.checked_at,
         fmt_metric(snapshot.provider_age_seconds),
+        snapshot.openai_provider.version,
+        snapshot.openai_provider.authenticated,
+        snapshot.openai_provider.checked_at,
+        fmt_metric(snapshot.openai_provider_age_seconds),
         snapshot.active,
         snapshot.queued,
         a.requests,
         a.failures,
         a.auth_failures,
+        a.by_provider.get("agy").copied().unwrap_or(0),
+        a.by_provider.get("openai").copied().unwrap_or(0),
+        a.by_provider.get("other").copied().unwrap_or(0),
         fmt_metric(a.duration_p50_ms),
         fmt_metric(a.duration_p95_ms),
         fmt_metric(a.startup_p50_ms),
@@ -803,17 +853,25 @@ fn render(snapshot: &Snapshot) -> String {
         c.started_at, c.total, c.auth, c.rate, c.scope, c.input, c.busy, c.other,
     ));
     if let Some(error) = &snapshot.provider.error {
-        text.push_str(&format!("Provider status: {error}\n"));
+        text.push_str(&format!("AGY status: {error}\n"));
     }
     if let Some(quota) = &snapshot.provider.quota {
-        text.push_str(&format!("Quota: {quota}\n"));
+        text.push_str(&format!("AGY quota: {quota}\n"));
     }
+    if let Some(error) = &snapshot.openai_provider.error {
+        text.push_str(&format!("OpenAI status: {error}\n"));
+    }
+    if let Some(quota) = &snapshot.openai_provider.quota {
+        text.push_str(&format!("OpenAI quota: {quota}\n"));
+    }
+    text.push_str("ChatGPT Usage: https://chatgpt.com/settings/usage\n");
     text.push_str("\nRecent requests (newest first)\n");
     for record in snapshot.records.iter().rev().take(15) {
         text.push_str(&format!(
-            "{}  {}  {}  {}ms  {}  {}\n",
+            "{}  {}  {}  {}  {}ms  {}  {}\n",
             record.request_id,
             record.client_id,
+            record.provider,
             record.model,
             record.duration_ms,
             record.status,
@@ -856,9 +914,11 @@ mod tests {
     use super::*;
     fn record(id: &str) -> RequestRecord {
         RequestRecord {
+            upstream_request_id: None,
             request_id: id.into(),
             client_id: "test".into(),
             model: "model".into(),
+            provider: "agy".into(),
             endpoint: "/v1/chat/completions".into(),
             started_at: Utc::now().to_rfc3339(),
             duration_ms: 100,
@@ -870,6 +930,70 @@ mod tests {
             usage_partial: false,
         }
     }
+    #[tokio::test]
+    async fn legacy_telemetry_and_snapshots_default_to_agy_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut legacy_record = serde_json::to_value(record("legacy")).unwrap();
+        legacy_record.as_object_mut().unwrap().remove("provider");
+        std::fs::write(
+            dir.path().join("telemetry.json"),
+            serde_json::to_vec(&vec![legacy_record]).unwrap(),
+        )
+        .unwrap();
+
+        let telemetry = Telemetry::open(dir.path(), 30, 100).unwrap();
+        let snapshot = telemetry.snapshot().await;
+        assert_eq!(snapshot.records[0].provider, "agy");
+        assert_eq!(snapshot.aggregate.by_provider.get("agy"), Some(&1));
+
+        let mut old_snapshot = serde_json::to_value(snapshot).unwrap();
+        let root = old_snapshot.as_object_mut().unwrap();
+        root.remove("openai_provider");
+        root.remove("openai_provider_age_seconds");
+        root.get_mut("aggregate")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("by_provider");
+        let restored: Snapshot = serde_json::from_value(old_snapshot).unwrap();
+        assert_eq!(
+            restored.openai_provider.error.as_deref(),
+            Some("provider_not_checked")
+        );
+        assert_eq!(restored.records[0].provider, "agy");
+    }
+
+    #[tokio::test]
+    async fn openai_status_is_sanitized_and_request_usage_is_attributed_by_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let telemetry = Telemetry::open(dir.path(), 30, 100).unwrap();
+        let mut openai_request = record("openai-request");
+        openai_request.provider = "openai".into();
+        telemetry.record(openai_request).await;
+        telemetry
+            .set_openai_provider(ProviderStatus {
+                registration_generation: None,
+                version: "preview-1".into(),
+                authenticated: true,
+                models: vec![crate::protocol::ModelInfo {
+                    id: "gpt-test".into(),
+                    name: "GPT test".into(),
+                }],
+                quota: None,
+                checked_at: Utc::now().to_rfc3339(),
+                error: None,
+            })
+            .await;
+        let snapshot = telemetry.snapshot().await;
+        assert!(snapshot.openai_provider.authenticated);
+        assert_eq!(snapshot.openai_provider.models[0].id, "gpt-test");
+        assert_eq!(snapshot.aggregate.by_provider.get("openai"), Some(&1));
+        let text = render(&snapshot);
+        assert!(text.contains("OpenAI preview-1"));
+        assert!(text.contains("Requests by provider: AGY=0 OpenAI=1"));
+        assert!(text.contains("https://chatgpt.com/settings/usage"));
+    }
+
     #[tokio::test]
     async fn persists_bounded_records_and_expires_old_entries() {
         let dir = tempfile::tempdir().unwrap();

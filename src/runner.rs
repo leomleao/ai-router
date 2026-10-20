@@ -114,6 +114,22 @@ impl Runner {
         request: RunRequest,
         cancel: CancellationToken,
     ) -> Result<RunStream, ApiError> {
+        if request
+            .input
+            .iter()
+            .any(|i| i.get("type").and_then(Value::as_str) == Some("reasoning"))
+        {
+            return Err(ApiError::unsupported(
+                "provider-specific reasoning replay on AGY",
+            ));
+        }
+        if request.profile == RunProfile::Native && self.config.openai_enabled {
+            return Err(ApiError::new(
+                503,
+                "native_unverified",
+                "Native containment has not verified isolation from OpenAI state",
+            ));
+        }
         if self.config.expected_agy_version != VERIFIED_AGY_VERSION {
             return Err(ApiError::new(
                 503,
@@ -205,8 +221,12 @@ impl Runner {
         workspace_owned: Arc<AtomicBool>,
     ) {
         let _completion = CompletionSignal(finished.clone());
-        let deadline =
-            tokio::time::Instant::now() + Duration::from_secs(self.config.request_timeout_secs);
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_millis(
+                request
+                    .remaining_ms
+                    .unwrap_or(self.config.request_timeout_secs * 1000),
+            );
         let startup = async {
             if cancel.is_cancelled() || sender.is_closed() {
                 return Err(cancelled());
@@ -854,7 +874,7 @@ async fn supervise(
                         let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
                         let event = RunEvent::ToolCall(call.clone());
                         if !send_event(&sender, event, &cancel, deadline).await { break Err(cancelled()); }
-                        break Ok(RunResult { text: state.text.clone(), structured_output: None, conversation_id: state.conversation_id.clone(), usage: state.observed_usage(), usage_partial: true, tool_calls: vec![call], status: "tool_calls".into() });
+                        break Ok(RunResult { output_items: Vec::new(), upstream_request_id: None, text: state.text.clone(), structured_output: None, conversation_id: state.conversation_id.clone(), usage: state.observed_usage(), usage_partial: true, tool_calls: vec![call], status: "tool_calls".into() });
                     }
                     Ok(None) => {},
                     Err(error) => break Err(error),
@@ -889,6 +909,7 @@ async fn supervise(
                                 }
                             }
                             Ok(Decoded::Result(result, events)) => {
+                                let result = *result;
                                 for event in events {
                                     if !send_event(&sender, event, &cancel, deadline).await { guard.kill(); stdout_task.abort(); stderr_task.abort(); let _ = child.wait().await; return; }
                                 }
@@ -1101,7 +1122,7 @@ struct DecodeState {
 }
 enum Decoded {
     Events(Vec<RunEvent>),
-    Result(RunResult, Vec<RunEvent>),
+    Result(Box<RunResult>, Vec<RunEvent>),
 }
 
 impl DecodeState {
@@ -1359,7 +1380,9 @@ impl DecodeState {
                     events.push(RunEvent::Native(value.clone()));
                 }
                 return Ok(Decoded::Result(
-                    RunResult {
+                    Box::new(RunResult {
+                        output_items: Vec::new(),
+                        upstream_request_id: None,
                         text,
                         structured_output,
                         conversation_id: self.conversation_id.clone(),
@@ -1367,7 +1390,7 @@ impl DecodeState {
                         usage_partial: false,
                         tool_calls: vec![],
                         status: "completed".into(),
-                    },
+                    }),
                     events,
                 ));
             }
@@ -1562,6 +1585,13 @@ mod tests {
 
     fn preparation_request() -> RunRequest {
         RunRequest {
+            owner: String::new(),
+            parallel_tool_calls: false,
+            remaining_ms: None,
+            input: Vec::new(),
+            instructions: Vec::new(),
+            provider_generation: None,
+            endpoint: String::new(),
             request_id: uuid::Uuid::new_v4().simple().to_string(),
             model: "gemini-3-pro".into(),
             prompt: "Synthetic preparation lifecycle test".into(),

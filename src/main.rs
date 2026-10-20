@@ -21,6 +21,7 @@ async fn main() {
 async fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str).unwrap_or("serve") {
+        "openai" => return ai_router::openai_auth::operator(&args[1..]).await,
         "mcp-relay" => {
             if args.len() != 2 {
                 return Err("Usage: ai-router mcp-relay <catalogue>".into());
@@ -98,7 +99,7 @@ async fn run() -> Result<(), String> {
         }
         "--help" | "-h" => {
             println!(
-                "ai-router serve | keygen <id> [model|native ...] | monitor [--json|--text] [--range 24h] | mcp-relay <catalogue>"
+                "ai-router serve | openai login|logout|status|accounts|select|resume | keygen <id> [model|native ...] | monitor [--json|--text] [--range 24h] | mcp-relay <catalogue>"
             );
             return Ok(());
         }
@@ -124,10 +125,28 @@ async fn run() -> Result<(), String> {
     let background = state.clone();
     let background_cancel = cancel.clone();
     let background_task = tokio::spawn(async move {
+        let mut retry = 5;
         loop {
-            background.refresh_provider().await;
+            background.refresh_agy().await;
             native::reap(&background).await;
-            tokio::select! {_ = background_cancel.cancelled()=>break,_ = tokio::time::sleep(Duration::from_secs(60))=>{}}
+            let healthy = background.provider.read().await.authenticated;
+            let delay = probe_delay(healthy, &mut retry);
+            tokio::select! {_ = background_cancel.cancelled()=>break,_ = tokio::time::sleep(delay)=>{}}
+        }
+    });
+    // A stalled provider cannot delay publication or recovery of the other.
+    let openai_background = state.clone();
+    let openai_cancel = cancel.clone();
+    let openai_background_task = tokio::spawn(async move {
+        if !openai_background.config.openai_enabled {
+            return;
+        }
+        let mut retry = 5;
+        loop {
+            openai_background.refresh_openai().await;
+            let healthy = openai_background.openai_provider.read().await.authenticated;
+            let delay = probe_delay(healthy, &mut retry);
+            tokio::select! {_ = openai_cancel.cancelled()=>break,_ = tokio::time::sleep(delay)=>{}}
         }
     });
     let listener = tokio::net::TcpListener::bind(&config.bind)
@@ -166,6 +185,7 @@ async fn run() -> Result<(), String> {
     let native_cleaned = native::shutdown(&state).await;
     let drained = state.drain(Duration::from_secs(6)).await;
     background_task.abort();
+    openai_background_task.abort();
     let _ = monitor_task.await;
     shutdown_telemetry.flush().await;
     if drained && native_cleaned {
@@ -194,4 +214,14 @@ fn parse_range(value: &str) -> Result<u64, String> {
         .and_then(|n| n.checked_mul(multiplier))
         .filter(|n| *n > 0 && *n <= 30 * 86400)
         .ok_or_else(|| "Invalid monitor range (1 second to 30 days)".into())
+}
+
+fn probe_delay(healthy: bool, retry: &mut u64) -> Duration {
+    if healthy {
+        *retry = 5;
+        return Duration::from_secs(60);
+    }
+    let delay = (*retry + u64::from(rand::random::<u8>() % 3)).min(60);
+    *retry = retry.saturating_mul(2).min(60);
+    Duration::from_secs(delay)
 }

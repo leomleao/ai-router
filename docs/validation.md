@@ -1,8 +1,86 @@
 # Local validation
 
-Automated tests run in local Docker with synthetic keys/state. Most use an
-explicit fake provider; the pinned official CLI also runs against a loopback
-mock model with external networking disabled.
+## Dual-provider checkpoint (2026-10-20)
+
+The dual-provider implementation has passed deterministic local integration
+validation and cross-review. The production gateway image and isolated
+production smoke checks passed. Clippy completed with three existing style
+warnings (argument count, nested conditional, and a test-only clone). Earlier sections below
+preserve historical AGY-only checkpoints. Authorized local OAuth, discovery,
+and basic live inference passed; the complete O1/O2 acceptance remains partial.
+
+Automated tests run in local Docker with synthetic keys/state. OpenAI uses
+explicit mock services; the pinned official AGY CLI also runs against a loopback
+mock model with external networking disabled. No signed-in provider state was
+used.
+
+### Current integrated evidence
+
+- Rust: 127 library + 25 HTTP + 15 runner tests passed (167 total).
+- Client regressions: 235 OpenAI 3.24.0 TCP/SDK/policy checks passed; 122 n8n
+  Vercel AI 7.0.66 / OpenAI 4.0.20 checks passed.
+- AGY boundary: 109 pinned official AGY 1.4.3 / gateway / MCP checks passed
+  against a loopback mock with synthetic state and networking disabled.
+- Monitor PTY: page navigation, scrolling, pause, range selection, disconnect
+  and recovery, themes, resize, `q`, Ctrl-C, text, and JSON checks passed.
+- Docker policy: loopback binding, nonroot runtime, three separate volumes,
+  OpenAI disabled by default, and synthetic protected-context exclusions passed.
+- `cargo fmt --all -- --check` and `git diff --check` passed.
+- `cargo clippy --locked --all-targets -j 2` completed; three existing style
+  warnings remain, with no build errors.
+- Production image `ai-router:subscription-local` built successfully. With only
+  synthetic tmpfs state and external networking disabled, smoke checks passed
+  for UID 10001, liveness, unavailable-provider readiness, empty model list,
+  schema-v2 capabilities, and operator account status. No existing service or
+  authentication volume was changed.
+
+Final review added regression coverage for coded authentication/server failures
+hiding OpenAI immediately and reasoning-only incomplete stream indexes. It also
+fixed a test-fixture race: a synthetic descendant PID file can exist briefly
+before its writer publishes the number; cancellation checks now wait for a
+complete PID rather than interpreting that empty file.
+
+Local browser setup exposed an idle-connection callback timeout. The listener
+now accepts bounded concurrent connections, ignores expired or unrelated
+requests, and preserves state validation and the overall authorization deadline.
+Three additional synthetic regressions cover preconnects, malformed requests,
+timeout recovery, and reader cleanup. All 157 Rust tests passed after this fix.
+
+Live OpenAI responses exposed two stream differences: missing Content-Type and
+completed tool items omitted from the terminal output array. The adapter now
+validates missing-header streams and reconstructs bounded finished items by
+index and stable ID, rejecting conflicts, gaps, partial arguments, and invalid
+terminals. Review also fixed restriction writes being canceled by request
+deadlines and transient errors replacing durable quota latches. The expanded
+167-test Rust suite passed with these changes; quota tests use synthetic state.
+
+The automated results above establish deterministic local behavior. Live
+evidence is recorded separately below. The full n8n and Hermes applications
+were not run; the client checks above are SDK-shaped compatibility tests.
+
+### Local signed-in Docker smoke (2026-10-20)
+
+The rebuilt production image was started on host-loopback port 8091, preserving
+the existing client digest and AGY/telemetry volumes. AGY 1.4.3 discovered 13
+models. Liveness, readiness, bearer authentication, schema-v2 capabilities,
+and unknown-model rejection passed. Live `gemini-3.8-flash-low` returned
+`ROUTER_OK` through nonstreaming Chat Completions and streaming Responses.
+A live client-tool round trip selected `router_probe`, returned validated
+arguments, accepted the synthetic client result, and produced `ROUTER_TOOL_OK`.
+The operator completed ChatGPT authorization. Discovery added 7 OpenAI model
+IDs alongside the 13 AGY models, with both providers ready and no conflicts.
+Live `gpt-6-luna` passed Chat Completions and Responses in streaming and
+nonstreaming modes, plus locally validated JSON-schema output. Client-tool
+continuation passed through both APIs: one validated `router_probe` call,
+a synthetic client result, and the requested final marker. The rebuilt image
+includes the finished-item reconstruction fix; both provider routes were also
+exercised concurrently.
+The selected session survived container recreation. Actual rotating refresh,
+full installed-client acceptance, and independent integration-category review
+remain outside these local checks. The ephemeral test client digest was removed
+after testing, its key was verified rejected, and the original client digest
+record was verified unchanged. After the final recreation both providers
+recovered their 20-model union and `/health` and `/ready` returned success.
 
 ## AGY 1.4.3 and direct client-tool functions
 

@@ -14,6 +14,7 @@ pub const CLIENT_ITEMS: usize = 1024;
 pub const CLIENT_BYTES: usize = 16 * 1024 * 1024;
 
 struct Entry {
+    scope: Option<String>,
     owner: String,
     id: String,
     item: Value,
@@ -73,7 +74,19 @@ impl ItemStore {
     pub fn save(&self, owner: &str, output: &Value) -> Result<(), ApiError> {
         self.save_at(owner, output, Instant::now())
     }
+    pub fn save_scoped(&self, owner: &str, output: &Value, scope: &str) -> Result<(), ApiError> {
+        self.save_scoped_at(owner, output, Instant::now(), Some(scope))
+    }
     fn save_at(&self, owner: &str, output: &Value, now: Instant) -> Result<(), ApiError> {
+        self.save_scoped_at(owner, output, now, None)
+    }
+    fn save_scoped_at(
+        &self,
+        owner: &str,
+        output: &Value,
+        now: Instant,
+        scope: Option<&str>,
+    ) -> Result<(), ApiError> {
         let items = output
             .get("output")
             .and_then(Value::as_array)
@@ -92,6 +105,7 @@ impl ItemStore {
             let size = size(item)?;
             bytes += size;
             incoming.push(Entry {
+                scope: scope.map(str::to_owned),
                 owner: owner.into(),
                 id: id.into(),
                 item: item.clone(),
@@ -139,12 +153,31 @@ impl ItemStore {
     pub fn resolve(&self, owner: &str, body: &mut Value, max_bytes: usize) -> Result<(), ApiError> {
         self.resolve_at(owner, body, max_bytes, Instant::now())
     }
+    pub fn resolve_scoped(
+        &self,
+        owner: &str,
+        body: &mut Value,
+        max_bytes: usize,
+        scope: &str,
+    ) -> Result<(), ApiError> {
+        self.resolve_scoped_at(owner, body, max_bytes, Instant::now(), Some(scope))
+    }
     fn resolve_at(
         &self,
         owner: &str,
         body: &mut Value,
         max_bytes: usize,
         now: Instant,
+    ) -> Result<(), ApiError> {
+        self.resolve_scoped_at(owner, body, max_bytes, now, None)
+    }
+    fn resolve_scoped_at(
+        &self,
+        owner: &str,
+        body: &mut Value,
+        max_bytes: usize,
+        now: Instant,
+        scope: Option<&str>,
     ) -> Result<(), ApiError> {
         let mut bytes = size(body)?;
         let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
@@ -181,7 +214,7 @@ impl ItemStore {
                 })
                 .ok_or_else(|| ApiError::bad_request("Item reference requires a valid ID"))?;
             // Unknown, expired, evicted and foreign IDs are indistinguishable.
-            let entry = state.entries.iter().find(|e| e.owner == owner && e.id == id)
+            let entry = state.entries.iter().find(|e| e.owner == owner && e.id == id && (e.item["type"] != "reasoning" || e.scope.as_deref() == scope))
                 .ok_or_else(|| ApiError::new(400, "item_reference_not_found", "Referenced item is unavailable; resend full history or start a new conversation"))?;
             bytes = bytes
                 .saturating_sub(size(item)?)
@@ -196,6 +229,39 @@ impl ItemStore {
             *item = entry.item.clone();
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod provider_scope_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn opaque_references_require_same_client_provider_and_registration() {
+        let store = ItemStore::default();
+        let output = json!({"output":[{"id":"rs_synthetic","type":"reasoning","summary":[],"encrypted_content":"synthetic-opaque"}]});
+        store
+            .save_scoped("client-a", &output, "openai:generation-a")
+            .unwrap();
+        for (owner, scope) in [
+            ("client-b", "openai:generation-a"),
+            ("client-a", "agy:agy"),
+            ("client-a", "openai:generation-b"),
+        ] {
+            let mut body = json!({"input":[{"type":"item_reference","id":"rs_synthetic"}]});
+            assert_eq!(
+                store
+                    .resolve_scoped(owner, &mut body, MAX_BYTES, scope)
+                    .unwrap_err()
+                    .code,
+                "item_reference_not_found"
+            );
+        }
+        let mut body = json!({"input":[{"type":"item_reference","id":"rs_synthetic"}]});
+        store
+            .resolve_scoped("client-a", &mut body, MAX_BYTES, "openai:generation-a")
+            .unwrap();
+        assert_eq!(body["input"][0]["encrypted_content"], "synthetic-opaque");
     }
 }
 fn size(value: &Value) -> Result<usize, ApiError> {

@@ -20,6 +20,7 @@ use std::{
 use unicode_width::UnicodeWidthChar;
 
 const PAGES: [&str; 6] = ["Overview", "Usage", "Provider", "Errors", "Events", "Help"];
+const OPENAI_USAGE_URL: &str = "https://chatgpt.com/settings/usage";
 const RANGES: [u64; 4] = [3600, 86400, 604800, 2592000];
 
 struct App {
@@ -395,7 +396,7 @@ fn draw(f: &mut Frame, app: &App, s: &Snapshot) {
         title,
     );
     let names = if area.width < 90 {
-        ["Home", "Usage", "AGY", "Errors", "Events", "Help"]
+        ["Home", "Usage", "Providers", "Errors", "Events", "Help"]
     } else {
         PAGES
     };
@@ -449,17 +450,9 @@ fn draw(f: &mut Frame, app: &App, s: &Snapshot) {
         format!(" {error} · showing last snapshot; retrying every 2s")
     } else {
         format!(
-            " AGY {} · {} · checked {} UTC · age {} · persistence errors {}",
-            s.provider.version,
-            if s.provider.authenticated {
-                "authenticated"
-            } else {
-                "not authenticated"
-            },
-            clock(&s.provider.checked_at),
-            s.provider_age_seconds
-                .map(|n| format!("{n}s"))
-                .unwrap_or_else(|| "unknown".into()),
+            " AGY {} · OpenAI {} · persistence errors {}",
+            provider_state(&s.provider),
+            provider_state(&s.openai_provider),
             s.persistence_errors
         )
     };
@@ -656,6 +649,7 @@ fn ranked(
     area: Rect,
     title: &str,
     counts: &BTreeMap<String, usize>,
+    empty_name: &str,
     offset: usize,
     p: Palette,
 ) {
@@ -666,9 +660,14 @@ fn ranked(
         .into_iter()
         .skip(offset)
         .map(|(name, n)| {
+            let name = if name.trim().is_empty() {
+                empty_name
+            } else {
+                name.as_str()
+            };
             let bar = "█".repeat((n.saturating_mul(12) / max).max(1));
             Row::new(vec![
-                Span::styled(name.clone(), Style::default().fg(p.text)),
+                Span::styled(name.to_owned(), Style::default().fg(p.text)),
                 Span::styled(n.to_string(), Style::default().fg(p.accent)),
                 Span::styled(bar, Style::default().fg(p.info)),
             ])
@@ -700,7 +699,7 @@ fn ranked(
 
 fn usage(f: &mut Frame, area: Rect, s: &Snapshot, app: &App, p: Palette) {
     let [tokens, rankings] =
-        Layout::vertical([Constraint::Length(6), Constraint::Min(0)]).areas(area);
+        Layout::vertical([Constraint::Length(8), Constraint::Min(0)]).areas(area);
     let a = &s.aggregate;
     f.render_widget(
         Paragraph::new(vec![
@@ -725,6 +724,13 @@ fn usage(f: &mut Frame, area: Rect, s: &Snapshot, app: &App, p: Palette) {
             )),
             Line::from("Observed usage only; partial records may omit tokens.")
                 .style(Style::default().fg(p.muted)),
+            Line::from(format!(
+                "Requests by provider: AGY {} · OpenAI {}",
+                a.by_provider.get("agy").copied().unwrap_or(0),
+                a.by_provider.get("openai").copied().unwrap_or(0)
+            )),
+            Line::from(format!("ChatGPT Usage: {OPENAI_USAGE_URL}"))
+                .style(Style::default().fg(p.info)),
         ])
         .block(p.block(" Token usage ")),
         tokens,
@@ -740,6 +746,7 @@ fn usage(f: &mut Frame, area: Rect, s: &Snapshot, app: &App, p: Palette) {
         models,
         "Models by request volume",
         &a.by_model,
+        "No model recorded",
         app.offset,
         p,
     );
@@ -748,6 +755,7 @@ fn usage(f: &mut Frame, area: Rect, s: &Snapshot, app: &App, p: Palette) {
         clients,
         "Clients by request volume",
         &a.by_client,
+        "",
         app.offset,
         p,
     );
@@ -755,93 +763,104 @@ fn usage(f: &mut Frame, area: Rect, s: &Snapshot, app: &App, p: Palette) {
 
 fn quota_lines(s: &Snapshot, p: Palette) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    if let Some(groups) = s
-        .provider
-        .quota
-        .as_ref()
-        .and_then(|q| q.get("groups"))
-        .and_then(|g| g.as_array())
-    {
-        for group in groups {
-            lines.push(
-                Line::from(
-                    group
-                        .get("name")
-                        .and_then(|n| n.as_str())
-                        .unwrap_or("Quota group")
-                        .to_string(),
-                )
-                .style(Style::default().fg(p.info).bold()),
-            );
-            if let Some(buckets) = group.get("buckets").and_then(|b| b.as_array()) {
-                for b in buckets {
-                    let name = b
-                        .get("name")
-                        .or_else(|| b.get("id"))
-                        .and_then(|n| n.as_str())
-                        .unwrap_or("bucket");
-                    let fraction = b
-                        .get("remaining_fraction")
-                        .and_then(|v| v.as_f64())
-                        .filter(|v| v.is_finite())
-                        .map(|v| v.clamp(0.0, 1.0));
-                    let remaining = fraction
-                        .map(|v| {
-                            format!(
-                                "{}{} {:3.0}%",
-                                "█".repeat((v * 20.0).round() as usize),
-                                "░".repeat(20 - (v * 20.0).round() as usize),
-                                v * 100.0
-                            )
-                        })
-                        .unwrap_or_else(|| "unknown".into());
-                    lines.push(Line::from(vec![
-                        Span::raw(format!("  {name}  ")),
-                        Span::styled(
-                            remaining,
-                            Style::default().fg(if fraction.is_some_and(|v| v < 0.2) {
-                                p.warn
-                            } else {
-                                p.good
-                            }),
-                        ),
-                    ]));
-                    if let Some(reset) = b.get("reset_time").and_then(|r| r.as_str()) {
-                        lines.push(
-                            Line::from(format!("  Resets {reset}"))
-                                .style(Style::default().fg(p.muted)),
-                        );
+    for (name, provider) in [("AGY", &s.provider), ("OpenAI", &s.openai_provider)] {
+        let mut had_quota = false;
+        if let Some(groups) = provider
+            .quota
+            .as_ref()
+            .and_then(|q| q.get("groups"))
+            .and_then(|g| g.as_array())
+        {
+            had_quota = true;
+            for group in groups {
+                lines.push(
+                    Line::from(
+                        group
+                            .get("name")
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("Quota group")
+                            .to_string(),
+                    )
+                    .style(Style::default().fg(p.info).bold()),
+                );
+                if let Some(buckets) = group.get("buckets").and_then(|b| b.as_array()) {
+                    for b in buckets {
+                        let name = b
+                            .get("name")
+                            .or_else(|| b.get("id"))
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("bucket");
+                        let fraction = b
+                            .get("remaining_fraction")
+                            .and_then(|v| v.as_f64())
+                            .filter(|v| v.is_finite())
+                            .map(|v| v.clamp(0.0, 1.0));
+                        let remaining = fraction
+                            .map(|v| {
+                                format!(
+                                    "{}{} {:3.0}%",
+                                    "█".repeat((v * 20.0).round() as usize),
+                                    "░".repeat(20 - (v * 20.0).round() as usize),
+                                    v * 100.0
+                                )
+                            })
+                            .unwrap_or_else(|| "unknown".into());
+                        lines.push(Line::from(vec![
+                            Span::raw(format!("  {name}  ")),
+                            Span::styled(
+                                remaining,
+                                Style::default().fg(if fraction.is_some_and(|v| v < 0.2) {
+                                    p.warn
+                                } else {
+                                    p.good
+                                }),
+                            ),
+                        ]));
+                        if let Some(reset) = b.get("reset_time").and_then(|r| r.as_str()) {
+                            lines.push(
+                                Line::from(format!("  Resets {reset}"))
+                                    .style(Style::default().fg(p.muted)),
+                            );
+                        }
                     }
                 }
             }
         }
-    }
-    if lines.is_empty() {
-        lines.push(
-            Line::from("Quota has not been reported by AGY.").style(Style::default().fg(p.muted)),
-        );
+        if !had_quota {
+            lines.push(
+                Line::from(format!("{name} quota has not been reported."))
+                    .style(Style::default().fg(p.muted)),
+            );
+        }
     }
     if !s.provider.models.is_empty() {
         lines.push(Line::from(""));
-        lines.push(Line::from("Available models").style(Style::default().fg(p.info).bold()));
+        lines.push(Line::from("AGY models").style(Style::default().fg(p.info).bold()));
         for model in &s.provider.models {
             lines.push(Line::from(format!("  {} · {}", model.id, model.name)));
         }
     }
+    if !s.openai_provider.models.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from("OpenAI models").style(Style::default().fg(p.info).bold()));
+        for model in &s.openai_provider.models {
+            lines.push(Line::from(format!("  {} · {}", model.id, model.name)));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(
+        Line::from(format!("ChatGPT Usage: {OPENAI_USAGE_URL}")).style(Style::default().fg(p.info)),
+    );
     lines
 }
 
 fn provider(f: &mut Frame, area: Rect, s: &Snapshot, app: &App, p: Palette) {
     let [status, quotas] =
-        Layout::vertical([Constraint::Length(7), Constraint::Min(0)]).areas(area);
-    let mut lines = vec![
+        Layout::vertical([Constraint::Length(8), Constraint::Min(0)]).areas(area);
+    let lines = vec![
         Line::from(format!(
-            "● {}  ·  AGY {}",
-            if s.provider.authenticated {
-                "Authenticated"
-            } else {
-                "Not authenticated"
-            },
+            "● AGY {} · version {}",
+            provider_state(&s.provider),
             s.provider.version
         ))
         .style(
@@ -861,20 +880,32 @@ fn provider(f: &mut Frame, area: Rect, s: &Snapshot, app: &App, p: Palette) {
                 .unwrap_or_else(|| "unknown".into())
         )),
         Line::from(format!(
-            "{} available models · {} active · {} queued",
+            "AGY {} models · OpenAI {} models · {} active · {} queued",
             s.provider.models.len(),
+            s.openai_provider.models.len(),
             s.active,
             s.queued
         )),
+        Line::from(format!(
+            "● OpenAI {} · checked {} · age {}",
+            provider_state(&s.openai_provider),
+            s.openai_provider.checked_at,
+            s.openai_provider_age_seconds
+                .map(|v| format!("{v}s"))
+                .unwrap_or_else(|| "unknown".into())
+        ))
+        .style(Style::default().fg(if s.openai_provider.authenticated {
+            p.good
+        } else {
+            p.muted
+        })),
+        Line::from(format!("ChatGPT Usage: {OPENAI_USAGE_URL}")).style(Style::default().fg(p.info)),
         Line::from(format!(
             "History: {} days / {} events · persistence errors {}",
             s.retention_days, s.max_events, s.persistence_errors
         ))
         .style(Style::default().fg(p.muted)),
     ];
-    if let Some(error) = &s.provider.error {
-        lines.push(Line::from(error.clone()).style(Style::default().fg(p.bad)));
-    }
     f.render_widget(
         Paragraph::new(lines).block(p.block(" Provider status ")),
         status,
@@ -885,6 +916,20 @@ fn provider(f: &mut Frame, area: Rect, s: &Snapshot, app: &App, p: Palette) {
             .block(p.block(" Quota remaining · cached at provider check · ↑↓ scroll ")),
         quotas,
     );
+}
+
+fn provider_state(provider: &crate::protocol::ProviderStatus) -> &str {
+    if provider.authenticated {
+        "ready"
+    } else if let Some(error) = provider.error.as_deref() {
+        match error {
+            "disabled" => "disabled",
+            "provider_not_checked" => "not checked",
+            other => other,
+        }
+    } else {
+        "not authenticated"
+    }
 }
 
 fn errors(f: &mut Frame, area: Rect, s: &Snapshot, app: &App, p: Palette) {
@@ -925,6 +970,7 @@ fn errors(f: &mut Frame, area: Rect, s: &Snapshot, app: &App, p: Palette) {
             codes,
             "Retained failure codes",
             &s.aggregate.by_error,
+            "",
             0,
             p,
         );
@@ -1062,7 +1108,10 @@ fn request_detail_lines(record: &RequestRecord, width: u16, p: Palette) -> Vec<L
     let mut fields = vec![
         (format!("Request ID: {}", record.request_id), p.info),
         (
-            format!("Client: {} · Model: {}", record.client_id, record.model),
+            format!(
+                "Client: {} · Model: {} · Provider: {}",
+                record.client_id, record.model, record.provider
+            ),
             p.text,
         ),
         (format!("Endpoint:   {}", record.endpoint), p.text),
@@ -1314,9 +1363,11 @@ mod tests {
         for i in 0..30 {
             telemetry
                 .record(RequestRecord {
+                    upstream_request_id: None,
                     request_id: format!("req-{i:02}"),
                     client_id: "demo-client".into(),
                     model: "gemini-demo".into(),
+                    provider: "agy".into(),
                     endpoint: "/v1/responses".into(),
                     started_at: (now - chrono::Duration::minutes(i * 3)).to_rfc3339(),
                     duration_ms: 1234,
@@ -1356,6 +1407,34 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn provider_page_shows_both_providers_and_chatgpt_usage_link() {
+        let mut snapshot = fixture().await;
+        snapshot.openai_provider.authenticated = true;
+        snapshot.openai_provider.version = "preview".into();
+        snapshot
+            .openai_provider
+            .models
+            .push(crate::protocol::ModelInfo {
+                id: "gpt-demo".into(),
+                name: "GPT demo".into(),
+            });
+        let mut app = App::new(86400);
+        app.page = 2;
+        let mut terminal = Terminal::new(TestBackend::new(120, 36)).unwrap();
+        terminal.draw(|f| draw(f, &app, &snapshot)).unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(screen.contains("AGY"));
+        assert!(screen.contains("OpenAI ready"));
+        assert!(screen.contains("https://chatgpt.com/settings/usage"));
     }
 
     #[test]
@@ -1413,6 +1492,7 @@ mod tests {
                 "Request ID: req-29",
                 "Client: demo-client",
                 "Model: gemini-demo",
+                "Provider: agy",
                 "/v1/responses",
                 "Started:",
                 "failed",

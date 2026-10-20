@@ -1,11 +1,13 @@
-# Parallel implementation contract
+# Provider implementation interfaces
 
-All modules live in one Rust crate, `ai-router`, with `src/lib.rs` exporting
+Implementation checkpoint: provider seams are present in the current tree;
+integrated validation/review is pending. Operator eligibility and live inference
+remain O1/O2 gates. All modules live in one Rust crate, `ai-router`, with `src/lib.rs` exporting
 `config`, `auth`, `protocol`, `runner`, `relay`, `monitor`, and `api`. Coordinate
 interface changes across modules. Never read protected secret files; use
 synthetic fixtures for validation.
 
-## P1 owner: config.rs, auth.rs, protocol.rs
+## Configuration, authentication, and protocol
 
 `Config::from_env() -> Result<Config, String>` reads environment values directly
 (no dotenv). `Config::for_test(root: &Path) -> Config` uses synthetic key digests.
@@ -14,11 +16,15 @@ Root wraps config in `Arc<Config>`. Public fields:
 ```text
 bind: String (default 0.0.0.0:8080 inside container)
 agy_bin: PathBuf; expected_agy_version: String (1.4.3)
-state_dir: PathBuf; workspace_dir: PathBuf; telemetry_dir: PathBuf
+state_dir: PathBuf; openai_state_dir: PathBuf
+  (default /var/lib/ai-router/openai-auth)
+openai_enabled: bool (false); openai_max_concurrent: usize (2)
+openai_max_queue: usize (8)
+workspace_dir: PathBuf; telemetry_dir: PathBuf
 monitor_socket: PathBuf; keys: Vec<KeyConfig>
 trusted_proxies: Vec<IpAddr>
 max_body_bytes: usize (1 MiB); max_output_bytes: usize (8 MiB)
-max_concurrent: usize (2); max_queue: usize (8)
+max_concurrent: usize (2); max_queue: usize (8) (AGY admission only)
 request_timeout_secs: u64 (120); artifact_ttl_secs: u64 (3600)
 preauth_per_minute: u32 (60); global_preauth_per_minute: u32 (600)
 per_key_per_minute: u32 (30); native_enabled: bool (false)
@@ -95,7 +101,7 @@ include `X-AI-Router-Item-Storage: memory|disabled`. Capabilities expose the
 limits and restart behavior. This does not implement response retrieval,
 `previous_response_id`, provider conversation resume or prompt-cache control.
 
-## P2 owner: runner.rs, relay.rs, tests/fixtures/fake-agy (and runner unit tests)
+## AGY runner and inert relay
 
 `Runner::new(Arc<Config>) -> Runner` (Clone).
 `Runner::start(RunRequest, CancellationToken) -> Result<RunStream, ApiError>`
@@ -134,22 +140,26 @@ fake tool result. Runner must detect that handoff promptly and return ToolCall /
 Completed with partial usage, then kill the process group. Native uses the
 official sandbox, never permission skipping, and is gated by config.
 
-## P3 owner: monitor/, Dockerfile, compose.yaml, .dockerignore, scripts/, docs/operations.md
+## Monitor, Docker, and operator interface
 
 `monitor::Telemetry::open(&Path, retention_days:u64, max_events:usize)
  -> Result<Telemetry,String>`; stores metadata only, bounded retention.
 `async record(&self, RequestRecord)`; `async snapshot(&self) -> Snapshot`;
-`async set_provider(&self, ProviderStatus)`;
+`async set_provider(&self, ProviderStatus)` for legacy AGY status;
+`async set_openai_provider(&self, ProviderStatus)` for OpenAI status;
 `async set_runtime(&self, active:usize, queued:usize)`.
 `note_rejection(&self, code:&str)` synchronously updates six fixed atomic
 counters. Preflight rejection history is sampled at 30 records/minute. These
 counters reset at process start and are distinct from retained-history totals.
 Insertion evicts excess records in O(1); expiration scans run at most once per
 minute, and snapshot aggregation runs outside the records mutex.
-RequestRecord: `request_id:String, client_id:String, model:String, endpoint:String,
+RequestRecord: `request_id:String, client_id:String, model:String, provider:String, endpoint:String,
 started_at:String, duration_ms:u64, startup_ms:Option<u64>, first_output_ms:Option<u64>,
 status:String, error_code:Option<String>, usage:Option<Usage>, usage_partial:bool`.
-Snapshot derives Serialize; includes recent records and aggregate status/usage.
+Older records default `provider` to `agy`. Snapshots keep the legacy `provider`
+field for AGY and add a defaulted `openai_provider`; `Aggregate.by_provider`
+attributes counts to `agy`, `openai`, or `other`. OAuth and encrypted reasoning
+fields are redacted in bounded in-memory request details.
 `async monitor::serve(Arc<Telemetry>, PathBuf, CancellationToken)
  -> Result<(),String>` implements read-only mode-0600 Unix socket. Protocol:
 client writes `snapshot\n`, server writes one JSON snapshot and closes.
@@ -164,7 +174,34 @@ restrictions, do not silently grant full privileges. Scripts never read .env or
 credential files. Operator key setup/login are outside Codex. Docker test build
 must exclude all banned patterns anywhere in context plus target/.git.
 
-## P4 root integration
+## Provider and OpenAI contracts
+
+`providers::ProviderId` is `Agy` or `OpenAi`; routing uses exact model IDs, never
+prefixes. A catalogue snapshot contains available entries and withholds
+duplicate IDs from both providers. It retains at most 4,096 last-known owners
+so a temporarily hidden model reports provider unavailability instead of being
+dispatched elsewhere. Readiness requires an authenticated status checked within
+180 seconds. Provider probes run independently on a 60-second cadence with a
+10-second timeout and 5-to-60-second exponential retry plus jitter. Provider
+metadata admission has a 100 ms lock deadline.
+
+`AI_ROUTER_MAX_CONCURRENT` / `AI_ROUTER_MAX_QUEUE` (2 / 8 by default) bound AGY.
+`AI_ROUTER_OPENAI_MAX_CONCURRENT` / `AI_ROUTER_OPENAI_MAX_QUEUE` (also 2 / 8)
+bound OpenAI. Their active/queued ceilings add together; global input/body and
+request-rate limits are unchanged. OpenAI is disabled unless
+`AI_ROUTER_OPENAI_ENABLED=true`. Native execution is AGY-only and remains off
+whenever OpenAI is enabled, until its state-volume denial is verified.
+
+OpenAI uses the public Responses API with `store:false` and `stream:true` for
+both gateway streaming modes. It preserves supported Responses `additional_tools`
+developer items and may return multiple function calls; the server never runs
+client tools. Encrypted reasoning items remain provider-provenanced in the local
+Responses item store. OpenAI Chat replay is a separate owner-scoped, memory-only
+cache: 24 hours, 16 MiB per client, 64 MiB globally, and 4,096 entries; it clears
+on restart. These account and transport capabilities remain unverified against
+a live subscription until operator O1/O2.
+
+## Gateway integration
 
 Authenticate/limit requests before normalisation/runner. Cache actual provider
 probe results; no catalog/quota subprocess per HTTP call. Shared event-to-SSE

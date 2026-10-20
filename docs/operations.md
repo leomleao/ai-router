@@ -83,11 +83,86 @@ volume concurrently. Before claiming persistent login support, verify fresh
 processes, container restart, and container recreation on the actual Linux
 image. A successful host macOS login does not prove these cases.
 
+### OpenAI subscription access
+
+OpenAI subscription routing is opt-in and defaults off. It is intended for an
+operator's personal/local open-source tools and a self-hosted open-source VM
+deployment. Before enabling it, the operator must verify that their account and
+integration category are eligible under the current [OpenAI plan usage
+guidance](https://developers.openai.com/siwc/token-sharing-open-source). The
+ChatGPT subscription's usage limits still apply; this does not provide an
+unlimited allowance or shared access for other users. Review current ChatGPT
+Usage in the account before resuming after a usage limit.
+
+Build the gateway image, then complete OAuth with the dedicated OpenAI volume.
+The helper listens on its container interface so Docker can forward the OAuth
+callback, while the host publishes that port only on loopback:
+
+```sh
+docker build -t ai-router:local .
+./scripts/openai.sh login
+```
+
+The browser uses the documented loopback redirect. When the helper runs on a
+remote VM, `127.0.0.1` in that redirect refers to the browser computer, so open
+an SSH local forward from that computer and run the helper on the VM through
+the SSH session. Keep the tunnel open until login finishes:
+
+```sh
+ssh -L 1455:127.0.0.1:1455 USER@SERVER
+cd /path/to/ai-router
+./scripts/openai.sh login
+```
+
+Override the default port 1455 with `AI_ROUTER_OPENAI_CALLBACK_PORT` or
+`--port N`. If local port 1455 is occupied, use the same alternate port on both
+sides, for example `ssh -L 2468:127.0.0.1:2468 USER@SERVER` and
+`./scripts/openai.sh login --port 2468`. Use `--new` to create a registration,
+or `--account ID` to log in to a saved registration. The helper runs as UID
+10001 and mounts only `ai-router-openai-auth`; Docker publishes its callback on
+host loopback only. Keep the gateway stopped while `login`, `select`, `logout`,
+or `resume` changes account state; the script checks this condition and starts
+a one-off helper. The gateway owns token refresh while it is running.
+
+```sh
+AI_ROUTER_OPENAI_ENABLED=true docker compose --env-file /dev/null up -d
+./scripts/openai.sh accounts
+./scripts/openai.sh status
+```
+
+`accounts` and `status` query the running gateway. To select a saved account,
+stop the service, then run `./scripts/openai.sh select ACCOUNT_ID` and start it
+again. `logout` revokes/removes the selected session according to the CLI's
+reported result; `resume` explicitly retries a provider that was paused after a
+usage limit, after the operator reviews ChatGPT Usage. Login, selection,
+logout, and resume do not change the OpenAI enable flag. Set
+`AI_ROUTER_OPENAI_ENABLED=true` in the starting shell to enable it:
+
+```sh
+AI_ROUTER_OPENAI_ENABLED=true docker compose --env-file /dev/null up -d
+```
+
+`AI_ROUTER_OPENAI_MAX_CONCURRENT` and `AI_ROUTER_OPENAI_MAX_QUEUE` default to
+2 and 8. OpenAI's state path defaults to `/var/lib/ai-router/openai-auth` and
+must remain separate from AGY authentication, workspaces, telemetry, and the
+monitor socket. OpenAI configuration or authorization failures leave AGY
+available; OpenAI models are exposed only when that provider is ready.
+
+For rollback, set `AI_ROUTER_OPENAI_ENABLED=false` (or unset it) and recreate
+the service. AGY continues to use `ai-router-auth`; disabling OpenAI preserves
+its dedicated volume for a later operator-managed login. Do not remove Docker
+volumes unless you intend to erase their provider state. O1/O2 live acceptance
+requires operator authorization. An explicitly authorized local Docker test may
+use the normal gateway/helper flow with signed-in runtime state; no raw token
+files are inspected or copied. Record only sanitized outcomes, and never provide
+tokens or credential files to an agent.
+
 ## Storage and permissions
 
 | Location | Lifecycle | Contents |
 | --- | --- | --- |
 | Named volume `ai-router-auth` | Persists through container replacement | AGY-owned login and CLI state |
+| Named volume `ai-router-openai-auth` | Persists through container replacement | OpenAI OAuth registrations and selected account state; isolated from AGY |
 | Named volume `ai-router-telemetry` | Persists through container replacement | Router request metadata, bounded to 30 days and 50,000 events |
 | `/run/ai-router/workspaces` on tmpfs | Disappears when the container stops | Request workspaces, uploads, temporary artifacts |
 | `/run/ai-router/monitor.sock` on tmpfs | Disappears when the container stops | Private read-only monitor socket, mode 0600 |
@@ -330,10 +405,13 @@ build-context checks with freshly created synthetic dummy files. It passes
 the Docker build. It never opens real credential files.
 
 Deterministic tests use an explicit synthetic fake AGY executable. They cover
-contracts and failure handling without invoking the signed-in host CLI. Real
-AGY authentication, subscriptions, CLI streaming/schema/tool handoffs, n8n and
-Hermes application behaviour, and native containment are distinct acceptance
-checks. Until each real check passes, capabilities must identify it as pending.
+contracts and failure handling without invoking signed-in runtime state. The
+authorized local runtime check passed OAuth/discovery for 7 OpenAI and 13 AGY
+models, persistence across container recreation, AGY round trips, all four
+OpenAI Chat/Responses streaming modes, Chat and Responses tool continuations,
+and validated JSON schema. Real rotating refresh, full installed-client
+behaviour (including full n8n/Hermes application flows), and native containment
+checks remain pending until separately verified.
 
 The authenticated local evaluation now passes both API styles, both streams,
 both schema formats and client-tool loops on Gemini, plus Claude text after

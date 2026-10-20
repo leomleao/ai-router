@@ -14,6 +14,13 @@ dummy_env.update({
     "AI_ROUTER_PORT": "8090",
     "AI_ROUTER_TRUSTED_PROXIES": "",
 })
+for name in (
+    "AI_ROUTER_OPENAI_ENABLED",
+    "AI_ROUTER_OPENAI_STATE_DIR",
+    "AI_ROUTER_OPENAI_MAX_CONCURRENT",
+    "AI_ROUTER_OPENAI_MAX_QUEUE",
+):
+    dummy_env.pop(name, None)
 config = json.loads(subprocess.check_output(
     ["docker", "compose", "--env-file", "/dev/null", "-f", str(repo / "compose.yaml"),
      "config", "--format", "json"], env=dummy_env, text=True))
@@ -30,8 +37,14 @@ assert service["ports"][0]["host_ip"] == "127.0.0.1"
 assert service["ports"][0]["published"] == "8090"
 assert all(mount["type"] == "volume" for mount in service["volumes"])
 assert {mount["target"] for mount in service["volumes"]} == {
-    "/var/lib/ai-router/auth", "/var/lib/ai-router/telemetry"}
+    "/var/lib/ai-router/auth", "/var/lib/ai-router/openai-auth",
+    "/var/lib/ai-router/telemetry"}
 assert service["environment"]["AI_ROUTER_NATIVE_ENABLED"] == "false"
+assert service["environment"]["AI_ROUTER_OPENAI_ENABLED"] == "false"
+assert service["environment"]["AI_ROUTER_OPENAI_STATE_DIR"] == "/var/lib/ai-router/openai-auth"
+openai_helper = (repo / "scripts/openai.sh").read_text()
+assert '"127.0.0.1:$port:$port"' in openai_helper
+assert "ai-router-openai-auth" in openai_helper
 
 image = "ai-router-context-policy:" + uuid.uuid4().hex
 with tempfile.TemporaryDirectory(prefix="ai-router-context-policy-") as tmp:

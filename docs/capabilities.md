@@ -1,5 +1,12 @@
 # Capability matrix
 
+Dual-provider deterministic checkpoint: OpenAI configuration, routing,
+OAuth/session lifecycle, Responses transport, registry, telemetry, and operator
+commands passed local Rust/client/monitor/Docker-policy validation and
+cross-review. Clippy and the production image build are still running. No O1/O2
+live subscription acceptance has been performed, so account eligibility and
+real inference remain unverified.
+
 The installed CLI pin is **1.4.3**. Authenticated Linux acceptance evidence
 currently covers **1.2.15**; live 1.4.3 acceptance is an operator gate.
 Capabilities are not inferred from the OpenAI endpoint catalogue. The official
@@ -12,6 +19,11 @@ authentication, quota or real model selection behavior.
 
 | Feature | HTTP surface | Current evidence / boundary |
 | --- | --- | --- |
+| Provider selection | `/v1/models`, Chat, Responses | Exact discovered model IDs route to their registered provider; no model substitution or billing fallback. AGY and OpenAI readiness/catalogues are independent. Deterministic integration checks passed locally; live acceptance pending |
+| OpenAI opt-in and OAuth | Operator `ai-router openai` commands | `AI_ROUTER_OPENAI_ENABLED` defaults false; dedicated `ai-router-openai-auth` state. Synthetic lifecycle checks and Docker policy passed; eligibility and live inference remain unverified (O1/O2 pending) |
+| OpenAI Responses tools | Chat and Responses client-tool loops | OpenAI Responses can return multiple function calls and supported `additional_tools` developer items; gateway does not execute client tools. Deterministic integration validation passed locally; live acceptance pending |
+| OpenAI reasoning replay | Responses local item store; Chat replay cache | Encrypted reasoning items retain provider state for replay. OpenAI Chat cache is owner-scoped, memory-only, 24-hour TTL, 16 MiB/client, 64 MiB/global, 4,096 entries; restart clears it. Deterministic bounds/ownership/replay checks passed locally |
+| Provider admission | Gateway request routes | Existing `AI_ROUTER_MAX_CONCURRENT`/`AI_ROUTER_MAX_QUEUE` remain AGY budgets; OpenAI has separate defaults 2/8. Total active and queued ceiling is the sum. Body/rate limits stay global |
 | Model catalogue | `/v1/models` | Authenticated Linux AGY 1.2.15 exposes 14 account model IDs; discovered catalogue is not proof every model supports every feature |
 | Quota/reset windows | Capabilities/private monitor | Authenticated Linux `/quota` metadata verified; cached freshness and reset windows reported |
 | Text generation | Chat and Responses | Real SDK checks passed on gemini-3.8-flash-low; claude-sonnet-4-6 Chat text passed after restart |
@@ -39,8 +51,10 @@ authentication, quota or real model selection behavior.
 | Embeddings/Realtime/batches/fine-tuning | None | No demonstrated CLI backend; unsupported endpoint errors |
 
 Native limitations: its API is implemented and fixture-tested, but public
-native execution remains disabled. The current container restrictions may
-prevent OS sandbox creation. Enabling native requires real canary tests,
+native execution remains disabled. Native stays disabled whenever OpenAI is
+enabled until containment verifies AGY and native processes cannot read the
+OpenAI volume. With OpenAI disabled, the existing native gate applies. The
+current container restrictions may prevent OS sandbox creation. Enabling native requires real canary tests,
 including auth-home denial, other-request workspace/temp denial, command
 containment, and cancellation of language servers/subagents that may create
 their own process groups. Failure keeps native disabled.
