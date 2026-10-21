@@ -894,7 +894,8 @@ async fn generate_body(
     // From here the request is valid, so its disclosures describe every
     // response, including provider failures before or after a stream commits.
     let mut disclosures = disclosure_headers(&request.ignored);
-    if let Some(mode) = apply_effort_policy(&state, selected, fallback.is_some(), &mut request).await
+    if let Some(mode) =
+        apply_effort_policy(&state, selected, fallback.is_some(), &mut request).await
     {
         disclosures.push(("x-ai-router-reasoning-effort", mode));
     }
@@ -1121,7 +1122,10 @@ fn settle_stream_event(
                 response_object(&out.completion_id, out.created, &out.model, result, true),
                 &out.metadata,
             );
-            if let Err(error) = state.items.save_scoped(&out.owner, &output, &out.item_scope) {
+            if let Err(error) = state
+                .items
+                .save_scoped(&out.owner, &output, &out.item_scope)
+            {
                 event = RunEvent::Error(error);
             }
         }
@@ -1182,6 +1186,7 @@ fn disclosure_headers(ignored: &[String]) -> Vec<(&'static str, String)> {
 ///    An exact ID's conflict is still rejected by the adapter.
 /// 3. OpenAI `minimal` that the catalogue does not list -> `mapped=<level>`,
 ///    the lowest listed level above it.
+///
 /// Anything else reaches the provider unchanged, without the header.
 async fn apply_effort_policy(
     state: &AppState,

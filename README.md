@@ -24,8 +24,9 @@ flowchart LR
 ```
 
 Both providers have separate account state, readiness, admission limits, and
-failure handling. A provider outage does not reroute a request to another
-provider. Client tools are returned to the client after schema validation; the
+failure handling. A provider outage does not reroute a request for a known
+model ID to another provider; only a never-served ID's fallback target can
+change. Client tools are returned to the client after schema validation; the
 client executes them and sends results in later history. Forced (`required`),
 named and `allowed_tools` choices narrow the tool inventory and fail closed when
 the model answers without a call. Media input and native execution are not supported.
@@ -98,6 +99,14 @@ Positive Chat `max_tokens` / `max_completion_tokens` and Responses
 The router preserves actual usage and keeps the legacy `agy_usage_partial`
 field alongside `ai_router_usage_partial` until a separately versioned API
 change. Neither provider is promised to enforce an output-token cap.
+
+Hints that common SDKs send by default but the router cannot act on (sampling
+settings, `metadata`, `user`, effort `none`/`minimal` on Antigravity and
+similar) are accepted, have no effect, and are named in `X-AI-Router-*` headers
+on every response to that request, streamed or not. Active controls stay
+rejected. Errors carry `x-should-retry`/`retry-after` guidance, and a stream
+fails with a real HTTP error until its first output. See
+[capabilities](docs/capabilities.md).
 
 ## Operations and design notes
 

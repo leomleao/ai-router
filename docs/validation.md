@@ -3,7 +3,94 @@
 The subsequent [n8n compatibility regression review](n8n-compatibility.md) records
 the schema fix, diagnostic privacy checks, restored CLI coverage, and separate
 Vercel/LangChain client matrices. Historical counts below describe the earlier
-implementation baseline.
+implementation baseline. Each 2026-10-21 compatibility section after the
+integration section records the run on that change's own branch, against the
+203-test `main` baseline; the integration section has the combined counts.
+
+## Compatibility integration (2026-10-21)
+
+Branch `compat-integration` merges the four audit fixes into `main` (6b0ffaf)
+with `--no-ff` merges, in order: accept-and-disclose bundle, streaming errors,
+model fallback, forced tool choice. Every test from every branch was kept. Only
+two expectations changed, both because of a reconciliation decision below: the
+fallback effort header value (`medium` became `mapped=medium`), and the forced
+tool-choice stream case, which now expects an HTTP 502 instead of a committed
+stream.
+
+Reconciliation decisions:
+
+- **One effort story.** `apply_effort_policy` makes the single effort decision
+  against the served model, after fallback, and emits at most one
+  `X-AI-Router-Reasoning-Effort` value. Precedence: Antigravity `none`/`minimal`
+  give `ignored`, a fallback-served Antigravity tier gives `mapped=<tier>`, and
+  OpenAI unlisted `minimal` gives `mapped=<level>`. Anything else is forwarded
+  without the header, and an exact Antigravity ID's conflicting effort is
+  still a 400. The fallback tier previously used a bare `<tier>` value; it now
+  shares the `mapped=` form.
+- **One disclosure path.** Disclosures are recorded on the request context once
+  it validates. The protect middleware adds them to every response for that
+  request: nonstreaming, streamed, failed before stream commit, or failed.
+  Before this, only successes carried them, except the fallback headers.
+  `X-AI-Router-Model-Fallback` is recorded before validation, as before.
+- **Stream commit on first output.** A stream commits on its first
+  client-visible output (delta, call or terminal result), never before
+  `Init`, and at most 15 s after the request starts streaming. A withheld
+  schema result that fails validation and a missing required tool call are
+  therefore real HTTP errors, like nonstreaming, instead of `response.failed`
+  after a 200.
+- **Errors.** Pre-commit errors are ordinary `ApiError` responses, so they
+  carry `x-should-retry`/`retry-after`, the disclosures and `param`.
+  `missing_required_tool_call` is deterministic (`x-should-retry: false`) and
+  names `param:"tool_choice"`. Stream `error` events now carry the error's
+  `param` instead of a fixed `null`. `ApiError::new` remains the only
+  constructor.
+- **Capabilities.** `profiles.model` gained `stream_commit` and
+  `disclosure_headers`. `reasoning_effort` gained the header, its values and
+  the fallback rule. `tool_choice` gained the missing-call error shape.
+  `unsupported` lists `active_sampling_controls` and no longer lists
+  `forced_tool_choice`.
+
+New integration tests in `src/api_contract_tests.rs` cover the following:
+
+- Studio's `gpt-5.4-nano` with effort `none` reaches the OpenAI target, with
+  `none` forwarded and no effort header. `minimal` maps to `low`. With only
+  Antigravity live, `none`/`minimal` give `ignored`, `high` gives
+  `mapped=medium` and `medium` gives no header, on both APIs and both modes.
+- Fallback-served overload, quota and Antigravity transient failures carry
+  identical status, body, retry headers and disclosures streamed and
+  nonstreamed.
+- Committed streams carry the nonstreaming disclosure set, both on success and
+  on failure after partial output.
+- `missing_required_tool_call` is a 502 with `x-should-retry: false` and
+  `param` before commit. After a commit forced by the wait bound, it is an
+  `error` event (with `param`) followed by `response.failed` or `[DONE]`.
+
+The Docker test stage (`ai-router-test:compat-integration`) passed 230 Rust
+tests: the 203 on `main`, 10 + 5 + 4 + 4 from the four branches, and 4
+integration tests. It also passed 144 official SDK checks per model, 170 n8n
+Vercel checks per model, 44 Studio checks per provider, 38 LangChain checks
+per model, the 36 streamed-failure client runs, the monitor PTY checks and 5
+login checks.
+
+The audit probe harness replayed all 164 case bodies, with the fallback
+targets mapped onto fixture IDs because the fixture catalogue has no
+`gpt-6-luna`. 51 cases moved from failure to success and 6 changed failure
+mode. None regressed. Of the 73 cases still failing:
+
+- 14 are fixture artifacts. 9 are `invalid_structured_output` from the
+  fixed-text mock, and 5 are later OpenAI cases masked by the overload latch,
+  which all pass when replayed alone.
+- 3 are the intended overload fixtures. They are now 503 with
+  `retry-after: 30` for streams too.
+- The rest are deliberate rejections or out-of-scope surfaces: hosted tools
+  and other `include` values, media, active sampling controls,
+  `previous_response_id`/`conversation`/`background`/`prompt`, non-neutral
+  verbosity, legacy Chat fields, unsupported endpoints, and auth/transport
+  negatives.
+- Two remain real gaps under the strict exact-ID effort rule: an explicit
+  effort that conflicts with an exact Antigravity ID.
+
+No live provider, server or deployment was used.
 
 ## Accept-and-disclose compatibility bundle (2026-10-21)
 
@@ -65,7 +152,8 @@ then reported upstream overload, quota and authentication failures only as
 Python SDK ignore that event, so the failure produced an empty answer.
 
 A stream now commits its 200 only after the provider's first event (`Init`,
-after accepted upstream headers). Earlier failures return the nonstreaming
+after accepted upstream headers); the integration later moved the commit to
+the first client-visible output. Earlier failures return the nonstreaming
 status, body and headers. The commit wait is bounded at 15 seconds, the existing
 keepalive interval; a provider still silent then gets a committed stream, as
 before. After commit, a Responses failure emits the spec `error` event
@@ -110,8 +198,8 @@ IDs are never remapped, so a known model's outage still reports
 `provider_unavailable`. `X-AI-Router-Model-Fallback: <requested> -> <served>`
 discloses each mapping, response bodies report the served ID, and monitor records
 keep the sanitized requested ID. For an Antigravity target, a different client
-effort yields to the ID's tier with `X-AI-Router-Reasoning-Effort` instead of the
-exact-ID conflict error. `AI_ROUTER_MODEL_FALLBACK=false` restores strict
+effort yields to the ID's tier with `X-AI-Router-Reasoning-Effort` (`mapped=<tier>`
+since the integration) instead of the exact-ID conflict error. `AI_ROUTER_MODEL_FALLBACK=false` restores strict
 behaviour; both targets are configurable and validated at startup.
 
 HTTP contract tests cover both APIs, streamed and nonstreamed, with the fixture
@@ -149,7 +237,8 @@ combined with a structured output format return `400 invalid_request` with
 `forced_tool_choice_client_bodies_call_the_selected_tool_or_fail_closed`
 replays the Twenty, n8n and LangChain bodies, plus `allowed_tools`, against
 both provider fixtures, streamed and nonstreamed. It also covers the
-fail-closed path (no text deltas, `response.failed` or a Chat `error` event),
+fail-closed path (no text deltas; on this branch `response.failed` or a Chat
+`error` event, and since the integration an HTTP 502 before stream commit),
 a call outside `allowed_tools`, and the 400 cases. The fixture models call the
 first offered tool only when forcing reaches them, so each call also proves
 the narrowed inventory. Wire tests check the OpenAI `tool_choice` field, the

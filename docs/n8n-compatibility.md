@@ -16,6 +16,8 @@ execution. They do not launch an installed n8n instance or call signed-in models
 | Multi-turn agent conversations | Text and function replay, stored item references, store omitted/true/false, owner isolation, out-of-order parallel results | Both SDK suites and `src/api_contract_tests.rs` |
 | Both public APIs | Chat Completions and Responses, streaming and nonstreaming, terminal events, IDs, usage and JSON output | All three SDK suites |
 | Force Tool Call on First Iteration | `tool_choice:"required"` returns a validated call or fails closed with `missing_required_tool_call` | `sdk_contract.py`, `src/api_contract_tests.rs` |
+| Chat Model options (temperature, metadata, service tier, safety identifier, truncation) | Range-checked, ignored and named in `X-AI-Router-Sampling-Controls`/`X-AI-Router-Ignored-Fields` | `sdk_contract.py`, `src/api_contract_tests.rs` |
+| Streaming agents on a failing provider | Overload, quota and authentication before the first output are HTTP errors with retry guidance; later failures are an `error` event with a top-level `error` object, which LangChain raises | `n8n_contract.mjs`, `n8n_langchain_contract.mjs`, `sdk_contract.py` |
 | Unsupported features | Active sampling/verbosity, custom/hosted tool choices, hosted tools, unknown controls, legacy Assistants endpoints | Official SDK negative checks and protocol tests |
 
 Pins are `ai@7.0.66`, `@ai-sdk/openai@4.0.20`,
@@ -115,6 +117,10 @@ public errors, ApiError serialization/Debug, and persisted telemetry. Inspect
 still retained. Restart/eviction clears that capture.
 
 ## Results and limits
+
+These are the 2026-10-20 review's counts. The current combined counts (230
+Rust tests; 144 official SDK, 170 Vercel and 38 LangChain checks per profile)
+are in the [validation](validation.md) integration section.
 
 - 190 Rust tests passed.
 - 250 official Python SDK assertions passed (125 per Gemini/Claude profile).
