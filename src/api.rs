@@ -263,6 +263,21 @@ impl AppState {
         resolved
     }
 
+    /// Map an ID the registry has never served onto a configured target.
+    async fn fallback_model(&self, requested: &str) -> Option<String> {
+        if !self.config.model_fallback {
+            return None;
+        }
+        self.snapshot()
+            .await
+            .fallback(
+                requested,
+                &self.config.fallback_openai_model,
+                &self.config.fallback_gemini_model,
+            )
+            .map(str::to_owned)
+    }
+
     async fn runtime(&self) {
         self.telemetry
             .set_runtime(
@@ -394,8 +409,45 @@ pub fn error(status: u16, code: &str, message: &str) -> ApiError {
 pub struct RequestContext {
     pub id: String,
     selection: std::sync::Mutex<Option<(String, String)>>,
+    fallback: std::sync::Mutex<Option<ModelFallback>>,
     pub started: Instant,
     pub recorded: AtomicBool,
+}
+
+/// A served substitute for an unknown requested model, disclosed on every
+/// response. `requested` is already bounded to a header- and log-safe ID.
+#[derive(Clone)]
+struct ModelFallback {
+    requested: String,
+    served: String,
+    effort: Option<String>,
+}
+impl ModelFallback {
+    fn new(requested: &str, served: &str) -> Self {
+        let requested: String = requested
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || "._:/-".contains(*c))
+            .take(128)
+            .collect();
+        Self {
+            requested: if requested.is_empty() {
+                "invalid".into()
+            } else {
+                requested
+            },
+            served: served.into(),
+            effort: None,
+        }
+    }
+    fn disclose(&self, response: &mut Response) {
+        let headers = response.headers_mut();
+        if let Ok(value) = format!("{} -> {}", self.requested, self.served).parse() {
+            headers.insert("x-ai-router-model-fallback", value);
+        }
+        if let Some(effort) = self.effort.as_deref().and_then(|e| e.parse().ok()) {
+            headers.insert("x-ai-router-reasoning-effort", effort);
+        }
+    }
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -546,6 +598,7 @@ async fn protect(
     }
     let context = Arc::new(RequestContext {
         selection: std::sync::Mutex::new(None),
+        fallback: std::sync::Mutex::new(None),
         id: Uuid::new_v4().to_string(),
         started: Instant::now(),
         recorded: AtomicBool::new(false),
@@ -561,6 +614,10 @@ async fn protect(
     request.extensions_mut().insert(key);
     request.extensions_mut().insert(context.clone());
     let mut response = next.run(request).await;
+    let fallback = context.fallback.lock().unwrap().clone();
+    if let Some(fallback) = &fallback {
+        fallback.disclose(&mut response);
+    }
     if response.status().as_u16() >= 400 && !context.recorded.load(Ordering::Relaxed) {
         let selection = context.selection.lock().unwrap().clone();
         state
@@ -576,6 +633,7 @@ async fn protect(
                     .as_ref()
                     .map(|(_, model)| model.clone())
                     .unwrap_or_default(),
+                requested_model: fallback.map(|fallback| fallback.requested),
                 provider: selection
                     .as_ref()
                     .map(|(provider, _)| provider.clone())
@@ -613,6 +671,7 @@ async fn rejection_response(state: &AppState, e: ApiError) -> Response {
                 request_id: Uuid::new_v4().to_string(),
                 client_id: "rejected".into(),
                 model: String::new(),
+                requested_model: None,
                 provider: "unknown".into(),
                 endpoint: "authentication".into(),
                 started_at: Utc::now().to_rfc3339(),
@@ -663,6 +722,9 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> Json<Value> {
             "prompt_cache_controls":{"mode":"ignored","retention_guarantee":false},
             "responses_include":["reasoning.encrypted_content"],
             "reasoning_summary":{"mode":"unavailable","accepted":["auto","concise","detailed"]},
+            "model_fallback":{"enabled":state.config.model_fallback,"applies_to":"model_ids_never_served","exact_ids_win":true,"listed_in_models":false,
+                "gemini_prefix_target":state.config.fallback_gemini_model,"default_target":state.config.fallback_openai_model,"unavailable_target":"other_target","neither_available":"model_not_found",
+                "disclosure_header":"x-ai-router-model-fallback","antigravity_effort":"served_model_tier","effort_disclosure_header":"x-ai-router-reasoning-effort"},
             "item_references":{"enabled":true,"storage":"memory","default_store":true,"ttl_seconds":items::TTL_SECONDS,"max_items":items::MAX_ITEMS,"max_bytes":items::MAX_BYTES,"per_client_items":items::CLIENT_ITEMS,"per_client_bytes":items::CLIENT_BYTES,"cleared_on_restart":true}}},
         "providers":{
             "agy":{"enabled":state.config.antigravity_enabled,"ready":snapshot.entries.iter().any(|e|e.provider==ProviderId::Agy),"adapter":agy.version,"baseline":crate::antigravity_auth::BASELINE_REVISION,"checked_at":agy.checked_at,"error":agy.error,"quota":agy.quota,"transport":"direct","fallback":false,"release_advisory":release},
@@ -778,10 +840,21 @@ async fn generate_body(
     mut body: Value,
     responses: bool,
 ) -> Result<Response, ApiError> {
-    let model_id = body
+    let requested = body
         .get("model")
         .and_then(Value::as_str)
-        .ok_or_else(|| ApiError::bad_request("model must be a string"))?;
+        .ok_or_else(|| ApiError::bad_request("model must be a string"))?
+        .to_owned();
+    let mut fallback = state
+        .fallback_model(&requested)
+        .await
+        .map(|served| ModelFallback::new(&requested, &served));
+    if let Some(fallback) = &fallback {
+        // The response body reports the served ID, as OpenAI does for snapshots.
+        body["model"] = json!(fallback.served);
+        *context.fallback.lock().unwrap() = Some(fallback.clone());
+    }
+    let model_id = fallback.as_ref().map_or(requested.as_str(), |f| &f.served);
     let selected = state.resolve_model(model_id).await?;
     *context.selection.lock().unwrap() = Some((selected.as_str().into(), model_id.to_owned()));
     let pinned_generation = Some(match selected {
@@ -816,6 +889,16 @@ async fn generate_body(
     request.owner = key.id.clone();
     request.endpoint = if responses { "responses" } else { "chat" }.into();
     request.provider_generation = pinned_generation.clone();
+    if let Some(fallback) = fallback.as_mut().filter(|_| selected == ProviderId::Agy) {
+        // Antigravity wire IDs fix the effort tier. A client's effort was chosen
+        // for the model it asked for, so the served tier wins and is disclosed.
+        let tier = request.model.rsplit('-').next().map(str::to_owned);
+        if request.effort.is_some() && request.effort != tier {
+            request.effort = None;
+            fallback.effort = tier;
+            *context.fallback.lock().unwrap() = Some(fallback.clone());
+        }
+    }
     let started = context.started;
     let admission = state.admit_provider(selected).await?;
     if state.resolve_model(&request.model).await? != selected {
@@ -843,6 +926,7 @@ async fn generate_body(
         json!({
             "event":"model_request", "request_id":id,
             "endpoint":if responses { "responses" } else { "chat" }, "model":model,
+            "requested_model":fallback.as_ref().map(|f| &f.requested),
             "provider":selected.as_str(),
             "input_item_count":request.input.len(),
             "input_bytes":serde_json::to_vec(&request.input).map_or(0,|v|v.len()),
@@ -875,6 +959,7 @@ async fn generate_body(
         admission,
     );
     guard.record.provider = selected.as_str().into();
+    guard.record.requested_model = fallback.map(|f| f.requested);
     let completion_id = format!("{}{}", if responses { "resp_" } else { "chatcmpl_" }, id);
     let created = Utc::now().timestamp();
     if !streaming {
@@ -1053,6 +1138,7 @@ impl CompletionGuard {
                 request_id,
                 client_id,
                 model,
+                requested_model: None,
                 provider: "agy".into(),
                 endpoint: endpoint.into(),
                 started_at: Utc::now().to_rfc3339(),
@@ -1607,6 +1693,9 @@ mod tests {
             Self::with_timeout(5).await
         }
         async fn with_timeout(timeout_seconds: u64) -> Self {
+            Self::configured(|config| config.request_timeout_secs = timeout_seconds).await
+        }
+        async fn configured(adjust: impl FnOnce(&mut Config)) -> Self {
             let root = tempfile::tempdir().unwrap();
             let mut config = Config::for_test(root.path());
             config.openai_enabled = true;
@@ -1616,10 +1705,11 @@ mod tests {
                 sha256: format!("{:x}", Sha256::digest(b"other-test-key")),
                 scopes: vec!["model".into()],
             });
-            config.request_timeout_secs = timeout_seconds;
+            config.request_timeout_secs = 5;
             config.preauth_per_minute = 10000;
             config.global_preauth_per_minute = 10000;
             config.per_key_per_minute = 10000;
+            adjust(&mut config);
             let config = Arc::new(config);
             let captured = Arc::new(tokio::sync::Mutex::new(Vec::new()));
             let model_mode = Arc::new(AtomicUsize::new(0));

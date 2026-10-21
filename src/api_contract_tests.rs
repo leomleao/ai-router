@@ -441,3 +441,224 @@ async fn studio_store_false_reasoning_tool_turns_round_trip_on_both_providers() 
     );
     assert_eq!(profile["reasoning_summary"]["mode"], "unavailable");
 }
+
+// Supabase Studio hard-codes OpenAI IDs that the live catalogue may not
+// advertise. Unseen IDs are served by a configured exact target and disclosed.
+async fn fallback_harness(adjust: impl FnOnce(&mut Config)) -> Harness {
+    DualHarness::configured(|config| {
+        config.fallback_openai_model = "synthetic-openai".into();
+        config.fallback_gemini_model = MODEL.into();
+        adjust(config);
+    })
+    .await
+}
+struct Served {
+    status: StatusCode,
+    fallback: Option<String>,
+    effort: Option<String>,
+    models: Vec<Value>,
+    body: Value,
+    request_id: String,
+}
+async fn serve(harness: &Harness, path: &str, model: &str, extra: Value) -> Served {
+    let streaming = extra["stream"] == true;
+    let mut body = if path.ends_with("completions") {
+        json!({"model":model,"messages":[{"role":"user","content":"hello"}]})
+    } else {
+        json!({"model":model,"input":"hello"})
+    };
+    for (field, value) in extra.as_object().unwrap() {
+        body[field] = value.clone();
+    }
+    let response = harness
+        .send(Method::POST, path, Some(body), Some("test-key"))
+        .await;
+    let header = |name: &str| {
+        response
+            .headers()
+            .get(name)
+            .map(|value| value.to_str().unwrap().to_owned())
+    };
+    let (fallback, effort) = (
+        header("x-ai-router-model-fallback"),
+        header("x-ai-router-reasoning-effort"),
+    );
+    let request_id = header("x-request-id").unwrap();
+    let status = response.status();
+    let (body, models) = if streaming && status == StatusCode::OK {
+        let events: Vec<Value> = frames(&read_bytes(response).await)
+            .iter()
+            .filter(|frame| frame.data != "[DONE]")
+            .map(event_json)
+            .collect();
+        let models = events
+            .iter()
+            .filter_map(|event| event.get("model").or(event.pointer("/response/model")))
+            .cloned()
+            .collect();
+        (Value::Null, models)
+    } else {
+        let body = read_json(response).await;
+        let models = body.get("model").cloned().into_iter().collect();
+        (body, models)
+    };
+    Served {
+        status,
+        fallback,
+        effort,
+        models,
+        body,
+        request_id,
+    }
+}
+
+#[tokio::test]
+async fn unsupported_model_ids_are_served_by_disclosed_fallback_targets() {
+    let harness = fallback_harness(|_| {}).await;
+    for path in ["/v1/chat/completions", "/v1/responses"] {
+        for streaming in [false, true] {
+            for (requested, target) in [
+                ("gpt-5.4-nano", "synthetic-openai"),
+                ("gpt-5.3-codex", "synthetic-openai"),
+                ("claude-unknown", "synthetic-openai"),
+                ("gemini-9-ultra", MODEL),
+                ("GEMINI-9-ULTRA", MODEL),
+            ] {
+                let served = serve(&harness, path, requested, json!({"stream":streaming})).await;
+                assert_eq!(served.status, StatusCode::OK, "{path} {requested}");
+                assert_eq!(
+                    served.fallback.as_deref(),
+                    Some(format!("{requested} -> {target}").as_str())
+                );
+                assert!(!served.models.is_empty());
+                assert!(served.models.iter().all(|model| model == target));
+                assert!(harness.state.drain(Duration::from_secs(5)).await);
+                let snapshot = harness.state.telemetry.snapshot().await;
+                let record = snapshot
+                    .records
+                    .iter()
+                    .find(|record| record.request_id == served.request_id)
+                    .unwrap();
+                assert_eq!(record.model, target);
+                assert_eq!(record.requested_model.as_deref(), Some(requested));
+            }
+            // Exact catalogue IDs are never remapped or annotated.
+            for exact in ["synthetic-openai", MODEL, "claude-sonnet-5-5-high"] {
+                let served = serve(&harness, path, exact, json!({"stream":streaming})).await;
+                assert_eq!(served.status, StatusCode::OK);
+                assert!(served.fallback.is_none());
+                assert!(served.models.iter().all(|model| model == exact));
+            }
+        }
+    }
+    // OpenAI receives the served ID; the client's effort is model-dependent there.
+    let served = serve(
+        &harness,
+        "/v1/responses",
+        "gpt-5.4-nano",
+        json!({"reasoning":{"effort":"low"}}),
+    )
+    .await;
+    assert_eq!(served.status, StatusCode::OK);
+    assert!(served.effort.is_none());
+    let upstream = harness.captured.lock().await.last().unwrap().clone();
+    assert_eq!(upstream["model"], "synthetic-openai");
+    assert_eq!(upstream["reasoning"]["effort"], "low");
+    // An Antigravity target's ID fixes its tier, so a mapped request's effort
+    // yields to it with disclosure; an exact ID's conflict is still rejected.
+    for (path, effort) in [
+        ("/v1/chat/completions", json!({"reasoning_effort":"high"})),
+        ("/v1/responses", json!({"reasoning":{"effort":"high"}})),
+    ] {
+        let served = serve(&harness, path, "gemini-9-ultra", effort.clone()).await;
+        assert_eq!(served.status, StatusCode::OK, "{}", served.body);
+        assert_eq!(served.effort.as_deref(), Some("medium"));
+        let served = serve(&harness, path, "gemini-9-ultra", json!({})).await;
+        assert!(served.effort.is_none());
+        let exact = serve(&harness, path, MODEL, effort).await;
+        assert_eq!(exact.status, StatusCode::BAD_REQUEST);
+        assert!(exact.fallback.is_none());
+        assert!(
+            exact.body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("conflicts with the exact model ID")
+        );
+    }
+    // The echoed ID is bounded and reduced to identifier characters.
+    let long = format!("gpt\u{1}\r\n{}", "x".repeat(300));
+    let served = serve(&harness, "/v1/responses", &long, json!({})).await;
+    assert_eq!(served.status, StatusCode::OK);
+    let header = served.fallback.unwrap();
+    assert_eq!(header, format!("gpt{} -> synthetic-openai", "x".repeat(125)));
+    let (_, models) = harness
+        .json(Method::GET, "/v1/models", None, Some("test-key"))
+        .await;
+    let ids: Vec<&str> = models["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|model| model["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 3);
+    assert!(!ids.iter().any(|id| id.starts_with("gpt-5") || *id == "gemini-9-ultra"));
+    let (_, capabilities) = harness
+        .json(Method::GET, "/v1/capabilities", None, Some("test-key"))
+        .await;
+    let policy = &capabilities["profiles"]["model"]["model_fallback"];
+    assert_eq!(policy["enabled"], true);
+    assert_eq!(policy["default_target"], "synthetic-openai");
+    assert_eq!(policy["gemini_prefix_target"], MODEL);
+    assert_eq!(policy["listed_in_models"], false);
+}
+
+#[tokio::test]
+async fn unavailable_fallback_target_crosses_over_or_keeps_model_not_found() {
+    let harness = fallback_harness(|_| {}).await;
+    // OpenAI catalogue outage: unseen IDs cross to the Gemini target, while the
+    // remembered exact OpenAI ID keeps its own outage error.
+    harness.model_mode.store(1, Ordering::SeqCst);
+    harness.state.refresh_openai().await;
+    for path in ["/v1/chat/completions", "/v1/responses"] {
+        let served = serve(&harness, path, "gpt-5.4-nano", json!({})).await;
+        assert_eq!(served.status, StatusCode::OK);
+        assert_eq!(served.fallback.as_deref(), Some(format!("gpt-5.4-nano -> {MODEL}").as_str()));
+        assert_eq!(served.models, vec![json!(MODEL)]);
+        let exact = serve(&harness, path, "synthetic-openai", json!({})).await;
+        assert_eq!(exact.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(exact.fallback.is_none());
+    }
+    // A Gemini target missing from the catalogue crosses to the OpenAI target.
+    let harness = fallback_harness(|config| config.fallback_gemini_model = "gemini-absent".into()).await;
+    let served = serve(&harness, "/v1/responses", "gemini-9-ultra", json!({})).await;
+    assert_eq!(served.status, StatusCode::OK);
+    assert_eq!(served.fallback.as_deref(), Some("gemini-9-ultra -> synthetic-openai"));
+    // With neither target available, today's error is unchanged.
+    let harness = DualHarness::new().await;
+    for model in ["gpt-5.4-nano", "gemini-9-ultra"] {
+        let served = serve(&harness, "/v1/chat/completions", model, json!({})).await;
+        assert_eq!(served.status, StatusCode::BAD_REQUEST);
+        assert_eq!(served.body["error"]["code"], "model_not_found");
+        assert!(served.fallback.is_none());
+    }
+}
+
+#[tokio::test]
+async fn disabled_model_fallback_restores_strict_model_not_found() {
+    let harness = fallback_harness(|config| config.model_fallback = false).await;
+    for path in ["/v1/chat/completions", "/v1/responses"] {
+        for model in ["gpt-5.4-nano", "gpt-5.3-codex", "gemini-9-ultra"] {
+            let served = serve(&harness, path, model, json!({})).await;
+            assert_eq!(served.status, StatusCode::BAD_REQUEST);
+            assert_eq!(served.body["error"]["code"], "model_not_found");
+            assert_eq!(served.body["error"]["message"], "Choose a model returned by /v1/models");
+            assert!(served.fallback.is_none());
+        }
+        let served = serve(&harness, path, MODEL, json!({})).await;
+        assert_eq!(served.status, StatusCode::OK);
+    }
+    let (_, capabilities) = harness
+        .json(Method::GET, "/v1/capabilities", None, Some("test-key"))
+        .await;
+    assert_eq!(capabilities["profiles"]["model"]["model_fallback"]["enabled"], false);
+}

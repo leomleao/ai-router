@@ -10,7 +10,8 @@ remain acceptance gates; see [validation](validation.md).
 
 | Feature | Current behavior |
 | --- | --- |
-| Provider routing | Exact discovered model IDs map to one provider. No prefix inference, provider fallback, or account fallback. Conflicting IDs are withheld. |
+| Provider routing | Exact discovered model IDs map to one provider and are never remapped. Conflicting IDs are withheld. There is no account fallback, and a known model whose provider is unavailable is never rerouted. |
+| Model fallback | A requested ID the router has never served (not live, conflicting, or remembered) is served by a configured exact target instead of returning `model_not_found`. IDs starting with `gemini` (any case) use `AI_ROUTER_FALLBACK_GEMINI_MODEL` (default `gemini-3.8-flash-medium`); all others, including `gpt-*`, `o*`, codex and `claude-*`, use `AI_ROUTER_FALLBACK_OPENAI_MODEL` (default `gpt-6-luna`). If that target is not in the live catalogue, the other target is used; if neither is, `model_not_found` is returned as before. Every affected response, including errors, carries `X-AI-Router-Model-Fallback: <requested> -> <served>`, with the requested ID reduced to identifier characters and at most 128 characters. Response bodies report the served ID. `/v1/models` lists only real catalogue IDs. `AI_ROUTER_MODEL_FALLBACK=false` restores strict exact-ID behaviour. |
 | Readiness | Catalogues are usable only while their provider is enabled, authenticated, and checked within 180 seconds. Account generation and persistent restrictions are checked at admission and before dispatch. |
 | Antigravity | Direct Rust HTTP/SSE adapter using a fixed reviewed origin, pinned identity, and reviewed protocol baseline. Text generation, history, client tools, and validated JSON are in scope. |
 | OpenAI | Independent opt-in Responses adapter. `AI_ROUTER_OPENAI_ENABLED` defaults to false; OpenAI state and admission are separate from Antigravity. |
@@ -22,7 +23,7 @@ remain acceptance gates; see [validation](validation.md).
 | Responses item references | Completed items are client-scoped in process memory, with a 24-hour TTL, 1,024 items / 16 MiB per client and 4,096 items / 64 MiB globally. Reasoning references also require the same provider and account generation. Restart clears items. |
 | Usage | Prompt, candidate, reasoning, cached, and total counts are mapped where supplied. Missing or inferred usage is marked partial. Responses retain both `agy_usage_partial` and `ai_router_usage_partial` for compatibility. |
 | Responses `include` | Only `["reasoning.encrypted_content"]` (or `[]`) is accepted. OpenAI always requests and returns encrypted reasoning items; Antigravity returns no reasoning items, so the hint adds nothing there. Any other value returns `unsupported_parameter`. Chat Completions accepts only an empty `include`. |
-| Reasoning controls | Responses `reasoning.effort` is supported (`low` to `max`; Antigravity requires the exact model ID's effort). `reasoning.summary` `auto`, `concise` or `detailed` is accepted because the Vercel AI SDK adds `detailed` whenever an effort is set, but summaries are not produced: reasoning items carry `summary: []`. Requests with a summary receive `X-AI-Router-Reasoning-Summary: unavailable`, and capabilities report the same. Other reasoning fields are rejected. |
+| Reasoning controls | Responses `reasoning.effort` is supported (`low` to `max`; Antigravity requires the exact model ID's effort). When a fallback serves an Antigravity model, its ID fixes the tier: a different client effort is replaced by that tier and disclosed as `X-AI-Router-Reasoning-Effort: <tier>`, instead of the conflict error that an exact ID receives. A fallback to OpenAI forwards the client's effort unchanged. `reasoning.summary` `auto`, `concise` or `detailed` is accepted because the Vercel AI SDK adds `detailed` whenever an effort is set, but summaries are not produced: reasoning items carry `summary: []`. Requests with a summary receive `X-AI-Router-Reasoning-Summary: unavailable`, and capabilities report the same. Other reasoning fields are rejected. |
 | Output budgets | Positive Chat and Responses budgets become best-effort visible-answer guidance. They are not hard output, reasoning, or usage limits. The response header and capabilities disclose this mode. |
 | Media | Image, audio, video, and other non-text input are unsupported. |
 | Native execution | Removed. `/v1/agy/runs` and all child routes return 404. Only `model` is a valid client-key scope. |
@@ -35,6 +36,9 @@ from currently usable catalogues. Antigravity additionally requires membership
 in the 13-ID reviewed baseline; unreviewed image, internal and future SKUs are
 withheld until their contracts are reviewed. Previously observed but unavailable IDs
 return an actionable provider-unavailable error instead of routing elsewhere.
+Model fallback applies only to IDs never observed, so it cannot hide such an
+outage. `/v1/capabilities` reports the policy under `profiles.model.model_fallback`,
+and monitor request records keep the requested ID beside the served model.
 
 The provider admission limits are independent. `AI_ROUTER_MAX_CONCURRENT` and
 `AI_ROUTER_MAX_QUEUE` default to 2 and 8 for Antigravity;

@@ -27,10 +27,14 @@ Main configuration fields and defaults:
 | concurrent / queue per provider | 2 / 8 |
 | request deadline | 120 seconds |
 | telemetry retention | 30 days / 50,000 events |
+| `model_fallback` | `true` (`AI_ROUTER_MODEL_FALLBACK`) |
+| `fallback_openai_model` | `gpt-6-luna` (`AI_ROUTER_FALLBACK_OPENAI_MODEL`) |
+| `fallback_gemini_model` | `gemini-3.8-flash-medium` (`AI_ROUTER_FALLBACK_GEMINI_MODEL`) |
 
 Antigravity, OpenAI, and telemetry paths must be separate absolute directories;
 configured paths reject protected filename and directory patterns. The monitor
-socket must remain outside those storage paths.
+socket must remain outside those storage paths. Fallback targets must be 1–128
+ASCII letters, digits, dots, colons, underscores, or hyphens.
 
 `KeyConfig { id, sha256, scopes }` stores digest records in `AI_ROUTER_KEYS`.
 Only the `model` scope is valid. `auth::generate_key(id, scopes)` creates a
@@ -99,6 +103,18 @@ registry withholds conflicting IDs and remembers up to 4,096 last-known owners
 so a hidden provider model reports unavailable instead of being routed to the
 other provider. Readiness requires authentication and a catalogue no older than
 180 seconds.
+
+`Snapshot::fallback(requested, openai_target, gemini_target)` is the only
+prefix rule. It returns a target only for an ID that is not live, conflicting,
+or remembered: the Gemini target for a case-insensitive `gemini` prefix,
+otherwise the OpenAI target, and the other target when the first is not live.
+The API rewrites the request's `model` to the served ID before normalization,
+so ownership, item scope, response bodies and telemetry use the served ID.
+`RequestRecord.requested_model` keeps the sanitized requested ID (omitted when
+no fallback applied), and the protect middleware adds
+`x-ai-router-model-fallback` to every response for that request. For an
+Antigravity target, a differing client effort is cleared before serialization
+and `x-ai-router-reasoning-effort` reports the served tier.
 
 Antigravity's `probe`, `generation`, `availability_error`, `model_availability`,
 and `start` methods feed the same API registry and provider-specific admission

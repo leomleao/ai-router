@@ -43,6 +43,9 @@ pub struct RequestRecord {
     pub request_id: String,
     pub client_id: String,
     pub model: String,
+    /// The client's model ID when a configured fallback served `model` instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_model: Option<String>,
     #[serde(default = "legacy_provider")]
     pub provider: String,
     pub endpoint: String,
@@ -554,6 +557,7 @@ fn sanitise_record(mut record: RequestRecord) -> Option<RequestRecord> {
     record.request_id = identifier(&record.request_id, 80);
     record.client_id = identifier(&record.client_id, 64);
     record.model = identifier(&record.model, 128);
+    record.requested_model = record.requested_model.map(|id| identifier(&id, 128));
     record.upstream_request_id = record.upstream_request_id.map(|id| identifier(&id, 256));
     if !matches!(record.provider.as_str(), "agy" | "openai") {
         record.provider = "other".to_owned();
@@ -926,7 +930,10 @@ fn render(snapshot: &Snapshot) -> String {
             record.request_id,
             record.client_id,
             record.provider,
-            record.model,
+            match &record.requested_model {
+                Some(requested) => format!("{} (requested {requested})", record.model),
+                None => record.model.clone(),
+            },
             record.duration_ms,
             record.status,
             record.error_code.as_deref().unwrap_or("")
@@ -979,6 +986,7 @@ mod tests {
             request_id: id.into(),
             client_id: "test".into(),
             model: "model".into(),
+            requested_model: None,
             provider: "agy".into(),
             endpoint: "/v1/chat/completions".into(),
             started_at: Utc::now().to_rfc3339(),

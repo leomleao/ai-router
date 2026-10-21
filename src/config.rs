@@ -37,6 +37,9 @@ pub struct Config {
     pub per_key_per_minute: u32,
     pub retention_days: u64,
     pub max_events: usize,
+    pub model_fallback: bool,
+    pub fallback_openai_model: String,
+    pub fallback_gemini_model: String,
 }
 
 impl Config {
@@ -72,6 +75,14 @@ impl Config {
             "/var/lib/ai-router/openai-auth",
         )?
         .into();
+        let model_fallback = match value("AI_ROUTER_MODEL_FALLBACK", "true")?.as_str() {
+            "true" => true,
+            "false" => false,
+            _ => return Err("AI_ROUTER_MODEL_FALLBACK must be true or false".to_owned()),
+        };
+        let fallback_openai_model = value("AI_ROUTER_FALLBACK_OPENAI_MODEL", "gpt-6-luna")?;
+        let fallback_gemini_model =
+            value("AI_ROUTER_FALLBACK_GEMINI_MODEL", "gemini-3.8-flash-medium")?;
         let telemetry_dir =
             value("AI_ROUTER_TELEMETRY_DIR", "/var/lib/ai-router/telemetry")?.into();
         let monitor_socket =
@@ -123,6 +134,9 @@ impl Config {
             per_key_per_minute: number!("AI_ROUTER_PER_KEY_PER_MINUTE", "30"),
             retention_days: number!("AI_ROUTER_RETENTION_DAYS", "30"),
             max_events: number!("AI_ROUTER_MAX_EVENTS", "50000"),
+            model_fallback,
+            fallback_openai_model,
+            fallback_gemini_model,
         };
         config.validate()?;
         Ok(config)
@@ -212,6 +226,16 @@ impl Config {
         )?;
         bounds("RETENTION_DAYS", self.retention_days, 1, 365)?;
         bounds("MAX_EVENTS", self.max_events as u64, 1, 50_000)?;
+        for (name, model) in [
+            ("FALLBACK_OPENAI_MODEL", &self.fallback_openai_model),
+            ("FALLBACK_GEMINI_MODEL", &self.fallback_gemini_model),
+        ] {
+            if !valid_model_id(model) {
+                return Err(format!(
+                    "AI_ROUTER_{name} must contain 1–128 ASCII letters, digits, dots, colons, underscores, or hyphens"
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -244,6 +268,9 @@ impl Config {
             per_key_per_minute: 30,
             retention_days: 30,
             max_events: 50000,
+            model_fallback: true,
+            fallback_openai_model: "gpt-6-luna".to_owned(),
+            fallback_gemini_model: "gemini-3.8-flash-medium".to_owned(),
         }
     }
 }
@@ -274,6 +301,16 @@ pub fn valid_identifier(value: &str) -> bool {
         && value
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// Fallback targets are echoed in headers and capabilities, so they share the
+/// catalogue's plain-identifier shape rather than accepting arbitrary text.
+pub fn valid_model_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b':' | b'_' | b'-'))
 }
 
 pub(crate) fn encode_hex(bytes: &[u8]) -> String {
@@ -366,6 +403,14 @@ mod tests {
                 .antigravity_enabled
         );
         assert_eq!(config.keys[0].id, "test");
+        assert!(config.model_fallback);
+        assert_eq!(config.fallback_openai_model, "gpt-6-luna");
+        assert_eq!(config.fallback_gemini_model, "gemini-3.8-flash-medium");
+        assert!(
+            !config_with("AI_ROUTER_MODEL_FALLBACK", "false")
+                .unwrap()
+                .model_fallback
+        );
     }
     #[test]
     fn rejects_invalid_paths_limits_and_public_key_metadata() {
@@ -384,6 +429,11 @@ mod tests {
             ("AI_ROUTER_MAX_QUEUE", "99999999"),
             ("AI_ROUTER_ANTIGRAVITY_ENABLED", "yes"),
             ("AI_ROUTER_TRUSTED_PROXIES", "10.0.0.0/8"),
+            ("AI_ROUTER_MODEL_FALLBACK", "yes"),
+            ("AI_ROUTER_FALLBACK_OPENAI_MODEL", ""),
+            ("AI_ROUTER_FALLBACK_OPENAI_MODEL", "gpt 6"),
+            ("AI_ROUTER_FALLBACK_GEMINI_MODEL", "gemini/../x"),
+            ("AI_ROUTER_FALLBACK_GEMINI_MODEL", "g".repeat(129).as_str()),
         ] {
             assert!(config_with(name, value).is_err(), "{name}");
         }
