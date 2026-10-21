@@ -36,6 +36,12 @@ RUN npm install --ignore-scripts --no-audit --no-fund --save-exact \
     @langchain/openai@1.4.4 @langchain/core@1.2.8
 COPY tests/n8n_contract.mjs ./n8n_contract.mjs
 
+# Supabase Studio's pinned assistant SDKs, isolated from n8n's versions.
+FROM node:24.10.0-bookworm-slim AS studio-contract-deps
+WORKDIR /opt/studio-contract
+RUN npm install --ignore-scripts --no-audit --no-fund --save-exact \
+    ai@7.0.59 @ai-sdk/openai@4.0.41 zod@4.1.8
+
 # Local deterministic tests only. The production image contains neither Python nor Node.
 FROM builder AS test
 USER root
@@ -49,9 +55,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends python3 python3
 ENV PATH=/opt/test-venv/bin:$PATH
 COPY --from=n8n-contract-deps /usr/local/bin/node /usr/local/bin/node
 COPY --from=n8n-contract-deps /opt/n8n-contract /opt/n8n-contract
+COPY --from=studio-contract-deps /opt/studio-contract /opt/studio-contract
 COPY tests ./tests
 COPY scripts/login.sh scripts/antigravity.sh scripts/openai.sh ./scripts/
-RUN cargo test --locked && python3 tests/monitor_tui.py && python3 tests/login_contract.py
+# The PTY and login checks run the debug binary, which cargo test does not build.
+RUN cargo test --locked && cargo build --locked && python3 tests/monitor_tui.py && python3 tests/login_contract.py
 
 FROM runtime AS gateway
 COPY THIRD_PARTY_NOTICES.md /usr/share/doc/ai-router/THIRD_PARTY_NOTICES.md

@@ -71,6 +71,10 @@ later turns retain their original chronology.
 content, call/result pairing, identifiers, and bounded item counts. They
 support tool choice `auto` and `none`; `none` removes the tool inventory.
 Forced/named choices and unsupported sampling controls fail explicitly.
+Responses accept `include: ["reasoning.encrypted_content"]` and a
+`reasoning.summary` hint of `auto`, `concise` or `detailed`; neither changes
+`RunRequest`, and summaries are disclosed as unavailable. Other include values
+and any non-empty Chat `include` remain `unsupported_parameter`.
 Positive output budgets add visible-answer guidance only. They do not cap
 provider tokens or truncate text, schema output, or tool arguments.
 

@@ -277,3 +277,167 @@ fn frames(bytes: &[u8]) -> Vec<SseFrame> {
 fn event_json(frame: &SseFrame) -> Value {
     serde_json::from_str(&frame.data).unwrap()
 }
+
+// Supabase Studio's assistant uses @ai-sdk/openai 4.x Responses with
+// store=false and a reasoning effort, so the SDK adds encrypted reasoning
+// include and a detailed summary request to every streamed tool turn.
+#[tokio::test]
+async fn studio_store_false_reasoning_tool_turns_round_trip_on_both_providers() {
+    let harness = DualHarness::new().await;
+    for model in ["synthetic-openai", MODEL] {
+        for streaming in [false, true] {
+            let mut tool = lookup_tool(true);
+            tool["strict"] = json!(false);
+            let mut input = vec![
+                json!({"role":"developer","content":"Synthetic Studio system prompt"}),
+                json!({"role":"user","content":[{"type":"input_text","text":"tools-fixture"}]}),
+            ];
+            let body = |input: &Vec<Value>| {
+                json!({"model":model,"input":input,"store":false,
+                    "include":["reasoning.encrypted_content"],
+                    "reasoning":{"effort":"medium","summary":"detailed"},
+                    "tools":[tool.clone()],"tool_choice":"auto","stream":streaming})
+            };
+            let response = harness
+                .send(
+                    Method::POST,
+                    "/v1/responses",
+                    Some(body(&input)),
+                    Some("test-key"),
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let header = |name: &str| response.headers()[name].to_str().unwrap().to_owned();
+            assert_eq!(header("x-ai-router-reasoning-summary"), "unavailable");
+            assert_eq!(header("x-ai-router-item-storage"), "disabled");
+            let bytes = read_bytes(response).await;
+            let first = if streaming {
+                event_json(
+                    frames(&bytes)
+                        .iter()
+                        .find(|f| f.event == "response.completed")
+                        .unwrap(),
+                )["response"]
+                    .clone()
+            } else {
+                serde_json::from_slice(&bytes).unwrap()
+            };
+            let output = first["output"].as_array().unwrap();
+            let calls: Vec<_> = output
+                .iter()
+                .filter(|item| item["type"] == "function_call")
+                .collect();
+            assert_eq!(calls.len(), 2);
+            // Encrypted reasoning is returned only where the provider has it;
+            // summaries are never fabricated.
+            let reasoning: Vec<_> = output
+                .iter()
+                .filter(|item| item["type"] == "reasoning")
+                .collect();
+            if model == MODEL {
+                assert!(reasoning.is_empty());
+            } else {
+                assert_eq!(reasoning.len(), 1);
+                assert_eq!(
+                    reasoning[0]["encrypted_content"],
+                    "synthetic-encrypted-reasoning"
+                );
+                assert_eq!(reasoning[0]["summary"], json!([]));
+                let upstream = harness.captured.lock().await.last().unwrap().clone();
+                assert_eq!(upstream["include"], json!(["reasoning.encrypted_content"]));
+                assert_eq!(upstream["reasoning"], json!({"effort":"medium"}));
+            }
+            // store=false replays full items exactly as the SDK serializes them.
+            for item in &reasoning {
+                input.push(json!({"type":"reasoning","id":item["id"],
+                    "encrypted_content":item["encrypted_content"],"summary":[]}));
+            }
+            for call in &calls {
+                input.push(
+                    json!({"type":"function_call","id":call["id"],"call_id":call["call_id"],
+                    "name":call["name"],"arguments":call["arguments"]}),
+                );
+            }
+            for call in &calls {
+                input.push(
+                    json!({"type":"function_call_output","call_id":call["call_id"],
+                    "output":"{\"rows\":[]}"}),
+                );
+            }
+            let response = harness
+                .send(
+                    Method::POST,
+                    "/v1/responses",
+                    Some(body(&input)),
+                    Some("test-key"),
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let wire = String::from_utf8(read_bytes(response).await).unwrap();
+            assert!(wire.contains("tool results accepted"), "{wire}");
+            if model != MODEL {
+                let upstream = harness.captured.lock().await.last().unwrap().clone();
+                assert!(
+                    upstream["input"].as_array().unwrap().iter().any(|item| {
+                        item["encrypted_content"] == "synthetic-encrypted-reasoning"
+                    })
+                );
+            }
+        }
+    }
+    for (body, field) in [
+        (
+            json!({"model":"synthetic-openai","input":"hello","include":["file_search_call.results"]}),
+            "include",
+        ),
+        (
+            json!({"model":"synthetic-openai","input":"hello","reasoning":{"effort":"medium","summary":"verbose"}}),
+            "reasoning.summary",
+        ),
+        (
+            json!({"model":MODEL,"messages":[{"role":"user","content":"hello"}],
+                "include":["reasoning.encrypted_content"]}),
+            "include",
+        ),
+    ] {
+        let path = if body.get("messages").is_some() {
+            "/v1/chat/completions"
+        } else {
+            "/v1/responses"
+        };
+        let (status, error) = harness.post(path, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error["error"]["code"], "unsupported_parameter");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with(field)
+        );
+    }
+    // Without a summary request, no disclosure header is added.
+    let response = harness
+        .send(
+            Method::POST,
+            "/v1/responses",
+            Some(json!({"model":MODEL,"input":"hello","reasoning":{"effort":"medium"}})),
+            Some("test-key"),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response
+            .headers()
+            .get("x-ai-router-reasoning-summary")
+            .is_none()
+    );
+    let (_, capabilities) = harness
+        .json(Method::GET, "/v1/capabilities", None, Some("test-key"))
+        .await;
+    let profile = &capabilities["profiles"]["model"];
+    assert_eq!(
+        profile["responses_include"],
+        json!(["reasoning.encrypted_content"])
+    );
+    assert_eq!(profile["reasoning_summary"]["mode"], "unavailable");
+}

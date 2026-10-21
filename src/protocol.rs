@@ -378,7 +378,15 @@ pub fn normalize_response(value: Value, request_id: String) -> Result<RunRequest
     let schema = response_schema(root.get("text"))?;
     let effort = if let Some(reasoning) = nonnull(root.get("reasoning")) {
         let reasoning = object(reasoning, "reasoning")?;
-        allowed_fields(reasoning, &["effort"], "reasoning")?;
+        allowed_fields(reasoning, &["effort", "summary"], "reasoning")?;
+        // The Vercel SDK adds summary=detailed whenever an effort is set.
+        // Summaries are optional output: reasoning items keep an empty
+        // summary array, and the response header discloses it.
+        if nonnull(reasoning.get("summary"))
+            .is_some_and(|v| !matches!(v.as_str(), Some("auto" | "concise" | "detailed")))
+        {
+            return Err(ApiError::unsupported("reasoning.summary"));
+        }
         parse_effort(reasoning.get("effort"))?
     } else {
         None
@@ -621,7 +629,17 @@ fn validate_common(root: &Map<String, Value>, responses: bool) -> Result<(), Api
             "store" | "background" | "logprobs" => value.as_bool() == Some(false),
             "frequency_penalty" | "presence_penalty" => value.as_f64() == Some(0.0),
             "top_logprobs" => value.as_u64() == Some(0),
-            "include" | "stop" => value.as_array().is_some_and(Vec::is_empty),
+            "stop" => value.as_array().is_some_and(Vec::is_empty),
+            // The OpenAI adapter always requests and returns encrypted
+            // reasoning; AGY returns no reasoning items, so nothing is claimed.
+            // Chat Completions has no include field and no reasoning items.
+            "include" => value.as_array().is_some_and(|entries| {
+                entries.is_empty()
+                    || responses
+                        && entries
+                            .iter()
+                            .all(|entry| entry.as_str() == Some("reasoning.encrypted_content"))
+            }),
             "truncation" => responses && value.as_str() == Some("disabled"),
             "verbosity" => !responses && value.as_str() == Some("medium"),
             // n8n supplies these OpenAI cache hints automatically. They never
@@ -1381,6 +1399,64 @@ mod tests {
         .unwrap();
         assert!(request.schema.is_none());
         assert!(request.effort.is_none());
+    }
+    #[test]
+    fn encrypted_reasoning_include_and_summary_hints_preserve_the_request() {
+        // Exact @ai-sdk/openai 4.x shape for store=false with a reasoning effort.
+        let input = json!({"model":"gemini-test", "input":"hello", "store":false,
+            "reasoning":{"effort":"medium"}, "tool_choice":"auto"});
+        let expected =
+            serde_json::to_value(normalize_response(input.clone(), "req".to_owned()).unwrap())
+                .unwrap();
+        for include in [
+            Value::Null,
+            json!([]),
+            json!(["reasoning.encrypted_content"]),
+        ] {
+            for summary in [
+                Value::Null,
+                json!("auto"),
+                json!("concise"),
+                json!("detailed"),
+            ] {
+                let mut value = input.clone();
+                value["include"] = include.clone();
+                value["reasoning"]["summary"] = summary;
+                let request = normalize_response(value, "req".to_owned()).unwrap();
+                assert_eq!(serde_json::to_value(request).unwrap(), expected);
+            }
+        }
+        for include in [
+            json!(["file_search_call.results"]),
+            json!([
+                "reasoning.encrypted_content",
+                "message.output_text.logprobs"
+            ]),
+            json!([1]),
+            json!("reasoning.encrypted_content"),
+        ] {
+            let mut value = input.clone();
+            value["include"] = include;
+            let error = normalize_response(value, "req".to_owned()).unwrap_err();
+            assert_eq!(error.code, "unsupported_parameter");
+            assert!(error.message.starts_with("include"));
+        }
+        // Chat Completions defines no include field and returns no reasoning items.
+        let mut value = chat();
+        value["include"] = json!(["reasoning.encrypted_content"]);
+        let error = normalize_chat(value, "req".to_owned()).unwrap_err();
+        assert_eq!(error.code, "unsupported_parameter");
+        for summary in [json!("verbose"), json!(true), json!({})] {
+            let mut value = input.clone();
+            value["reasoning"]["summary"] = summary;
+            let error = normalize_response(value, "req".to_owned()).unwrap_err();
+            assert_eq!(error.code, "unsupported_parameter");
+            assert!(error.message.starts_with("reasoning.summary"));
+        }
+        let mut value = input.clone();
+        value["reasoning"]["mode"] = json!("auto");
+        let error = normalize_response(value, "req".to_owned()).unwrap_err();
+        assert!(error.message.starts_with("reasoning.mode"));
     }
     #[test]
     fn neutral_verbosity_preserves_output_schema_constraints() {

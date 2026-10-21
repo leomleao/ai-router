@@ -661,6 +661,8 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> Json<Value> {
         "profiles":{"model":{"chat_completions":true,"responses":true,"streaming":true,"text":true,"json_schema":true,"client_tools":true,"parallel_tool_execution":false,"media_input":false,
             "output_token_budget":{"mode":"prompt_guidance","hard_limit":false,"limits_reasoning_tokens":false,"parameters":["max_output_tokens","max_tokens","max_completion_tokens"]},
             "prompt_cache_controls":{"mode":"ignored","retention_guarantee":false},
+            "responses_include":["reasoning.encrypted_content"],
+            "reasoning_summary":{"mode":"unavailable","accepted":["auto","concise","detailed"]},
             "item_references":{"enabled":true,"storage":"memory","default_store":true,"ttl_seconds":items::TTL_SECONDS,"max_items":items::MAX_ITEMS,"max_bytes":items::MAX_BYTES,"per_client_items":items::CLIENT_ITEMS,"per_client_bytes":items::CLIENT_BYTES,"cleared_on_restart":true}}},
         "providers":{
             "agy":{"enabled":state.config.antigravity_enabled,"ready":snapshot.entries.iter().any(|e|e.provider==ProviderId::Agy),"adapter":agy.version,"baseline":crate::antigravity_auth::BASELINE_REVISION,"checked_at":agy.checked_at,"error":agy.error,"quota":agy.quota,"transport":"direct","fallback":false,"release_advisory":release},
@@ -719,6 +721,10 @@ async fn generate(
     let has_cache_hints = ["prompt_cache_key", "prompt_cache_retention"]
         .iter()
         .any(|field| body.get(*field).is_some_and(|value| !value.is_null()));
+    let wants_reasoning_summary = responses
+        && body
+            .pointer("/reasoning/summary")
+            .is_some_and(|v| !v.is_null());
     let storage_mode = if body.get("store").and_then(Value::as_bool) == Some(false) {
         "disabled"
     } else {
@@ -743,6 +749,12 @@ async fn generate(
             response.headers_mut().insert(
                 "x-ai-router-prompt-cache-controls",
                 "ignored".parse().unwrap(),
+            );
+        }
+        if wants_reasoning_summary {
+            response.headers_mut().insert(
+                "x-ai-router-reasoning-summary",
+                "unavailable".parse().unwrap(),
             );
         }
         response
@@ -2110,6 +2122,8 @@ mod tests {
             ("python3", "tests/sdk_contract.py", "claude-sonnet-5-5-high"),
             ("node", "tests/n8n_contract.mjs", "gemini-4-argon-medium"),
             ("node", "tests/n8n_contract.mjs", "claude-sonnet-5-5-high"),
+            ("node", "tests/studio_contract.mjs", "synthetic-openai"),
+            ("node", "tests/studio_contract.mjs", "gemini-4-argon-medium"),
             (
                 "node",
                 "tests/n8n_langchain_contract.mjs",

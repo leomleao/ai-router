@@ -5,6 +5,30 @@ the schema fix, diagnostic privacy checks, restored CLI coverage, and separate
 Vercel/LangChain client matrices. Historical counts below describe the earlier
 implementation baseline.
 
+## Supabase Studio Responses compatibility (2026-10-21)
+
+Supabase Studio's assistant (`supabase/studio:2026.10.12`, `ai@7.0.59`,
+`@ai-sdk/openai@4.0.41`) sets `store:false` and a reasoning effort for
+`gpt-6-luna`. For that reasoning model the SDK adds
+`include:["reasoning.encrypted_content"]` and `reasoning.summary:"detailed"`, which
+were rejected before the provider was called. Responses now accept that
+include value and the `auto`/`concise`/`detailed` summary hints; the normalized
+request is unchanged. OpenAI already requests and returns encrypted reasoning;
+Antigravity returns no reasoning items. Summaries are never produced, so
+`X-AI-Router-Reasoning-Summary: unavailable` and capabilities disclose that.
+Other include values, malformed summaries, and Chat `include` stay rejected.
+
+`tests/studio_contract.mjs` drives the pinned Studio SDKs through streamed and
+nonstreamed multi-step tool turns. It checks the exact wire fields, the
+store-false replay of encrypted reasoning, and the rejection of other includes.
+It runs against the OpenAI and Antigravity fixtures, with 40 checks each. 203 Rust
+tests passed, together with 125 official SDK checks per model, 170 n8n Vercel
+checks, 38 LangChain checks, monitor PTY checks, and 5 login checks. The test
+stage now builds the debug binary that the PTY and login checks run; without it,
+`scripts/test-local.sh` failed on `main`. Formatting, `git diff --check` and
+clippy passed; clippy reported only the existing style-warning categories. No live
+Studio, server, or deployment was used.
+
 ## Direct model-only implementation (2026-10-20)
 
 The local implementation and independent review rounds completed. The previous
