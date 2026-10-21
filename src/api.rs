@@ -57,7 +57,12 @@ pub struct AppState {
     global: RateLimiter,
     clients: RateLimiter,
     rejection_logs: RateLimiter,
+    stream_commit_wait: Duration,
 }
+
+/// Longest a stream waits for provider acceptance before committing its 200:
+/// the keepalive interval, so the wait adds no longer silence than an open stream.
+const STREAM_COMMIT_WAIT: Duration = Duration::from_secs(15);
 
 impl AppState {
     pub fn new(
@@ -87,6 +92,7 @@ impl AppState {
             active: AtomicUsize::new(0),
             queued: AtomicUsize::new(0),
             drained: Notify::new(),
+            stream_commit_wait: STREAM_COMMIT_WAIT,
         })
     }
 
@@ -939,12 +945,34 @@ async fn generate_body(
         guard.observe(&RunEvent::Error(failure.clone()));
         return Err(failure);
     }
+    // Commit the SSE 200 only after the provider's first event (Init once it
+    // accepted the request). Earlier failures keep the non-streaming status,
+    // code and headers, as on OpenAI. A provider still silent after the commit
+    // wait gets a committed stream with keepalives; later failures are events.
+    let mut pending = match tokio::time::timeout(state.stream_commit_wait, run.events.recv()).await
+    {
+        Err(_) => None,
+        Ok(Some(RunEvent::Error(failure))) => {
+            guard.observe(&RunEvent::Error(failure.clone()));
+            return Err(failure);
+        }
+        Ok(Some(event)) => Some(event),
+        Ok(None) => {
+            let failure = error(
+                502,
+                "incomplete_provider_output",
+                "Provider ended without a result",
+            );
+            guard.observe(&RunEvent::Error(failure.clone()));
+            return Err(failure);
+        }
+    };
     let stream = async_stream::stream! {
         let mut guard = guard;
         let mut render = StreamRenderer::new(responses, completion_id.clone(), model.clone(), created, include_usage, store_items, metadata.clone());
         for item in render.begin() { yield Ok::<Event,Infallible>(item); }
         let mut terminal = false;
-        while let Some(mut event) = run.events.recv().await {
+        while let Some(mut event) = match pending.take() { Some(event) => Some(event), None => run.events.recv().await } {
             if let RunEvent::Completed(result) = &event {
                 if let Err(error) = validate_result(result) { event = RunEvent::Error(error); }
             }
@@ -1409,10 +1437,18 @@ impl StreamRenderer {
                 events
             }
             RunEvent::Error(e) => {
+                // Official SDKs (and so LangChain) raise only on a top-level
+                // `error` object, so it accompanies the spec error fields.
+                let mut detail = e.response_body()["error"].take();
+                detail["param"] = Value::Null;
                 if self.responses {
-                    vec![self.emit("response.failed",json!({"response":{"id":self.id,"object":"response","created_at":self.created,"model":self.model,"status":"failed","output":[],"error":{"code":e.code,"message":e.message,"upstream_request_id":e.upstream_request_id},"usage":null}}))]
+                    vec![self.emit("error",json!({"code":e.code,"message":e.message,"param":null,"error":detail})),
+                        self.emit("response.failed",json!({"response":{"id":self.id,"object":"response","created_at":self.created,"model":self.model,"status":"failed","output":[],"error":{"code":e.code,"message":e.message,"upstream_request_id":e.upstream_request_id},"usage":null}}))]
                 } else {
-                    vec![self.emit("error",json!({"error":{"code":e.code,"message":e.message,"type":"provider_error","upstream_request_id":e.upstream_request_id}})),Event::default().data("[DONE]")]
+                    vec![
+                        self.emit("error", json!({"error":detail})),
+                        Event::default().data("[DONE]"),
+                    ]
                 }
             }
             _ => vec![],
@@ -1598,6 +1634,19 @@ mod tests {
             )
                 .into_response();
         }
+        if input.contains("auth-fixture") {
+            return (StatusCode::UNAUTHORIZED, Json(json!({"error":{"code":"invalid_api_key","message":"synthetic-provider-private-detail"}}))).into_response();
+        }
+        if input.contains("midstream-fixture") {
+            let wire = [
+                json!({"type":"response.output_text.delta","delta":"partial "}),
+                json!({"type":"response.failed","response":{"error":{"code":"server_error","message":"synthetic-provider-private-detail"}}}),
+            ]
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect::<String>();
+            return ([("content-type", "text/event-stream")], wire).into_response();
+        }
         let continuing = body["input"]
             .as_array()
             .unwrap()
@@ -1730,6 +1779,26 @@ mod tests {
         if text.contains("direct-quota-fixture") {
             return StatusCode::TOO_MANY_REQUESTS.into_response();
         }
+        if text.contains("overload-fixture") {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        if text.contains("auth-fixture") {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        if text.contains("midstream-fixture") {
+            // Separate chunks, so the partial text is delivered before the
+            // malformed frame fails the decoder.
+            let wire = async_stream::stream! {
+                yield Ok::<_, Infallible>(format!("data: {}\n\n", json!({"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"partial "}]}}]}})));
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                yield Ok("data: not-json\n\n".to_owned());
+            };
+            return (
+                [("content-type", "text/event-stream")],
+                axum::body::Body::from_stream(wire),
+            )
+                .into_response();
+        }
         if text.contains("direct-protocol-fixture") {
             return ([("content-type", "text/event-stream")], "data: {}\n\n").into_response();
         }
@@ -1770,6 +1839,9 @@ mod tests {
             Self::with_timeout(5).await
         }
         async fn with_timeout(timeout_seconds: u64) -> Self {
+            Self::with_commit_wait(timeout_seconds, STREAM_COMMIT_WAIT).await
+        }
+        async fn with_commit_wait(timeout_seconds: u64, commit_wait: Duration) -> Self {
             let root = tempfile::tempdir().unwrap();
             let mut config = Config::for_test(root.path());
             config.openai_enabled = true;
@@ -1822,6 +1894,7 @@ mod tests {
                 format!("http://{address}"),
                 "synthetic-openai-token".into(),
             );
+            Arc::get_mut(&mut state).unwrap().stream_commit_wait = commit_wait;
             state.refresh_provider().await;
             assert!(state.provider.read().await.authenticated);
             assert!(state.openai_provider.read().await.authenticated);
@@ -2034,14 +2107,9 @@ mod tests {
                     )
                 };
                 let (status, wire) = h.call(path, Some(body)).await;
-                assert_eq!(
-                    status,
-                    if streaming {
-                        StatusCode::OK
-                    } else {
-                        StatusCode::SERVICE_UNAVAILABLE
-                    }
-                );
+                // Streams commit only after provider acceptance, so both modes
+                // return the same HTTP failure.
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
                 assert!(wire.contains("server_is_overloaded"));
                 assert!(wire.contains("OpenAI is temporarily overloaded"));
                 assert!(wire.contains("did not retry automatically"));
@@ -2052,26 +2120,8 @@ mod tests {
                     h.state.openai.availability_error().await.unwrap().code,
                     "server_is_overloaded"
                 );
-                if streaming {
-                    let failed = wire
-                        .lines()
-                        .filter_map(|line| line.strip_prefix("data:"))
-                        .filter_map(|data| serde_json::from_str::<Value>(data.trim()).ok())
-                        .find(|event| {
-                            if responses {
-                                event["type"] == "response.failed"
-                            } else {
-                                event.get("error").is_some()
-                            }
-                        })
-                        .unwrap();
-                    let error = if responses {
-                        &failed["response"]["error"]
-                    } else {
-                        &failed["error"]
-                    };
-                    assert_eq!(error["code"], "server_is_overloaded");
-                }
+                let error: Value = serde_json::from_str(&wire).unwrap();
+                assert_eq!(error["error"]["code"], "server_is_overloaded");
                 // Overload clears through normal discovery, without re-login.
                 h.state.refresh_openai().await;
                 let (status, wire) = h
@@ -2215,7 +2265,8 @@ mod tests {
             drop(second);
         };
         let ((status, wire), ()) = tokio::join!(request, release);
-        assert_eq!(status, StatusCode::OK, "{wire}");
+        // The provider never accepted the request, so the timeout is HTTP.
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{wire}");
         assert!(wire.contains("provider_timeout"), "{wire}");
         assert!(!wire.contains("OpenAI synthetic answer"), "{wire}");
         assert!(started.elapsed() < Duration::from_millis(1800));
@@ -2384,14 +2435,8 @@ mod tests {
                 .to_str()
                 .unwrap()
                 .to_owned();
-            assert_eq!(
-                response.status(),
-                if streaming {
-                    StatusCode::OK
-                } else {
-                    StatusCode::BAD_REQUEST
-                }
-            );
+            // A rejection before provider acceptance is HTTP in both modes.
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
             let wire = String::from_utf8(
                 response
                     .into_body()
@@ -2515,6 +2560,286 @@ mod tests {
             .0,
             StatusCode::OK
         );
+    }
+    fn failure_request(
+        model: &str,
+        api: &str,
+        fixture: &str,
+        stream: bool,
+    ) -> (&'static str, Value) {
+        if api == "responses" {
+            (
+                "/v1/responses",
+                json!({"model":model,"input":fixture,"stream":stream}),
+            )
+        } else {
+            (
+                "/v1/chat/completions",
+                json!({"model":model,"messages":[{"role":"user","content":fixture}],"stream":stream}),
+            )
+        }
+    }
+    fn sse_events(wire: &str) -> Vec<(Option<String>, Value)> {
+        wire.split("\n\n")
+            .filter_map(|frame| {
+                let event = frame
+                    .lines()
+                    .find_map(|l| l.strip_prefix("event:"))
+                    .map(|e| e.trim().to_owned());
+                let data = frame.lines().find_map(|l| l.strip_prefix("data:"))?.trim();
+                Some((
+                    event,
+                    serde_json::from_str(data).unwrap_or_else(|_| json!(data)),
+                ))
+            })
+            .collect()
+    }
+    async fn last_record(h: &DualHarness) -> RequestRecord {
+        for _ in 0..150 {
+            if let Some(record) = h.state.telemetry.snapshot().await.records.last() {
+                return record.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("request was not recorded");
+    }
+    #[tokio::test]
+    async fn streamed_failures_before_provider_acceptance_are_real_http_errors() {
+        for (model, fixture) in [
+            ("synthetic-openai", "overload-fixture"),
+            ("synthetic-openai", "auth-fixture"),
+            ("synthetic-openai", "quota-fixture"),
+            ("gemini-4-argon-medium", "overload-fixture"),
+            ("gemini-4-argon-medium", "auth-fixture"),
+            ("gemini-4-argon-medium", "direct-quota-fixture"),
+        ] {
+            for api in ["chat", "responses"] {
+                let h = DualHarness::new().await;
+                let (path, body) = failure_request(model, api, fixture, false);
+                let plain = h
+                    .send(axum::http::Method::POST, path, Some(body), Some("test-key"))
+                    .await;
+                let h = DualHarness::new().await;
+                let (path, body) = failure_request(model, api, fixture, true);
+                let streamed = h
+                    .send(axum::http::Method::POST, path, Some(body), Some("test-key"))
+                    .await;
+                // Before deferral this was 200 + response.created/in_progress
+                // + response.failed, which LangChain and n8n ignore.
+                assert_ne!(streamed.status(), StatusCode::OK, "{model} {fixture} {api}");
+                assert_eq!(streamed.status(), plain.status(), "{model} {fixture} {api}");
+                for header in ["content-type", "retry-after", "x-ai-router-item-storage"] {
+                    assert_eq!(
+                        streamed.headers().get(header),
+                        plain.headers().get(header),
+                        "{header}"
+                    );
+                }
+                use http_body_util::BodyExt;
+                let plain: Value =
+                    serde_json::from_slice(&plain.into_body().collect().await.unwrap().to_bytes())
+                        .unwrap();
+                let wire = streamed.into_body().collect().await.unwrap().to_bytes();
+                let streamed: Value = serde_json::from_slice(&wire).unwrap();
+                assert_eq!(streamed, plain);
+                assert!(
+                    !String::from_utf8_lossy(&wire).contains("synthetic-provider-private-detail")
+                );
+                // Monitor and telemetry classify it exactly like the nonstreaming failure.
+                let record = last_record(&h).await;
+                assert_eq!(record.status, "failed");
+                assert_eq!(
+                    record.error_code.as_deref(),
+                    streamed["error"]["code"].as_str()
+                );
+                assert_eq!(
+                    record.provider,
+                    if model == "synthetic-openai" {
+                        "openai"
+                    } else {
+                        "agy"
+                    }
+                );
+            }
+        }
+    }
+    #[tokio::test]
+    async fn midstream_failures_emit_spec_error_event_then_terminal_failure() {
+        for model in ["synthetic-openai", "gemini-4-argon-medium"] {
+            for api in ["chat", "responses"] {
+                let h = DualHarness::new().await;
+                let (path, body) = failure_request(model, api, "midstream-fixture", true);
+                let (status, wire) = h.call(path, Some(body)).await;
+                assert_eq!(status, StatusCode::OK, "{wire}");
+                assert!(!wire.contains("synthetic-provider-private-detail"));
+                let events = sse_events(&wire);
+                let record = last_record(&h).await;
+                assert_eq!(record.status, "failed");
+                let code = record.error_code.unwrap();
+                if api == "responses" {
+                    let kinds = events
+                        .iter()
+                        .map(|(kind, _)| kind.clone().unwrap())
+                        .collect::<Vec<_>>();
+                    assert_eq!(&kinds[..2], ["response.created", "response.in_progress"]);
+                    assert_eq!(
+                        &kinds[kinds.len() - 2..],
+                        ["error", "response.failed"],
+                        "{wire}"
+                    );
+                    assert!(kinds.contains(&"response.output_text.delta".to_owned()));
+                    assert!(
+                        events
+                            .iter()
+                            .enumerate()
+                            .all(|(i, (_, event))| event["sequence_number"] == i)
+                    );
+                    let error = &events[kinds.len() - 2].1;
+                    // ResponseErrorEvent fields, plus the object the SDKs raise on.
+                    assert_eq!(error["type"], "error");
+                    assert_eq!(error["code"], code.as_str());
+                    assert_eq!(error["param"], Value::Null);
+                    assert!(error["message"].is_string());
+                    assert_eq!(error["error"]["code"], code.as_str());
+                    assert_eq!(error["error"]["message"], error["message"]);
+                    assert_eq!(error["error"]["type"], "server_error");
+                    let failed = &events.last().unwrap().1["response"];
+                    assert_eq!(failed["status"], "failed");
+                    assert_eq!(failed["error"]["code"], code.as_str());
+                } else {
+                    assert_eq!(events[0].1["choices"][0]["delta"]["role"], "assistant");
+                    assert_eq!(events[1].1["choices"][0]["delta"]["content"], "partial ");
+                    let error = &events[events.len() - 2].1["error"];
+                    assert_eq!(error["code"], code.as_str());
+                    assert_eq!(error["type"], "server_error");
+                    assert_eq!(error["param"], Value::Null);
+                    assert_eq!(events.last().unwrap().1, "[DONE]");
+                }
+            }
+        }
+    }
+    #[tokio::test]
+    async fn slow_provider_acceptance_commits_the_stream_after_the_bound() {
+        let h = DualHarness::with_commit_wait(5, Duration::from_millis(100)).await;
+        let started = Instant::now();
+        let response = h
+            .send(axum::http::Method::POST, "/v1/responses",
+                Some(json!({"model":"synthetic-openai","input":"deadline-fixture overload-fixture","stream":true})), Some("test-key"))
+            .await;
+        // Headers arrive at the bound, before the provider's 700 ms answer.
+        assert!(started.elapsed() < Duration::from_millis(600));
+        assert_eq!(response.status(), StatusCode::OK);
+        use http_body_util::BodyExt;
+        let wire = String::from_utf8(
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        let kinds = sse_events(&wire)
+            .into_iter()
+            .map(|(kind, _)| kind.unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            [
+                "response.created",
+                "response.in_progress",
+                "error",
+                "response.failed"
+            ]
+        );
+        assert!(wire.contains("server_is_overloaded"));
+    }
+    #[tokio::test]
+    async fn client_disconnect_is_recorded_before_and_after_stream_commit() {
+        let h = DualHarness::new().await;
+        let pending = h.send(
+            axum::http::Method::POST,
+            "/v1/responses",
+            Some(json!({"model":"synthetic-openai","input":"deadline-fixture","stream":true})),
+            Some("test-key"),
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), pending)
+                .await
+                .is_err()
+        );
+        let record = last_record(&h).await;
+        assert_eq!(
+            (record.status.as_str(), record.error_code.as_deref()),
+            ("cancelled", Some("client_disconnected"))
+        );
+        assert!(h.state.drain(Duration::from_secs(2)).await);
+        let h = DualHarness::with_commit_wait(5, Duration::from_millis(100)).await;
+        let response = h.send(axum::http::Method::POST, "/v1/chat/completions",
+            Some(json!({"model":"synthetic-openai","messages":[{"role":"user","content":"deadline-fixture"}],"stream":true})), Some("test-key")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        drop(response);
+        let record = last_record(&h).await;
+        assert_eq!(
+            (record.status.as_str(), record.error_code.as_deref()),
+            ("cancelled", Some("client_disconnected"))
+        );
+        assert!(h.state.drain(Duration::from_secs(2)).await);
+    }
+    // Each client gets a fresh gateway per failure: overload and auth failures
+    // latch provider availability, which would mask the streamed path.
+    #[tokio::test]
+    async fn official_n8n_and_langchain_clients_raise_streamed_failures() {
+        use tokio::io::AsyncWriteExt;
+        let mut runs = 0;
+        for model in ["synthetic-openai", "gemini-4-argon-medium"] {
+            for fixture in ["overload-fixture", "auth-fixture", "midstream-fixture"] {
+                for api in ["chat", "responses"] {
+                    let h = DualHarness::new().await;
+                    let (path, body) = failure_request(model, api, fixture, true);
+                    let (status, wire) = h.call(path, Some(body)).await;
+                    let expected = if status == StatusCode::OK {
+                        json!({"status":null,"code":last_record(&h).await.error_code})
+                    } else {
+                        json!({"status":status.as_u16(),"code":serde_json::from_str::<Value>(&wire).unwrap()["error"]["code"]})
+                    };
+                    let clients = [
+                        ("python3", "tests/sdk_contract.py"),
+                        ("node", "tests/n8n_contract.mjs"),
+                        ("node", "tests/n8n_langchain_contract.mjs"),
+                    ]
+                    .map(|(program, script)| {
+                        let failure = json!({"fixture":fixture,"api":api,"status":expected["status"],"code":expected["code"]});
+                        async move {
+                            let h = DualHarness::new().await;
+                            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                            let address = listener.local_addr().unwrap();
+                            let app = h.app.clone();
+                            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+                            let mut child = tokio::process::Command::new(program)
+                                .arg(script)
+                                .stdin(std::process::Stdio::piped())
+                                .stdout(std::process::Stdio::piped())
+                                .stderr(std::process::Stdio::piped())
+                                .kill_on_drop(true)
+                                .spawn()
+                                .unwrap();
+                            let input = json!({"base_url":format!("http://{address}/v1"),"model":model,"failure":failure});
+                            child.stdin.take().unwrap().write_all(input.to_string().as_bytes()).await.unwrap();
+                            let output = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output()).await.unwrap().unwrap();
+                            server.abort();
+                            let stdout = String::from_utf8_lossy(&output.stdout);
+                            assert!(output.status.success() && stdout.contains("streamed failure"), "{script} {model} {failure}: {stdout} {}",
+                                String::from_utf8_lossy(&output.stderr));
+                        }
+                    });
+                    futures_util::future::join_all(clients).await;
+                    runs += 3;
+                }
+            }
+        }
+        assert_eq!(runs, 36);
     }
     mod compatibility_contract {
         include!("api_contract_tests.rs");

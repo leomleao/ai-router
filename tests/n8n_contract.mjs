@@ -8,7 +8,7 @@ const { createOpenAI } = await import(require.resolve('@ai-sdk/openai'));
 
 let configuration = '';
 for await (const chunk of process.stdin) configuration += chunk;
-const {base_url: BASE, model: MODEL} = JSON.parse(configuration);
+const {base_url: BASE, model: MODEL, failure: FAILURE} = JSON.parse(configuration);
 assert.ok(BASE.startsWith('http://127.0.0.1:'));
 const KEY = 'test-key';
 let checks = 0;
@@ -38,6 +38,30 @@ const provider = createOpenAI({
     return response;
   },
 });
+
+// A streamed provider failure surfaces as an error part: the HTTP status and
+// code before acceptance, the stream error object (and partial text) after.
+if (FAILURE) {
+  const result = streamText({ model: FAILURE.api === 'chat' ? provider.chat(MODEL) : provider.responses(MODEL),
+    prompt: FAILURE.fixture, maxRetries: 0, abortSignal: AbortSignal.timeout(30_000), onError() {} });
+  let text = '';
+  const errors = [];
+  for await (const part of result.fullStream) {
+    if (part.type === 'text-delta') text += part.text;
+    if (part.type === 'error') errors.push(part.error);
+  }
+  check(errors.length === 1 && wire.length === 1, 'One surfaced error from one request, without retry');
+  const [error] = errors;
+  if (FAILURE.status === null) {
+    check(text === 'partial ' && (error.code ?? error.error?.code) === FAILURE.code,
+      `Mid-stream failure after partial output: ${JSON.stringify(error)} ${text}`);
+  } else {
+    check(error.statusCode === FAILURE.status && wire[0].status === FAILURE.status
+      && JSON.parse(error.responseBody).error.code === FAILURE.code, `HTTP failure ${error.statusCode}`);
+  }
+  console.log(`PASS: ${checks} n8n Vercel SDK streamed failure checks`);
+  process.exit(0);
+}
 
 function options(style, budget, neutralDefaults = false) {
   return {

@@ -158,6 +158,19 @@ and its children fall through to 404. All protected routes require a model-scope
 client key. Capabilities currently report schema version 3 and explicit
 unsupported features.
 
+Streaming requests commit their SSE response only after the provider's first
+`RunEvent` (normally `Init`, sent after accepted upstream response headers) or
+after `STREAM_COMMIT_WAIT` (15 seconds, the keepalive interval). A provider
+`Error` before that returns the nonstreaming `ApiError` response, so status,
+body, `retry-after` and telemetry classification match the nonstreaming path.
+After commit, `StreamRenderer` turns an `Error` into a Responses `error` event
+followed by `response.failed`, or a Chat chunk with a top-level `error` object
+followed by `[DONE]`. The `error` event carries the OpenAPI `ResponseErrorEvent`
+fields and the same nested `error` object as the HTTP body (with `param: null`),
+because openai-node and openai-python raise only on that object. A client that
+disconnects before or after commit drops the same `CompletionGuard`, which
+cancels the provider and records `client_disconnected`.
+
 ## Monitor and Docker boundary
 
 `monitor::Telemetry` stores retained request metadata separately from a

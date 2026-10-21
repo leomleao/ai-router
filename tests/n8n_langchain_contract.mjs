@@ -6,7 +6,7 @@ const require=createRequire('/opt/n8n-contract/package.json');
 const {ChatOpenAI}=await import(require.resolve('@langchain/openai'));
 const {HumanMessage,ToolMessage}=await import(require.resolve('@langchain/core/messages'));
 let input='';for await (const chunk of process.stdin) input+=chunk;
-const {base_url,model}=JSON.parse(input);
+const {base_url,model,failure}=JSON.parse(input);
 assert.ok(base_url.startsWith('http://127.0.0.1:'));
 let checks=0;let wire=[];
 function check(value,message){assert.ok(value,message);checks++;}
@@ -15,6 +15,22 @@ const fetchLocal=async(url,init)=>{
   const body=JSON.parse(init.body);wire.push(body);
   return fetch(url,init);
 };
+// LangChain ignores response.failed, so a streamed failure must reach it as
+// an HTTP error before acceptance, or as the SDK-raised `error` event after.
+if (failure) {
+  const llm=new ChatOpenAI({model,apiKey:'test-key',maxRetries:0,timeout:10000,
+    useResponsesApi:failure.api==='responses',configuration:{baseURL:base_url,fetch:fetchLocal}});
+  let text='';let caught;
+  try {
+    for await (const chunk of await llm.stream([new HumanMessage(failure.fixture)]))
+      text+=typeof chunk.content==='string'?chunk.content:chunk.content.filter(p=>p.type==='text').map(p=>p.text).join('');
+  } catch (error) { caught=error; }
+  check(caught,'Workflow stream raises instead of ending silently');
+  check(caught.status===(failure.status??undefined)&&caught.code===failure.code,`${caught.status} ${caught.code}`);
+  check(failure.status!==null||text==='partial ','Partial output precedes the mid-stream failure');
+  console.log(`PASS: ${checks} n8n LangChain streamed failure checks`);
+  process.exit(0);
+}
 for (const responses of [false,true]) {
   const llm=new ChatOpenAI({model,apiKey:'test-key',maxRetries:0,timeout:10000,
     useResponsesApi:responses,configuration:{baseURL:base_url,fetch:fetchLocal}});

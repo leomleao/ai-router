@@ -218,12 +218,13 @@ that the whole plan is exhausted or provide a reset time. This follows the
 
 ### Interpreting OpenAI failures
 
-`server_is_overloaded` means OpenAI reported temporary overload. Non-streaming
-Chat Completions and Responses requests return HTTP 503 with the original code
-and a fixed explanation to try again shortly. For streaming requests, the
-already-started HTTP response stays open long enough to deliver the explanation
-in the Chat error event or Responses `response.failed` event; its HTTP status
-cannot be changed after headers are sent. The router does not automatically
+`server_is_overloaded` means OpenAI reported temporary overload. Chat
+Completions and Responses requests return HTTP 503 with the original code and a
+fixed explanation to try again shortly. Streaming requests do too, because a
+stream's HTTP 200 waits for the provider to accept the request (at most 15
+seconds). Only a failure after that is delivered in-stream: a Chat chunk with a
+top-level `error` object, or a Responses `error` event followed by
+`response.failed`; its HTTP status cannot change once headers are sent. The router does not automatically
 retry, switch accounts or fall back to another provider. Normal successful
 provider discovery can clear this transient condition; it does not require
 signing in again.
