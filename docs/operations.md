@@ -118,6 +118,22 @@ callback publication, and stopped-gateway requirement for state mutations.
 OpenAI logout and resume use outbound networking for remote revocation or grant
 renewal; they do not publish callback ports. Other non-login one-offs are offline.
 
+### Adopting a newly reviewed baseline
+
+The 2026-10-21 release adopts `omp-d5cd750e-antigravity-v2` / Hub 2.24.0.
+The OAuth registration is unchanged, so an existing matching Google sign-in can
+be retained. Build the new image, stop the gateway, inspect
+`./scripts/login.sh agy status`, then run `./scripts/login.sh agy resume` before
+starting it again. Use the actual image/container/volume overrides for a custom
+local deployment. An old saved baseline returns `agy_baseline_update_required`
+until this explicit step; the status includes `saved_baseline` and
+`baseline_update_required`. Review any existing account/protocol restrictions
+before resuming. Do not log in again or delete state just to update the baseline.
+
+See [the upstream review](upstream-review-2026-10-21.md) for evidence, exact
+operator commands and the live-validation boundary. None of these changes
+requires an additional environment variable.
+
 ### Upstream release advisory and manual updates
 
 At startup the router checks the public Antigravity Hub version manifest and
@@ -189,6 +205,16 @@ available.
 2 and 8. Antigravity has its own `AI_ROUTER_MAX_CONCURRENT` and
 `AI_ROUTER_MAX_QUEUE`, also defaulting to 2 and 8. Do not mount the OpenAI auth
 volume into the Antigravity helper or the reverse.
+
+### OpenAI usage visibility
+
+The public Sign in with ChatGPT route does not document a numeric remaining-plan
+quota endpoint. The monitor reports that remaining allowance is unavailable and
+links to ChatGPT Usage; it does not call Codex's separate backend usage APIs.
+`subscription_sharing_usage_limit_exceeded` pauses requests until explicit
+recovery, but may describe a plan-wide or app-specific limit. It does not prove
+that the whole plan is exhausted or provide a reset time. This follows the
+[official OpenAI documentation](https://developers.openai.com/siwc/token-sharing-open-source/errors-and-recovery).
 
 ### Interpreting OpenAI failures
 

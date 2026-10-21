@@ -3,14 +3,14 @@
 Status: direct model-only implementation present on 2026-10-20; local validation
 and live acceptance in progress. No supported renewable-token handoff was found
 in public interfaces; operator selected a separate OMP-registration sign-in.
-Research refreshed: 2026-10-20. Historical research below dates to 2026-10-04.
+Latest maintenance review: [2026-10-21](upstream-review-2026-10-21.md), adopting Hub 2.24.0 and OMP d5cd750e. The 2026-10-20 research below remains historical evidence; the original proposal dates to 2026-10-04.
 
 ## Current decision and refreshed evidence
 
 The operator selected a complete replacement of AGY subprocess inference on
 `main`, including removal of native-agent endpoints. The current implementation
-is preserved locally as `archive/agy-cli-2026-10-20`, pointing to
-`4d23e015ba273ed1600ec43c7815f791b4c04286`. This branch has not been pushed.
+is preserved as the published `archive/agy-cli-2026-10-20`, pointing to
+`4d23e015ba273ed1600ec43c7815f791b4c04286`. This branch has been pushed for rollback.
 OpenAI remains a separate provider. Direct-provider work is described in the [plan](direct-antigravity-plan.md) and
 [DAG](direct-antigravity-dag.md).
 

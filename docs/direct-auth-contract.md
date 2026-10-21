@@ -8,7 +8,7 @@ reuse is not implemented by extracting or copying its contents.
 
 The operator explicitly selected fresh consent using the reviewed OMP installed
 application registration. The baseline is upstream revision
-`2220e58146ebe31508e7a216242840d373e082d0`,
+`d5cd750e41fede277f9eb933455da92a0738915e`,
 `packages/catalog/src/compat/rules/auth/google-antigravity.kdl`. The registration
 is bundled in that public source; it is not evidence of provider authorization
 for a separate application. An operator-owned reviewed installed-application
@@ -72,6 +72,21 @@ separately. The checked-in baseline is compiled into the binary and checked
 against the adapter revision, source commit, identity, destinations and paths.
 No runtime baseline file, endpoint/account/CLI fallback or network-driven
 identity update changes authenticated dispatch.
+
+## Adopting the 2026-10-21 baseline
+
+The reviewed baseline is `omp-d5cd750e-antigravity-v2`, using the explicit Hub
+2.24.0 version pin. Its registration, scopes and project flow match the prior
+baseline. Existing sessions are preserved, but prior-baseline state returns
+`agy_baseline_update_required` before token use or dispatch. Status exposes
+`saved_baseline` and `baseline_update_required` alongside the compiled `adapter`.
+Stop the gateway and explicitly run `login.sh agy status`, then
+`login.sh agy resume` with the new image to adopt this reviewed baseline. Resume
+validates compiled metadata and configuration before changing state, retains
+the matching session and project, and rotates the generation under the exclusive
+dispatch barrier. It does not renew consent or retry a generation. Inspect any
+saved account/protocol restriction before recovery; a new image never silently
+clears it. See the [review and upgrade steps](upstream-review-2026-10-21.md).
 
 ## Upstream advisory and review lifecycle
 

@@ -4,7 +4,7 @@
 
 The Antigravity adapter translates selected protocol behaviour from
 [oh-my-pi](https://github.com/can1357/oh-my-pi), revision
-`2220e58146ebe31508e7a216242840d373e082d0`. Source provenance:
+`d5cd750e41fede277f9eb933455da92a0738915e` (reviewed 2026-10-21). Source provenance:
 
 - `packages/ai/src/providers/google-gemini-cli.ts`
 - `packages/ai/src/providers/google-shared.ts`

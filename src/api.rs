@@ -1522,6 +1522,10 @@ mod tests {
         })
     }
     async fn mock_direct_response(Json(body): Json<Value>) -> Response {
+        assert!(
+            body.get("requestType").is_none(),
+            "reviewed Antigravity envelope must omit requestType"
+        );
         if let Some(tools) = body.pointer("/request/tools").and_then(Value::as_array) {
             for tool in tools {
                 for declaration in tool["functionDeclarations"].as_array().unwrap() {

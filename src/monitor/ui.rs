@@ -829,8 +829,12 @@ fn quota_lines(s: &Snapshot, p: Palette) -> Vec<Line<'static>> {
         }
         if !had_quota {
             lines.push(
-                Line::from(format!("{name} quota has not been reported."))
-                    .style(Style::default().fg(p.muted)),
+                Line::from(if name == "OpenAI" {
+                    "OpenAI remaining allowance is unavailable through this route.".into()
+                } else {
+                    format!("{name} quota has not been reported.")
+                })
+                .style(Style::default().fg(p.muted)),
             );
         }
     }
@@ -840,11 +844,49 @@ fn quota_lines(s: &Snapshot, p: Palette) -> Vec<Line<'static>> {
                 .style(Style::default().fg(p.info)),
         );
         lines.push(Line::from(format!(
-            "Pinned {} · observed {} · {}",
+            "Hub: reviewed {} · observed {}",
             advisory["pinned_version"].as_str().unwrap_or("unknown"),
             advisory["observed_version"].as_str().unwrap_or("unknown"),
-            advisory["alerts"]
         )));
+        let short = |key: &str| {
+            advisory[key]
+                .as_str()
+                .unwrap_or("unknown")
+                .chars()
+                .take(8)
+                .collect::<String>()
+        };
+        lines.push(Line::from(format!(
+            "OMP: reviewed {} · observed {}",
+            short("pinned_revision"),
+            short("observed_revision")
+        )));
+        if let Some(alerts) = advisory["alerts"].as_array() {
+            if alerts.is_empty() {
+                lines.push(
+                    Line::from("Release metadata matches the reviewed baseline.")
+                        .style(Style::default().fg(p.muted)),
+                );
+            }
+            for alert in alerts {
+                let message = match alert.as_str() {
+                    Some("manifest_version_changed") => "A different Hub release needs review.",
+                    Some("upstream_revision_changed") => {
+                        "OMP source has changed since this review."
+                    }
+                    Some("manifest_check_failed") => {
+                        "Hub release check failed; keeping the reviewed pin."
+                    }
+                    Some("revision_check_failed") => {
+                        "OMP revision check failed; keeping the reviewed pin."
+                    }
+                    Some("manifest_check_stale") => "Hub release check is stale.",
+                    Some("revision_check_stale") => "OMP revision check is stale.",
+                    _ => "Release metadata needs review.",
+                };
+                lines.push(Line::from(message).style(Style::default().fg(p.warn)));
+            }
+        }
     }
     if !s.provider.models.is_empty() {
         lines.push(Line::from(""));
@@ -1489,6 +1531,30 @@ mod tests {
         status.authenticated = false;
         status.error = Some("provider_disabled".into());
         assert_eq!(provider_state(&status), "disabled");
+    }
+
+    #[tokio::test]
+    async fn quota_and_release_advisory_explain_unknown_allowance_and_review_needed() {
+        let mut snapshot = fixture().await;
+        snapshot.openai_provider.quota = None;
+        snapshot.antigravity_release = Some(serde_json::json!({
+            "pinned_version":"2.24.0","observed_version":"2.25.0",
+            "pinned_revision":"d5cd750e41fede277f9eb933455da92a0738915e",
+            "observed_revision":"0123456789abcdef0123456789abcdef01234567",
+            "alerts":["manifest_version_changed","upstream_revision_changed"]}));
+        let app = App::new(86400);
+        let text = quota_lines(&snapshot, Palette::new(&app))
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("OpenAI remaining allowance is unavailable through this route."));
+        assert!(text.contains("Hub: reviewed 2.24.0 · observed 2.25.0"));
+        assert!(text.contains("OMP: reviewed d5cd750e · observed 01234567"));
+        assert!(text.contains("A different Hub release needs review."));
+        assert!(text.contains("OMP source has changed since this review."));
+        assert!(!text.contains("manifest_version_changed"));
+        assert!(text.contains("does not affect readiness"));
     }
 
     #[tokio::test]

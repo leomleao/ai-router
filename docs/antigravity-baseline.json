@@ -1,12 +1,12 @@
 {
   "schema_version": 1,
-  "adapter_revision": "omp-2220e581-antigravity-v1",
-  "review_date": "2026-10-20",
+  "adapter_revision": "omp-d5cd750e-antigravity-v2",
+  "review_date": "2026-10-21",
   "provider_id": "agy",
   "provider_label": "Antigravity",
   "source": {
     "repository": "https://github.com/can1357/oh-my-pi",
-    "commit": "2220e58146ebe31508e7a216242840d373e082d0",
+    "commit": "d5cd750e41fede277f9eb933455da92a0738915e",
     "license": "MIT",
     "files": [
       "packages/ai/src/providers/google-gemini-cli.ts",
@@ -23,15 +23,67 @@
       "packages/ai/src/utils/schema/fields.ts"
     ],
     "evidence_kind": "Pinned public OMP source and its recorded Antigravity Hub observations; not an independently documented official CLI protocol or proof of account compatibility.",
-    "notice": "THIRD_PARTY_NOTICES.md"
+    "notice": "THIRD_PARTY_NOTICES.md",
+    "review": "docs/upstream-review-2026-10-21.md",
+    "previous_commit": "2220e58146ebe31508e7a216242840d373e082d0",
+    "file_sha256": {
+      "packages/ai/src/providers/google-gemini-cli.ts": {
+        "previous": "f5d59b6639dcf0153dbdd1f977deb08e352d5c9d3f9a996146979762373a6476",
+        "reviewed": "6f65dc1870d83407ec02a5f38d92c48982c3f210a4c25e2a1ce9f397f6fd0913"
+      },
+      "packages/ai/src/providers/google-shared.ts": {
+        "previous": "85145665024481bf4d8a439f2c3563db33a8e7b25bc0cd5d295c42ef8dd099ad",
+        "reviewed": "85145665024481bf4d8a439f2c3563db33a8e7b25bc0cd5d295c42ef8dd099ad"
+      },
+      "packages/ai/src/registry/oauth/google-antigravity.ts": {
+        "previous": "d3a16a02261e9ef98a87b222016c35d9e1fd2f71cb1dfce1a0399b81b5c094d6",
+        "reviewed": "d3a16a02261e9ef98a87b222016c35d9e1fd2f71cb1dfce1a0399b81b5c094d6"
+      },
+      "packages/catalog/src/wire/gemini-headers.ts": {
+        "previous": "39f9533ee0021195b8c5bea2442a966fa947e0c2e0574be78598cce56e92550a",
+        "reviewed": "39f9533ee0021195b8c5bea2442a966fa947e0c2e0574be78598cce56e92550a"
+      },
+      "packages/catalog/src/discovery/antigravity.ts": {
+        "previous": "40a7f03a9995e3d6f56f4de9b293025429524add6450d138188880d612248dea",
+        "reviewed": "40a7f03a9995e3d6f56f4de9b293025429524add6450d138188880d612248dea"
+      },
+      "packages/catalog/src/compat/rules/auth/google-antigravity.kdl": {
+        "previous": "f5102c481a585403bf3a7611ebbb32a679fce9263d1793ebe53905ea15ba6c6d",
+        "reviewed": "f5102c481a585403bf3a7611ebbb32a679fce9263d1793ebe53905ea15ba6c6d"
+      },
+      "packages/catalog/src/compat/rules/providers/google-antigravity.kdl": {
+        "previous": "d97b13e79b9d5a4431bb297de00991f531a6984ec4dd2a35a40682a61e7dcd72",
+        "reviewed": "d97b13e79b9d5a4431bb297de00991f531a6984ec4dd2a35a40682a61e7dcd72"
+      },
+      "packages/catalog/src/compat/rules/classes/gemini.kdl": {
+        "previous": "9bf4fd79d468b3b15b83711cdc682c32e2d1e6d06a5e6a5218415ce1c34a8c80",
+        "reviewed": "9bf4fd79d468b3b15b83711cdc682c32e2d1e6d06a5e6a5218415ce1c34a8c80"
+      },
+      "packages/catalog/src/compat/rules/taxonomy/_collapse.kdl": {
+        "previous": "e2bbb3a97be5c7e6f1062f425629c71a2563afe376f58f5d566172c66b85b307",
+        "reviewed": "e2bbb3a97be5c7e6f1062f425629c71a2563afe376f58f5d566172c66b85b307"
+      },
+      "packages/catalog/src/compat/rules/classes/anthropic.kdl": {
+        "previous": "44f95848f146a2fed268771e5754fc3706ad6a864c43a36a97d31f40ab24385f",
+        "reviewed": "a1bac4e5c926bab68b22580192a864e9f890def407ec9a1e966fc6197de53718"
+      },
+      "packages/ai/src/utils/schema/normalize.ts": {
+        "previous": "621d499705bbc14bd2d0a85ca21ad2234ada7fa4a3670e47ab907d4547eb99c9",
+        "reviewed": "621d499705bbc14bd2d0a85ca21ad2234ada7fa4a3670e47ab907d4547eb99c9"
+      },
+      "packages/ai/src/utils/schema/fields.ts": {
+        "previous": "7bb5634a92529c195dc695be09344168821c8f3e532bfb041107573f0a858595",
+        "reviewed": "7bb5634a92529c195dc695be09344168821c8f3e532bfb041107573f0a858595"
+      }
+    }
   },
   "identity": {
-    "user_agent": "antigravity/hub/2.19.1 (aidev_client; os_type=darwin; arch=arm64; cl=963137146)",
-    "version": "2.19.1",
+    "user_agent": "antigravity/hub/2.24.0 (aidev_client; os_type=darwin; arch=arm64; cl=963137146)",
+    "version": "2.24.0",
     "automatic_identity_updates": false,
     "caller_identity_overrides": false,
     "request_user_agent": "antigravity",
-    "request_type": "agent"
+    "evidence": "Version pinned from the official 2026-10-21 Hub manifest using the unchanged reviewed OMP constructor. The darwin/arm64 identity and cl=963137146 remain the constructor constants, not a new native-client traffic capture; the artifact build locator is not treated as a changelist."
   },
   "destinations": {
     "inference_origin": "https://daily-cloudcode-pa.googleapis.com",
@@ -63,7 +115,8 @@
       "client_id_sha256": "bf00c418024ba6bf606ccdc37120976e41bc429dd1d46ecf16a729aa532626ea",
       "client_secret_sha256": "1d2f041093fd95aa8995a038c711d50a7960da09a505381c09a745d6ad0ecc60",
       "runtime_verification": "Compiled baseline checks decoded registration fingerprints; saved session client ID must match configuration before authenticated traffic, including unexpired tokens. Metadata drift never auto-updates registration."
-    }
+    },
+    "baseline_upgrade": "A stored prior baseline remains blocked until the operator explicitly runs agy resume with the gateway stopped. Resume preserves the matching OAuth session and rotates its generation; no automatic state migration or new consent is performed."
   },
   "request_contract": {
     "envelope_fields": [
@@ -71,8 +124,7 @@
       "model",
       "request",
       "requestId",
-      "userAgent",
-      "requestType"
+      "userAgent"
     ],
     "request_id_shape": "agent/<ephemeral-agent-uuid>/<unix-milliseconds>/<ephemeral-trajectory-uuid>/2",
     "session_id_shape": "Negative decimal 63-bit value encoded as a string, derived stably from first user text and scoped to owner, exact model and account generation; bounded negative random fallback without a nonempty first user turn.",
@@ -97,7 +149,8 @@
     "automatic_generation_retries": false,
     "claude_thinking_header": "anthropic-beta: interleaved-thinking-2025-05-14 on generation for the six reviewed Claude 5.5 tier IDs only",
     "session_continuation_validation": "Stable scoped negative-decimal session IDs, canonical function-call parts and explicit private-state requests follow reviewed source behavior. The decisive live Claude continuation fix was omitting standalone empty visible text/signature parts; no endpoint or identity update was needed.",
-    "claude_private_thought_state": "For the six reviewed Claude 5.5 tier IDs, generationConfig.thinkingConfig.includeThoughts is true to receive private thought/signature replay state. No numeric thinking budget, level override, or hard output cap is inferred."
+    "claude_private_thought_state": "For the six reviewed Claude 5.5 tier IDs, generationConfig.thinkingConfig.includeThoughts is true to receive private thought/signature replay state. No numeric thinking budget, level override, or hard output cap is inferred.",
+    "request_type": "Omitted, matching the reviewed upstream removal of requestType:agent."
   },
   "model_ids_when_present_in_usable_raw_roster": [
     "gemini-4-argon-low",

@@ -968,13 +968,9 @@ fn failure(status: u16, code: &str) -> ApiError {
     ApiError::new(
         status,
         code,
-        if code == "subscription_sharing_usage_limit_exceeded" {
-            "ChatGPT plan usage limit reached; manage usage at https://chatgpt.com/settings/usage"
-        } else {
-            crate::protocol::error_explanation("openai", code).unwrap_or(
-                "OpenAI subscription provider could not complete this request; consult private provider status",
-            )
-        },
+        crate::protocol::error_explanation("openai", code).unwrap_or(
+            "OpenAI subscription provider could not complete this request; consult private provider status",
+        ),
     )
 }
 
@@ -1120,6 +1116,8 @@ mod tests {
         );
         assert_eq!(e.status, 429);
         assert!(!e.message.contains("synthetic-token"));
+        assert!(e.message.contains("for this app or plan"));
+        assert!(e.message.contains("https://chatgpt.com/settings/usage"));
     }
 
     #[tokio::test]

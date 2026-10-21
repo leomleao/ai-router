@@ -1,7 +1,7 @@
 //! Pinned Cloud Code Assist wire conversion. No transport, credentials, or logging.
 //!
 //! Protocol provenance: oh-my-pi, MIT, commit
-//! 2220e58146ebe31508e7a216242840d373e082d0, packages/ai/src/providers/
+//! d5cd750e41fede277f9eb933455da92a0738915e, packages/ai/src/providers/
 //! google-gemini-cli.ts and google-shared.ts, plus packages/catalog/src/wire/
 //! gemini-headers.ts. See THIRD_PARTY_NOTICES.md for the upstream notice.
 //! Visible text is preserved. Tool schemas use CCA-compatible provider hints;
@@ -567,7 +567,7 @@ pub fn serialize(request: &RunRequest, project: &str, replay: &[Value]) -> Resul
     }
     let envelope = json!({"project":project,"model":request.model,"request":body,
         "requestId":format!("agent/{agent}/{}/{trajectory}/2",chrono::Utc::now().timestamp_millis()),
-        "userAgent":"antigravity","requestType":"agent"});
+        "userAgent":"antigravity"});
     if serde_json::to_vec(&envelope).map_or(true, |v| v.len() > MAX_OUTPUT_BYTES) {
         return Err(ApiError::bad_request(
             "Antigravity request exceeds byte limits",
@@ -1135,7 +1135,22 @@ mod tests {
             json!([{"role":"user","parts":[{"text":"hello"}]}])
         );
         assert!(body["request"].get("generationConfig").is_none());
-        assert_eq!(body["requestType"], "agent");
+        assert!(body.get("requestType").is_none());
+        let baseline: Value =
+            serde_json::from_str(include_str!("../docs/antigravity-baseline.json")).unwrap();
+        let actual: HashSet<_> = body
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let expected: HashSet<_> = baseline["request_contract"]["envelope_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|field| field.as_str().unwrap())
+            .collect();
+        assert_eq!(actual, expected);
         assert!(
             body["request"]["sessionId"]
                 .as_str()

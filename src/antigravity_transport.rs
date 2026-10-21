@@ -628,8 +628,14 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        let operator =
-            AntigravityAuth::new(d.path().join("state"), OAuthConfig::default()).unwrap();
+        let operator = AntigravityAuth::new(
+            d.path().join("state"),
+            OAuthConfig {
+                client_id: "synthetic-client".into(),
+                client_secret: None,
+            },
+        )
+        .unwrap();
         operator
             .block_for_generation(Restriction::Account, &generation)
             .await
@@ -685,8 +691,14 @@ mod tests {
             .await
             .unwrap();
         assert!(response.chunk().await.unwrap().is_some());
-        let operator =
-            AntigravityAuth::new(d.path().join("state"), OAuthConfig::default()).unwrap();
+        let operator = AntigravityAuth::new(
+            d.path().join("state"),
+            OAuthConfig {
+                client_id: "synthetic-client".into(),
+                client_secret: None,
+            },
+        )
+        .unwrap();
         operator
             .block_for_generation(Restriction::Account, &generation)
             .await

@@ -98,6 +98,7 @@ change. Neither provider is promised to enforce an output-token cap.
 
 ## Operations and design notes
 
+[The latest upstream review](docs/upstream-review-2026-10-21.md) records the Hub 2.24.0 baseline and explicit session-preserving upgrade.
 [Local operations](docs/operations.md) covers login, volumes, OpenAI opt-in,
 and monitoring. [Capabilities](docs/capabilities.md) describes the current
 model-only surface and validation limits. [Interfaces](docs/interfaces.md)

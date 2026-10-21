@@ -9,8 +9,8 @@ use std::{
 };
 use tokio::sync::Mutex;
 
-pub const PINNED_VERSION: &str = "2.19.1";
-pub const PINNED_REVISION: &str = "2220e58146ebe31508e7a216242840d373e082d0";
+pub const PINNED_VERSION: &str = "2.24.0";
+pub const PINNED_REVISION: &str = "d5cd750e41fede277f9eb933455da92a0738915e";
 pub const MANIFEST_URL: &str = "https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest/latest-arm64-mac.yml";
 pub const REVISION_URL: &str = "https://api.github.com/repos/can1357/oh-my-pi/commits/main";
 const MAX_BYTES: usize = 64 * 1024;
@@ -291,7 +291,7 @@ mod tests {
             "version: '2.19.1' # release",
             "  version : \"2.19.1\"\r\n",
         ] {
-            assert_eq!(parse_manifest(text).unwrap(), PINNED_VERSION);
+            assert_eq!(parse_manifest(text).unwrap(), "2.19.1");
         }
         for text in [
             "version: 2.19.1\nversion: 2.19.1",

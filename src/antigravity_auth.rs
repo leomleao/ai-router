@@ -1,6 +1,6 @@
 //! Router-owned Google authorization. Never imports AGY/OMP token files.
 //! All authenticated operations share this gate and fixed, reviewed origins.
-//! OAuth registration provenance: OMP 2220e581, catalog auth/google-antigravity.kdl.
+//! OAuth registration provenance: OMP d5cd750e, catalog auth/google-antigravity.kdl.
 //! This bundled installed-app registration was explicitly selected by the operator.
 //! Login is an explicit account recovery exception; protocol restrictions still apply.
 use crate::protocol::ApiError;
@@ -33,8 +33,8 @@ use tokio_util::sync::CancellationToken;
 
 pub const CCA_ORIGIN: &str = "https://daily-cloudcode-pa.googleapis.com";
 pub const PINNED_USER_AGENT: &str =
-    "antigravity/hub/2.19.1 (aidev_client; os_type=darwin; arch=arm64; cl=963137146)";
-pub const BASELINE_REVISION: &str = "omp-2220e581-antigravity-v1";
+    "antigravity/hub/2.24.0 (aidev_client; os_type=darwin; arch=arm64; cl=963137146)";
+pub const BASELINE_REVISION: &str = "omp-d5cd750e-antigravity-v2";
 /// The reviewed baseline is compiled into the binary, never loaded from a
 /// runtime path or changed by release metadata or environment variables.
 pub fn baseline_valid() -> bool {
@@ -50,8 +50,14 @@ fn baseline_document_valid(document: &str) -> bool {
         && v["schema_version"] == 1
         && v["adapter_revision"] == BASELINE_REVISION
         && v.pointer("/identity/user_agent").and_then(Value::as_str) == Some(PINNED_USER_AGENT)
+        && v.pointer("/identity/version").and_then(Value::as_str)
+            == Some(crate::antigravity_release::PINNED_VERSION)
+        && PINNED_USER_AGENT.starts_with(&format!(
+            "antigravity/hub/{} ",
+            crate::antigravity_release::PINNED_VERSION
+        ))
         && v.pointer("/source/commit").and_then(Value::as_str)
-            == Some("2220e58146ebe31508e7a216242840d373e082d0")
+            == Some(crate::antigravity_release::PINNED_REVISION)
         && [
             ("inference_origin", CCA_ORIGIN),
             (
@@ -359,7 +365,7 @@ impl AntigravityAuth {
         let s = lock.read()?;
         self.observe_state(&s, &lock);
         Ok(
-            json!({"provider":"agy","adapter":BASELINE_REVISION,"authenticated":s.session.is_some(),"available":allowed(&s,None).is_ok() && self.ensure_registration(&s).is_ok(),"baseline_valid":baseline_valid(),"bundled_registration_valid":bundled_registration_valid(&compiled_baseline()),"registration_source":if self.config.validate().is_err(){"unconfigured"}else if registration_matches_baseline(&self.config,&compiled_baseline()){"reviewed_omp"}else{"operator_configured"},"session_registration_matches":s.session.as_ref().map(|session|session.client_id == self.config.client_id),"generation":s.generation,"protocol_blocked":s.protocol_block,"account_restriction":s.account_block,"project_resolved":s.session.as_ref().is_some_and(|s|!s.project.is_empty()),"registration_configured":self.config.validate().is_ok(),"legacy_auth_import":"unsupported_no_documented_handoff"}),
+            json!({"provider":"agy","adapter":BASELINE_REVISION,"authenticated":s.session.is_some(),"available":allowed(&s,None).is_ok() && self.ensure_registration(&s).is_ok(),"baseline_valid":baseline_valid(),"saved_baseline":s.baseline,"baseline_update_required":s.baseline != BASELINE_REVISION,"bundled_registration_valid":bundled_registration_valid(&compiled_baseline()),"registration_source":if self.config.validate().is_err(){"unconfigured"}else if registration_matches_baseline(&self.config,&compiled_baseline()){"reviewed_omp"}else{"operator_configured"},"session_registration_matches":s.session.as_ref().map(|session|session.client_id == self.config.client_id),"generation":s.generation,"protocol_blocked":s.protocol_block,"account_restriction":s.account_block,"project_resolved":s.session.as_ref().is_some_and(|s|!s.project.is_empty()),"registration_configured":self.config.validate().is_ok(),"legacy_auth_import":"unsupported_no_documented_handoff"}),
         )
     }
     pub async fn availability_error(&self) -> Option<ApiError> {
@@ -553,6 +559,10 @@ impl AntigravityAuth {
     }
     /// Explicit recovery is generation-bound and never retries the failed request.
     pub async fn resume(&self, expected_generation: &str) -> Result<(), ApiError> {
+        if !baseline_valid() {
+            return Err(restricted(Restriction::Protocol));
+        }
+        self.config.validate()?;
         let deadline = Instant::now() + Duration::from_secs(20);
         let _write = tokio::time::timeout_at(deadline.into(), self.gate.write())
             .await
@@ -615,9 +625,7 @@ impl AntigravityAuth {
             .lock(Instant::now() + Duration::from_secs(5))
             .await?
             .read()?;
-        if !baseline_valid() || initial.protocol_block || initial.baseline != BASELINE_REVISION {
-            return Err(restricted(Restriction::Protocol));
-        }
+        validate_baseline(&initial)?;
         let initial_generation = initial.generation;
         let state = random();
         let verifier = random();
@@ -751,9 +759,7 @@ impl AntigravityAuth {
                 "Antigravity session changed during explicit sign-in",
             ));
         }
-        if !baseline_valid() || state.protocol_block || state.baseline != BASELINE_REVISION {
-            return Err(restricted(Restriction::Protocol));
-        }
+        validate_baseline(&state)?;
         let result = self.bounded(request, deadline).await;
         // Never acquire the exclusive closure barrier while retaining our own
         // shared admission or local read guard.
@@ -858,6 +864,19 @@ impl AntigravityAuth {
         }
     }
 }
+fn validate_baseline(s: &State) -> Result<(), ApiError> {
+    if !baseline_valid() || s.protocol_block {
+        return Err(restricted(Restriction::Protocol));
+    }
+    if s.baseline != BASELINE_REVISION {
+        return Err(ApiError::new(
+            503,
+            "agy_baseline_update_required",
+            "Antigravity has a newly reviewed baseline. Stop the gateway, run login.sh agy status, then login.sh agy resume to adopt it while keeping the existing sign-in.",
+        ));
+    }
+    Ok(())
+}
 fn allowed(s: &State, generation: Option<&str>) -> Result<(), ApiError> {
     if generation.is_some_and(|g| g != s.generation) {
         return Err(ApiError::new(
@@ -866,9 +885,7 @@ fn allowed(s: &State, generation: Option<&str>) -> Result<(), ApiError> {
             "Antigravity session changed before dispatch",
         ));
     }
-    if !baseline_valid() || s.protocol_block || s.baseline != BASELINE_REVISION {
-        return Err(restricted(Restriction::Protocol));
-    }
+    validate_baseline(s)?;
     if let Some(kind) = s.account_block {
         return Err(restricted(kind));
     }
@@ -1367,6 +1384,86 @@ mod tests {
             .await
             .unwrap();
         assert!(b.availability_error().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn reviewed_upgrade_requires_explicit_resume_and_preserves_the_matching_session() {
+        let (_root, auth) = store();
+        let generation = seed(&auth).await;
+        let lock = auth
+            .lock(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        let mut state = lock.read().unwrap();
+        state.baseline = "omp-2220e581-antigravity-v1".into();
+        let session_before = serde_json::to_value(&state.session).unwrap();
+        lock.write(&state).unwrap();
+        drop(lock);
+        let status = auth.status().await.unwrap();
+        assert_eq!(status["baseline_update_required"], true);
+        assert_eq!(status["protocol_blocked"], false);
+        assert_eq!(status["authenticated"], true);
+        assert_eq!(status["available"], false);
+        assert_eq!(
+            auth.token(Instant::now() + Duration::from_secs(1))
+                .await
+                .err()
+                .unwrap()
+                .code,
+            "agy_baseline_update_required"
+        );
+        assert_eq!(
+            auth.dispatch_guard(&generation, Instant::now() + Duration::from_secs(1))
+                .await
+                .err()
+                .unwrap()
+                .code,
+            "agy_baseline_update_required"
+        );
+
+        auth.resume(&generation).await.unwrap();
+        let lock = auth
+            .lock(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        let after = lock.read().unwrap();
+        assert_eq!(
+            serde_json::to_value(&after.session).unwrap(),
+            session_before
+        );
+        assert_eq!(after.baseline, BASELINE_REVISION);
+        assert_ne!(after.generation, generation);
+        let current = after.generation;
+        drop(lock);
+        assert_eq!(
+            auth.status().await.unwrap()["baseline_update_required"],
+            false
+        );
+        assert!(auth.availability_error().await.is_none());
+        assert_eq!(
+            auth.try_validate_generation(&generation, Instant::now() + Duration::from_secs(1))
+                .err()
+                .unwrap()
+                .code,
+            "agy_session_changed"
+        );
+        assert!(
+            auth.dispatch_guard(&current, Instant::now() + Duration::from_secs(1))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_registration_cannot_adopt_a_new_baseline_on_resume() {
+        let (_root, auth) = store();
+        let generation = seed(&auth).await;
+        let invalid = AntigravityAuth::new(auth.directory.clone(), OAuthConfig::default()).unwrap();
+        assert_eq!(
+            invalid.resume(&generation).await.unwrap_err().code,
+            "agy_oauth_configuration_required"
+        );
+        assert_eq!(auth.generation().await.unwrap(), generation);
     }
     #[tokio::test]
     async fn no_auth_status_does_not_require_registration() {
@@ -1901,6 +1998,7 @@ mod tests {
             "/schema_version",
             "/adapter_revision",
             "/identity/user_agent",
+            "/identity/version",
             "/source/commit",
             "/destinations/inference_origin",
             "/destinations/inference_path",

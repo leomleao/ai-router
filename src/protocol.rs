@@ -12,8 +12,14 @@ use std::collections::{HashMap, HashSet};
 /// upstream messages, prompts, or other private payloads.
 pub(crate) fn error_explanation(provider: &str, code: &str) -> Option<&'static str> {
     match (provider, code) {
+        ("agy", "agy_baseline_update_required") => Some(
+            "Antigravity needs explicit adoption of its reviewed baseline. Stop the gateway, inspect login.sh agy status, then run login.sh agy resume to keep the existing sign-in.",
+        ),
         ("openai", "server_is_overloaded") => Some(
             "OpenAI is temporarily overloaded. Try again shortly. The router did not retry automatically.",
+        ),
+        ("openai", "subscription_sharing_usage_limit_exceeded") => Some(
+            "A ChatGPT usage limit was reached for this app or plan. Review the applicable limit at https://chatgpt.com/settings/usage before resuming.",
         ),
         ("openai", "invalid_structured_output") => Some(
             "OpenAI returned invalid JSON or output that did not match the requested schema. The output was withheld.",
