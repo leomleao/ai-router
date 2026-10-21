@@ -56,6 +56,7 @@ request_id, model: String
 tools: Vec<ToolDefinition>
 schema: Option<Value>
 effort: Option<String>
+ignored: Vec<String>              accepted no-op fields, for disclosure only (not serialized)
 ```
 
 Both provider serializers consume `instructions` and typed `input`; no
@@ -70,13 +71,30 @@ later turns retain their original chronology.
 `normalize_chat` and `normalize_response` validate supported fields, text-only
 content, call/result pairing, identifiers, and bounded item counts. They
 support tool choice `auto` and `none`; `none` removes the tool inventory.
-Forced/named choices and unsupported sampling controls fail explicitly.
+Forced/named choices and active sampling controls (`n` other than 1,
+`logit_bias`, `logprobs`, `top_logprobs`, non-empty `stop`) fail explicitly.
+Sampling hints (`temperature`, `top_p`, `seed`, `frequency_penalty`,
+`presence_penalty`) are range-checked and recorded in `ignored`, as are
+`metadata`, `user`, `safety_identifier`, `service_tier` `auto`/`default` and
+Responses `truncation: "auto"`; none of them changes the rest of `RunRequest`.
+Replay tolerance also records into `ignored`: Responses `reasoning` items
+without `encrypted_content` are dropped, Chat assistant `annotations` and
+`reasoning_content` and content-part `cache_control` are removed, and Responses
+assistant `refusal` parts become `output_text`. Effort accepts `none` and
+`minimal`; the API applies the provider policy after model resolution
+(Antigravity clears both, OpenAI may replace `minimal` with the lowest
+catalogue-listed level) and discloses changes in response headers.
 Responses accept `include: ["reasoning.encrypted_content"]` and a
 `reasoning.summary` hint of `auto`, `concise` or `detailed`; neither changes
 `RunRequest`, and summaries are disclosed as unavailable. Other include values
 and any non-empty Chat `include` remain `unsupported_parameter`.
 Positive output budgets add visible-answer guidance only. They do not cap
 provider tokens or truncate text, schema output, or tool arguments.
+
+`ApiError::retry_header` gives retry guidance on JSON error responses:
+`x-should-retry: false` for validation errors, deterministic output-shape
+failures and durable provider restrictions, and `retry-after` for other 503s.
+The API layer adds `retry-after` to 429 rate limits that are not durable.
 
 Shared types include `ToolDefinition`, `ToolCall`, `Usage`, `RunResult`, and
 `RunEvent`. `RunResult::usage_partial` carries incomplete or inferred usage.
@@ -118,7 +136,9 @@ memory-only and keyed by client, exact model, and account generation, with a
 24-hour TTL and per-client/global byte bounds.
 
 `openai::OpenAi` and `openai_auth` keep their own state directory, auth
-lifecycle, generation, provider probe, and Responses transport. Disabling or
+lifecycle, generation, provider probe, and Responses transport. The probe also
+records each model's catalogue `supported_reasoning_levels`, which
+`OpenAi::minimal_effort_substitute` uses for the `minimal` effort policy. Disabling or
 restricting either provider does not disable the other. `provider_stream::RunStream`
 holds an event receiver and a `finished` cancellation token used by API
 completion/drain handling.

@@ -230,6 +230,7 @@ fn session_id(request: &RunRequest) -> Result<String, ApiError> {
 /// Serialize normalized typed history, never the CLI's rendered transcript.
 /// Current exact wire IDs encode effort; matching explicit effort is redundant,
 /// while a conflict is rejected rather than silently selecting another tier.
+/// OpenAI's `none`/`minimal` are not tiers here: the API clears and discloses them.
 pub fn serialize(request: &RunRequest, project: &str, replay: &[Value]) -> Result<Value, ApiError> {
     if project.is_empty()
         || project.len() > 256
@@ -239,8 +240,12 @@ pub fn serialize(request: &RunRequest, project: &str, replay: &[Value]) -> Resul
     {
         return Err(ApiError::bad_request("Invalid Antigravity project"));
     }
-    if let Some(effort) = &request.effort {
-        if request.model.rsplit('-').next() != Some(effort.as_str()) {
+    if let Some(effort) = request
+        .effort
+        .as_deref()
+        .filter(|effort| !matches!(*effort, "none" | "minimal"))
+    {
+        if request.model.rsplit('-').next() != Some(effort) {
             return Err(ApiError::bad_request(
                 "reasoning_effort conflicts with the exact model ID",
             ));
@@ -1022,14 +1027,16 @@ fn stream_error(value: &Value) -> ApiError {
             Some("RESOURCE_EXHAUSTED") => 429,
             _ => 502,
         });
+    // Upstream authorization failures are reported as provider unavailable,
+    // never as the client's router key being wrong.
     let mut error = match status {
         401 => ApiError::new(
-            401,
+            503,
             "provider_authentication_failed",
             "Antigravity authentication was rejected",
         ),
         403 => ApiError::new(
-            403,
+            503,
             "provider_account_restricted",
             "Antigravity denied this account",
         ),
@@ -1499,7 +1506,8 @@ mod tests {
             .push(b"data: {\"error\":{\"code\":403,\"message\":\"synthetic-private-error\"}}\n\n")
             .err()
             .unwrap();
-        assert_eq!(error.status, 403);
+        assert_eq!(error.status, 503);
+        assert_eq!(error.code, "provider_account_restricted");
         assert!(!error.to_string().contains("synthetic-private"));
         assert!(decoder.finish().is_err());
     }

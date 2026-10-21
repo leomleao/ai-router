@@ -298,14 +298,17 @@ impl AppState {
                     .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                         (n < max_queue).then_some(n + 1)
                     })
-                    .map_err(|_| error(429, "busy", "The provider request queue is full"))?;
+                    // Saturation is local and brief, not a client rate limit:
+                    // 503 with retry-after is retried by clients that never
+                    // retry 429 (n8n).
+                    .map_err(|_| error(503, "busy", "The provider request queue is full"))?;
                 self.queued.fetch_add(1, Ordering::SeqCst);
                 queued_guard = Some(QueueGuard(self.clone(), provider));
                 self.runtime().await;
                 let wait = Duration::from_secs(self.config.request_timeout_secs.min(30));
                 let result = tokio::time::timeout(wait, slots.clone().acquire_owned()).await;
                 result
-                    .map_err(|_| error(429, "busy", "The request queue wait expired"))?
+                    .map_err(|_| error(503, "busy", "The request queue wait expired"))?
                     .map_err(|_| error(503, "shutting_down", "Service is shutting down"))?
             }
         };
@@ -511,7 +514,7 @@ async fn protect(
         let Ok(_permit) = state.body_slots.clone().try_acquire_owned() else {
             return rejection_response(
                 &state,
-                error(429, "busy", "Too many request bodies in progress"),
+                error(503, "busy", "Too many request bodies in progress"),
             )
             .await;
         };
@@ -595,7 +598,10 @@ async fn protect(
     response
         .headers_mut()
         .insert("x-request-id", context.id.parse().unwrap());
-    if response.status() == StatusCode::TOO_MANY_REQUESTS {
+    // Rate limits are retryable; a durable restriction says it is not.
+    if response.status() == StatusCode::TOO_MANY_REQUESTS
+        && !response.headers().contains_key("x-should-retry")
+    {
         response
             .headers_mut()
             .insert("retry-after", "10".parse().unwrap());
@@ -661,14 +667,19 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> Json<Value> {
         "profiles":{"model":{"chat_completions":true,"responses":true,"streaming":true,"text":true,"json_schema":true,"client_tools":true,"parallel_tool_execution":false,"media_input":false,
             "output_token_budget":{"mode":"prompt_guidance","hard_limit":false,"limits_reasoning_tokens":false,"parameters":["max_output_tokens","max_tokens","max_completion_tokens"]},
             "prompt_cache_controls":{"mode":"ignored","retention_guarantee":false},
+            "sampling_controls":{"mode":"ignored","accepted":SAMPLING_HINTS,"rejected":["n>1","logit_bias","logprobs","top_logprobs>0","stop"]},
+            "ignored_fields":{"accepted":["metadata","user","safety_identifier","service_tier:auto","service_tier:default","truncation:auto","stream_options.include_obfuscation:false","annotations","cache_control","reasoning_content"],"metadata_echo":"responses","truncation":"never"},
+            "reasoning_effort":{"accepted":["none","minimal","low","medium","high","xhigh","max"],"openai":{"none":"forwarded","minimal":"lowest_listed_level_when_unlisted"},"agy":{"none":"ignored","minimal":"ignored","other":"must_match_model_id"}},
+            "reasoning_replay":{"unencrypted":"dropped"},
+            "retry_hints":{"deterministic":"x-should-retry:false","transient_503":"retry-after","local_saturation":{"status":503,"code":"busy"},"rate_limit":{"status":429}},
             "responses_include":["reasoning.encrypted_content"],
             "reasoning_summary":{"mode":"unavailable","accepted":["auto","concise","detailed"]},
             "item_references":{"enabled":true,"storage":"memory","default_store":true,"ttl_seconds":items::TTL_SECONDS,"max_items":items::MAX_ITEMS,"max_bytes":items::MAX_BYTES,"per_client_items":items::CLIENT_ITEMS,"per_client_bytes":items::CLIENT_BYTES,"cleared_on_restart":true}}},
         "providers":{
             "agy":{"enabled":state.config.antigravity_enabled,"ready":snapshot.entries.iter().any(|e|e.provider==ProviderId::Agy),"adapter":agy.version,"baseline":crate::antigravity_auth::BASELINE_REVISION,"checked_at":agy.checked_at,"error":agy.error,"quota":agy.quota,"transport":"direct","fallback":false,"release_advisory":release},
-            "openai":{"enabled":state.config.openai_enabled,"ready":snapshot.entries.iter().any(|e|e.provider==ProviderId::OpenAi),"version":openai.version,"checked_at":openai.checked_at,"error":openai.error,"quota":openai.quota,"usage_url":"https://chatgpt.com/settings/usage","upstream":"responses","upstream_store":false,"upstream_stream":true,"client_tools":true,"media_input":false,"output_token_budget":{"mode":"prompt_guidance","hard_limit":false},"unsupported":["sampling_controls","hosted_tools","native"],"reasoning_effort":"model_dependent"}},
+            "openai":{"enabled":state.config.openai_enabled,"ready":snapshot.entries.iter().any(|e|e.provider==ProviderId::OpenAi),"version":openai.version,"checked_at":openai.checked_at,"error":openai.error,"quota":openai.quota,"usage_url":"https://chatgpt.com/settings/usage","upstream":"responses","upstream_store":false,"upstream_stream":true,"client_tools":true,"media_input":false,"output_token_budget":{"mode":"prompt_guidance","hard_limit":false},"unsupported":["active_sampling_controls","hosted_tools","native"],"reasoning_effort":"model_dependent"}},
         "admission":{"total_max_concurrent":state.config.max_concurrent+if state.config.openai_enabled {state.config.openai_max_concurrent}else{0},"providers":{"agy":{"max_concurrent":state.config.max_concurrent,"max_queue":state.config.max_queue},"openai":{"enabled":state.config.openai_enabled,"max_concurrent":state.config.openai_max_concurrent,"max_queue":state.config.openai_max_queue}}},
-        "unsupported":["native","media_input","forced_tool_choice","sampling_controls","embeddings","audio","image_generation_api","realtime","batches","fine_tuning","provider_management"],
+        "unsupported":["native","media_input","forced_tool_choice","active_sampling_controls","embeddings","audio","image_generation_api","realtime","batches","fine_tuning","provider_management"],
         "verification":{"adapter_contract":"automated_fixtures","live_direct_provider":"operator_validation_required"},
         "model_conflicts":snapshot.conflicts,
         "per_model":snapshot.entries.iter().map(|e|json!({"id":e.model.id,"provider":e.provider.as_str(),"chat_completions":true,"responses":true,"streaming":true,"client_tools":true,"native":false,"media_input":false,"output_token_budget":{"mode":"prompt_guidance","hard_limit":false}})).collect::<Vec<_>>()
@@ -807,12 +818,22 @@ async fn generate_body(
         .pointer("/stream_options/include_usage")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    // Responses echo request metadata, as OpenAI does. It never reaches a provider.
+    let metadata = body
+        .get("metadata")
+        .filter(|value| !value.is_null())
+        .cloned()
+        .unwrap_or_else(|| json!({}));
     let id = context.id.clone();
     let mut request = if responses {
         normalize_response(body, id.clone())?
     } else {
         normalize_chat(body, id.clone())?
     };
+    let mut disclosures = disclosure_headers(&request.ignored);
+    if let Some(mode) = apply_effort_policy(&state, selected, &mut request).await {
+        disclosures.push(("x-ai-router-reasoning-effort", mode));
+    }
     request.owner = key.id.clone();
     request.endpoint = if responses { "responses" } else { "chat" }.into();
     request.provider_generation = pinned_generation.clone();
@@ -887,7 +908,10 @@ async fn generate_body(
                         return Err(error);
                     }
                     let output = if responses {
-                        response_object(&completion_id, created, &model, &result, store_items)
+                        echo_metadata(
+                            response_object(&completion_id, created, &model, &result, store_items),
+                            &metadata,
+                        )
                     } else {
                         chat_object(&completion_id, created, &model, &result)
                     };
@@ -898,9 +922,9 @@ async fn generate_body(
                         }
                     }
                     guard.capture_response(&output);
-                    return Ok(token_budget_response(
-                        Json(output).into_response(),
-                        has_token_budget,
+                    return Ok(disclose(
+                        token_budget_response(Json(output).into_response(), has_token_budget),
+                        &disclosures,
                     ));
                 }
                 RunEvent::Error(e) => return Err(e),
@@ -917,7 +941,7 @@ async fn generate_body(
     }
     let stream = async_stream::stream! {
         let mut guard = guard;
-        let mut render = StreamRenderer::new(responses, completion_id.clone(), model.clone(), created, include_usage, store_items);
+        let mut render = StreamRenderer::new(responses, completion_id.clone(), model.clone(), created, include_usage, store_items, metadata.clone());
         for item in render.begin() { yield Ok::<Event,Infallible>(item); }
         let mut terminal = false;
         while let Some(mut event) = run.events.recv().await {
@@ -926,7 +950,7 @@ async fn generate_body(
             }
             if store_items {
                 if let RunEvent::Completed(result) = &event {
-                    let output = response_object(&completion_id, created, &model, result, true);
+                    let output = echo_metadata(response_object(&completion_id, created, &model, result, true), &metadata);
                     if let Err(error) = state.items.save_scoped(&owner, &output, &item_scope) {
                         event = RunEvent::Error(error);
                     }
@@ -934,7 +958,7 @@ async fn generate_body(
             }
             guard.observe(&event);
             if let RunEvent::Completed(result) = &event {
-                let output = if responses { response_object(&completion_id, created, &model, result, store_items) }
+                let output = if responses { echo_metadata(response_object(&completion_id, created, &model, result, store_items), &metadata) }
                     else { chat_object(&completion_id, created, &model, result) };
                 guard.capture_response(&output);
             }
@@ -953,7 +977,77 @@ async fn generate_body(
     response
         .headers_mut()
         .insert("cache-control", "no-cache, no-transform".parse().unwrap());
-    Ok(token_budget_response(response, has_token_budget))
+    Ok(disclose(
+        token_budget_response(response, has_token_budget),
+        &disclosures,
+    ))
+}
+
+/// Accepted fields with no effect are named in response headers, so a
+/// client can tell an ignored hint from an enforced control.
+fn disclosure_headers(ignored: &[String]) -> Vec<(&'static str, String)> {
+    let mut headers = Vec::new();
+    if ignored
+        .iter()
+        .any(|field| SAMPLING_HINTS.contains(&field.as_str()))
+    {
+        headers.push(("x-ai-router-sampling-controls", "ignored".to_owned()));
+    }
+    if ignored.iter().any(|field| field == DROPPED_REASONING) {
+        headers.push(("x-ai-router-reasoning-replay", "dropped".to_owned()));
+    }
+    let mut fields: Vec<&str> = ignored
+        .iter()
+        .map(String::as_str)
+        .filter(|field| !SAMPLING_HINTS.contains(field) && *field != DROPPED_REASONING)
+        .collect();
+    fields.sort_unstable();
+    fields.dedup();
+    if !fields.is_empty() {
+        headers.push(("x-ai-router-ignored-fields", fields.join(", ")));
+    }
+    headers
+}
+
+fn disclose(mut response: Response, headers: &[(&'static str, String)]) -> Response {
+    for (name, value) in headers {
+        if let Ok(value) = value.parse() {
+            response.headers_mut().insert(*name, value);
+        }
+    }
+    response
+}
+
+/// `none` and `minimal` are OpenAI effort levels. An Antigravity model ID
+/// fixes its effort, so there they mean "no explicit effort". OpenAI forwards
+/// both unless its catalogue lists the model's levels without `minimal`.
+/// The returned header value discloses any change.
+async fn apply_effort_policy(
+    state: &AppState,
+    provider: ProviderId,
+    request: &mut RunRequest,
+) -> Option<String> {
+    let effort = request.effort.as_deref()?;
+    match provider {
+        ProviderId::Agy if matches!(effort, "none" | "minimal") => {
+            request.effort = None;
+            Some("ignored".into())
+        }
+        ProviderId::OpenAi if effort == "minimal" => {
+            let applied = state
+                .openai
+                .minimal_effort_substitute(&request.model)
+                .await?;
+            request.effort = Some(applied.into());
+            Some(format!("mapped={applied}"))
+        }
+        _ => None,
+    }
+}
+
+fn echo_metadata(mut output: Value, metadata: &Value) -> Value {
+    output["metadata"] = metadata.clone();
+    output
 }
 
 fn token_budget_response(mut response: Response, has_budget: bool) -> Response {
@@ -1160,6 +1254,7 @@ impl Drop for CompletionGuard {
 struct StreamRenderer {
     responses: bool,
     store_items: bool,
+    metadata: Value,
     id: String,
     model: String,
     created: i64,
@@ -1178,10 +1273,12 @@ impl StreamRenderer {
         created: i64,
         include_usage: bool,
         store_items: bool,
+        metadata: Value,
     ) -> Self {
         Self {
             responses,
             store_items,
+            metadata,
             id,
             model,
             created,
@@ -1211,7 +1308,7 @@ impl StreamRenderer {
         if !self.responses {
             return vec![self.chunk(json!({"role":"assistant","content":""}), Value::Null)];
         }
-        let response = json!({"id":self.id,"object":"response","created_at":self.created,"model":self.model,"status":"in_progress","output":[],"error":null,"incomplete_details":null,"usage":null,"store":self.store_items});
+        let response = json!({"id":self.id,"object":"response","created_at":self.created,"model":self.model,"status":"in_progress","output":[],"error":null,"incomplete_details":null,"usage":null,"store":self.store_items,"metadata":self.metadata});
         vec![
             self.emit("response.created", json!({"response":response})),
             self.emit("response.in_progress", json!({"response":response})),
@@ -1291,7 +1388,17 @@ impl StreamRenderer {
                     } else {
                         "response.completed"
                     };
-                    events.push(self.emit(kind,json!({"response":response_object(&self.id,self.created,&self.model,&result,self.store_items)})));
+                    let response = echo_metadata(
+                        response_object(
+                            &self.id,
+                            self.created,
+                            &self.model,
+                            &result,
+                            self.store_items,
+                        ),
+                        &self.metadata,
+                    );
+                    events.push(self.emit(kind, json!({"response":response})));
                 } else {
                     events.push(self.chunk(json!({}), json!(finish_reason(&result))));
                     if self.include_usage {
@@ -1372,6 +1479,55 @@ mod tests {
         assert!(state.drain(Duration::from_secs(1)).await);
     }
     #[tokio::test]
+    async fn local_saturation_is_a_retryable_503_while_key_limits_stay_429() {
+        let (_temp, state) = test_state();
+        let _held = state.admit_provider(ProviderId::OpenAi).await.unwrap();
+        let Err(busy) = state.admit_provider(ProviderId::OpenAi).await else {
+            panic!("a saturated queue admitted a request");
+        };
+        assert_eq!((busy.status, busy.code.as_str()), (503, "busy"));
+        let response = busy.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()["retry-after"], "10");
+        assert!(response.headers().get("x-should-retry").is_none());
+        state.stop();
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::for_test(temp.path());
+        config.per_key_per_minute = 1;
+        let telemetry = Arc::new(
+            Telemetry::open(
+                &config.telemetry_dir,
+                config.retention_days,
+                config.max_events,
+            )
+            .unwrap(),
+        );
+        let config = Arc::new(config);
+        let state = AppState::new(config.clone(), Antigravity::new(config), telemetry);
+        let app = router(state.clone());
+        let mut statuses = Vec::new();
+        for _ in 0..2 {
+            use tower::ServiceExt;
+            let request = Request::builder()
+                .uri("/v1/models")
+                .header("authorization", "Bearer test-key")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            statuses.push((
+                response.status(),
+                response.headers().get("retry-after").cloned(),
+            ));
+        }
+        assert_eq!(statuses[0], (StatusCode::OK, None));
+        assert_eq!(
+            statuses[1],
+            (StatusCode::TOO_MANY_REQUESTS, Some("10".parse().unwrap()))
+        );
+        state.stop();
+    }
+    #[tokio::test]
     async fn disabled_openai_and_unauthenticated_antigravity_are_not_ready() {
         let (_temp, state) = test_state();
         state.publish_openai_monitor_status().await;
@@ -1425,6 +1581,13 @@ mod tests {
         }
         if input.contains("quota-fixture") {
             return (StatusCode::TOO_MANY_REQUESTS, Json(json!({"error":{"code":"subscription_sharing_usage_limit_exceeded","message":"synthetic-provider-private-detail"}}))).into_response();
+        }
+        if input.contains("upstream-auth-fixture") {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error":{"code":"invalid_token","message":"synthetic-provider-private-detail"}})),
+            )
+                .into_response();
         }
         if input.contains("overload-fixture") {
             return (
@@ -1629,7 +1792,8 @@ mod tests {
                 async move {
                     if mode.load(Ordering::SeqCst)==2 { tokio::time::sleep(Duration::from_secs(1)).await; }
                     if mode.load(Ordering::SeqCst)==1 { return StatusCode::SERVICE_UNAVAILABLE.into_response(); }
-                    Json(json!({"models":[{"slug":"synthetic-openai","display_name":"Synthetic OpenAI","visibility":"list"}]})).into_response()
+                    Json(json!({"models":[{"slug":"synthetic-openai","display_name":"Synthetic OpenAI","visibility":"list",
+                        "supported_reasoning_levels":[{"effort":"low"},{"effort":"medium"},{"effort":"high"}]}]})).into_response()
                 }
             }))
                 .route("/responses", post(mock_openai_response))

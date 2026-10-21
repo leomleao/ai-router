@@ -318,7 +318,7 @@ impl Antigravity {
                     error.code.as_str(),
                     "provider_authentication_failed" | "provider_account_restricted"
                 ) {
-                    let kind = if error.status == 401 {
+                    let kind = if error.code == "provider_authentication_failed" {
                         Restriction::Authentication
                     } else {
                         Restriction::Account

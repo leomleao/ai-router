@@ -21,6 +21,7 @@ pub struct OpenAi {
     auth: AuthStore,
     client: reqwest::Client,
     discovered_generation: Arc<Mutex<Option<String>>>,
+    reasoning_levels: Arc<Mutex<HashMap<String, Vec<String>>>>,
     replay: Arc<Mutex<VecDeque<Replay>>>,
     local_block: Arc<Mutex<Option<(String, ApiError)>>>,
     #[cfg(test)]
@@ -50,6 +51,7 @@ impl OpenAi {
                 .build()
                 .expect("TLS HTTP client"),
             discovered_generation: Arc::new(Mutex::new(None)),
+            reasoning_levels: Arc::new(Mutex::new(HashMap::new())),
             replay: Arc::new(Mutex::new(VecDeque::new())),
             local_block: Arc::new(Mutex::new(None)),
             #[cfg(test)]
@@ -152,6 +154,7 @@ impl OpenAi {
             let body: Value = serde_json::from_slice(&body)
                 .map_err(|_| failure(502, "invalid_provider_catalogue"))?;
             let models = parse_models(&body)?;
+            *self.reasoning_levels.lock().await = parse_reasoning_levels(&body);
             *self.discovered_generation.lock().await = Some(generation.clone());
             Ok::<_, ApiError>((models, generation))
         })
@@ -177,6 +180,20 @@ impl OpenAi {
             }
         }
         status
+    }
+
+    /// The effort to send instead of `minimal`, when the discovered catalogue
+    /// lists this model's levels without it: the lowest listed level above
+    /// `minimal`. Unlisted levels are forwarded for the upstream to decide.
+    pub async fn minimal_effort_substitute(&self, model: &str) -> Option<&'static str> {
+        let levels = self.reasoning_levels.lock().await;
+        let levels = levels.get(model)?;
+        if levels.iter().any(|level| level == "minimal") {
+            return None;
+        }
+        ["low", "medium", "high", "xhigh", "max"]
+            .into_iter()
+            .find(|effort| levels.iter().any(|level| level == effort))
     }
 
     async fn latch_transient(&self, generation: &str, error: &ApiError) {
@@ -671,6 +688,31 @@ fn parse_models(value: &Value) -> Result<Vec<ModelInfo>, ApiError> {
     Ok(models)
 }
 
+/// Catalogue entries may list `supported_reasoning_levels` as effort strings
+/// or `{effort, description}` presets. Unknown or absent lists are omitted.
+fn parse_reasoning_levels(value: &Value) -> HashMap<String, Vec<String>> {
+    const EFFORTS: [&str; 7] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+    let mut levels = HashMap::new();
+    for entry in value["models"].as_array().into_iter().flatten().take(500) {
+        let Some(id) = entry["slug"].as_str() else {
+            continue;
+        };
+        let listed: Vec<String> = entry["supported_reasoning_levels"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .take(16)
+            .filter_map(|level| level.as_str().or_else(|| level["effort"].as_str()))
+            .filter(|level| EFFORTS.contains(level))
+            .map(str::to_owned)
+            .collect();
+        if !listed.is_empty() {
+            levels.insert(id.to_owned(), listed);
+        }
+    }
+    levels
+}
+
 fn serialize(request: &RunRequest) -> Result<Value, ApiError> {
     let mut input = Vec::new();
     for instruction in &request.instructions {
@@ -932,12 +974,16 @@ fn upstream_error(http_status: u16, value: &Value) -> ApiError {
         "server_is_overloaded" => 503,
         "subscription_sharing_usage_limit_exceeded" => 429,
         "subscription_sharing_usage_unavailable" | "subscription_sharing_user_unavailable" => 503,
+        // Upstream authorization or plan problems are not the client's router
+        // key. SDKs read 401/403 as "your API key is wrong", so the provider is
+        // reported unavailable while the code keeps the explanation.
         "subscription_sharing_user_not_eligible"
         | "subscription_sharing_route_not_supported"
         | "chatpass_v2_scope_not_authorized"
-        | "chatpass_v2_invalid_authorization_context" => 403,
-        "subscription_sharing_invalid_user" => 401,
+        | "chatpass_v2_invalid_authorization_context"
+        | "subscription_sharing_invalid_user" => 503,
         "subscription_sharing_unsupported_capability" => 400,
+        _ if matches!(http_status, 401 | 403) => 503,
         _ => http_status,
     };
     failure(status, code)
@@ -1038,6 +1084,17 @@ mod tests {
         assert_eq!(body["stream"], true);
         assert!(body.get("temperature").is_none());
         assert!(body.get("max_output_tokens").is_none());
+    }
+    #[test]
+    fn catalogue_reasoning_levels_accept_presets_and_strings_only_when_known() {
+        let levels = parse_reasoning_levels(&json!({"models":[
+            {"slug":"presets","supported_reasoning_levels":[{"effort":"low","description":"Fast"},{"effort":"high"}]},
+            {"slug":"strings","supported_reasoning_levels":["minimal","medium","unknown"]},
+            {"slug":"unlisted"},
+            {"slug":"empty","supported_reasoning_levels":[{"effort":"turbo"}]}]}));
+        assert_eq!(levels["presets"], ["low", "high"]);
+        assert_eq!(levels["strings"], ["minimal", "medium"]);
+        assert!(!levels.contains_key("unlisted") && !levels.contains_key("empty"));
     }
     #[test]
     fn account_model_shape_and_visibility() {
@@ -1190,7 +1247,16 @@ mod tests {
                     Some("synthetic-generation"),
                 )
                 .await;
-            assert_eq!(error.status, status);
+            // Upstream auth failures are provider unavailability, not a bad router key.
+            assert_eq!(
+                error.status,
+                if matches!(status, 401 | 403) {
+                    503
+                } else {
+                    status
+                }
+            );
+            assert_eq!(error.code, code);
             assert_eq!(provider.availability_error().await.unwrap().code, code);
         }
         task.abort();
@@ -1475,7 +1541,7 @@ mod tests {
     async fn mock_http_success_status_json_errors_are_classified_and_redacted() {
         for (code, expected_status) in [
             ("subscription_sharing_usage_limit_exceeded", 429),
-            ("subscription_sharing_invalid_user", 401),
+            ("subscription_sharing_invalid_user", 503),
             ("subscription_sharing_unsupported_capability", 400),
         ] {
             let body =

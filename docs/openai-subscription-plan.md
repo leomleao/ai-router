@@ -169,7 +169,8 @@ OpenAI storage. Preserve the opt-out header and retention/eviction behavior.
 Unsupported upstream fields include output-token caps, sampling controls, and
 cache-retention controls. Maintain existing gateway compatibility explicitly:
 positive token budgets remain disclosed best-effort answer-length instructions,
-cache hints remain disclosed as ignored, and sampling controls are rejected.
+cache hints and range-checked sampling hints remain disclosed as ignored, and
+active sampling controls (`n`, `logit_bias`, `logprobs`, `stop`) are rejected.
 Do not forward ignored fields or advertise them as enforced OpenAI capabilities.
 Other unsupported fields fail validation rather than being silently dropped.
 See the current [preview contract](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations).
