@@ -33,7 +33,9 @@ const provider = createOpenAI({
     const response = await fetch(input, { ...init, body: JSON.stringify({ ...body, model: MODEL }) });
     wire.push({ path: url.pathname, body, status: response.status,
       summary: response.headers.get('x-ai-router-reasoning-summary'),
-      itemStorage: response.headers.get('x-ai-router-item-storage') });
+      itemStorage: response.headers.get('x-ai-router-item-storage'),
+      sampling: response.headers.get('x-ai-router-sampling-controls'),
+      effort: response.headers.get('x-ai-router-reasoning-effort') });
     return response;
   },
 });
@@ -109,6 +111,19 @@ for (const streaming of [true, false]) {
   check(reasoning.every(part => part.text === ''), 'No reasoning summary text is fabricated');
   check(reasoningProvider ? reasoning.length === 1 : reasoning.length === 0, 'Reasoning parts match the provider');
 }
+
+// Studio's simple endpoints (titles, SQL edits, feedback classification) use
+// effort "none"; feedback classification also sets temperature 0.
+wire = [];
+const simple = await generateText({ model: provider(STUDIO_MODEL), prompt: 'hello', temperature: 0,
+  maxRetries: 0, providerOptions: { openai: { store: false, reasoningEffort: 'none' } } });
+check(wire.length === 1 && wire[0].status === 200 && simple.text.length > 0, 'Effort none request succeeds');
+check(wire[0].body.reasoning?.effort === 'none' && wire[0].body.reasoning?.summary === undefined
+  && JSON.stringify(wire[0].body.include) === '["reasoning.encrypted_content"]' && wire[0].body.temperature === 0,
+  'SDK sends effort none, encrypted include and temperature');
+check(wire[0].sampling === 'ignored', 'Ignored temperature is disclosed');
+check(wire[0].effort === (reasoningProvider ? null : 'ignored'),
+  'OpenAI receives effort none; Antigravity discloses that the model ID decides');
 
 // Other include values remain explicit errors, never silently dropped.
 wire = [];

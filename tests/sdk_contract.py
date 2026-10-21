@@ -196,13 +196,23 @@ def token_budget_contracts():
 for response_api in (False,True):
     create=client.responses.create if response_api else client.chat.completions.create
     base={'model':model,'input':'hello'} if response_api else {'model':model,'messages':[{'role':'user','content':'hello'}]}
-    for options in ({'temperature':0.5},{'tool_choice':'required','tools':[response_tool] if response_api else [tool]},
-                    {'tools':[{'type':'web_search'}]}, {'extra_body':{'unknown_control':True}}):
+    for options in ({'tool_choice':'required','tools':[response_tool] if response_api else [tool]},
+                    {'tools':[{'type':'web_search'}]}, {'extra_body':{'unknown_control':True}},
+                    {'extra_body':{'logit_bias':{'1':1}}}, {'temperature':2.5}):
         try:
             create(**base,**options)
             raise AssertionError('unsupported request accepted')
         except APIStatusError as error:
-            check(error.status_code==400)
+            check(error.status_code==400 and error.response.headers.get('x-should-retry')=='false')
+    # Sampling hints are range-checked, ignored and disclosed, never enforced.
+    raw=(client.responses if response_api else client.chat.completions).with_raw_response.create(
+        **base,temperature=0.5,top_p=1,metadata={'workflow':'synthetic'},user='user-123')
+    result=raw.parse()
+    check((result.output_text if response_api else result.choices[0].message.content)=='Hello from fixture')
+    check(raw.headers.get('x-ai-router-sampling-controls')=='ignored', 'Ignored sampling hints are disclosed')
+    check(raw.headers.get('x-ai-router-ignored-fields')=='metadata, user', 'Ignored request fields are named')
+    if response_api:
+        check(result.metadata=={'workflow':'synthetic'}, 'Responses echo request metadata')
     for verbosity in ('low','high'):
         options={'text':{'verbosity':verbosity}} if response_api else {'extra_body':{'verbosity':verbosity}}
         try:

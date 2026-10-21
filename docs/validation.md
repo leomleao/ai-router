@@ -5,6 +5,57 @@ the schema fix, diagnostic privacy checks, restored CLI coverage, and separate
 Vercel/LangChain client matrices. Historical counts below describe the earlier
 implementation baseline.
 
+## Accept-and-disclose compatibility bundle (2026-10-21)
+
+An external audit replayed request bodies that the official SDKs, Vercel AI
+SDK, LangChain, n8n, Supabase Studio, Twenty and Cognee send by default. This
+change closes audit items A1, A2, B1, B3, part of B5, B7 to B11 and the
+Responses `stream_options` gap:
+
+- Effort `none`/`minimal` is accepted. OpenAI receives `none` unchanged. It
+  receives `minimal` unless the catalogue's `supported_reasoning_levels` omit
+  it; then the lowest listed level above `minimal` is sent, disclosed as
+  `X-AI-Router-Reasoning-Effort: mapped=<level>`. On Antigravity both mean "no
+  explicit effort", disclosed as `ignored`, with no model-suffix conflict.
+- Sampling hints are range-checked and ignored (`X-AI-Router-Sampling-Controls:
+  ignored`). `n>1`, `logit_bias`, `logprobs`, `top_logprobs>0` and a non-empty
+  `stop` stay rejected.
+- `metadata` (echoed on Responses), `user`, `safety_identifier`, `service_tier`
+  `auto`/`default` and Responses `truncation:"auto"` are accepted and named in
+  `X-AI-Router-Ignored-Fields`. Responses `stream_options` accepts
+  `include_obfuscation:false`.
+- Unencrypted Responses reasoning replay is dropped (`X-AI-Router-Reasoning-Replay:
+  dropped`). A Responses assistant `refusal` part becomes text. Chat
+  `annotations`, `reasoning_content` and part-level `cache_control` are
+  ignored and disclosed.
+- Errors carry retry guidance: `x-should-retry: false` for validation errors,
+  invalid or incomplete output shapes and durable restrictions, and
+  `retry-after` for other 503s. Local saturation is 503 `busy`; key rate limits
+  stay 429. Upstream 401/403 become 503 with the provider's code.
+
+Overload latching was checked against the new headers. A 503 overload, transport
+failure or upstream 401/403/5xx latches OpenAI until the next catalogue probe
+(at most 60 s while healthy). Retries inside that window get the same 503 and
+`retry-after: 30` locally, with no upstream call. A durable plan or
+authorization restriction stays latched and returns `x-should-retry: false`.
+
+Validation used the Docker test stage (`ai-router-test:t1-compat-accept`):
+213 Rust tests passed (203 before), with 134 official SDK checks per model
+(125 before), 44 Studio checks per provider (40 before; the new checks drive
+the SDK's effort-`none` plus `temperature:0` request), 170 n8n Vercel checks,
+38 LangChain checks, monitor PTY checks and 5 login checks. Formatting passed;
+clippy reported only the existing style-warning categories. The audit's synthetic probe
+harness replayed all 164 case bodies before and after the change. 43 cases
+moved from a 400 rejection to a provider call, including Studio `title-v2`,
+`code-complete`, `onboarding-design` and `policy`. Studio `title-v2`, `policy`
+and `feedback-classify` then return the fixture-only `invalid_structured_output`
+502, the same as the audit's control without reasoning. The remaining 400s are
+deliberately rejected or owned by other changes: active sampling controls,
+forced `tool_choice`, hosted tools and other `include` values, media,
+`previous_response_id`/`conversation`/`background`/`prompt`, non-neutral
+verbosity, unknown model IDs, and an explicit effort tier that conflicts with
+an Antigravity model ID. No live provider, server or deployment was used.
+
 ## Supabase Studio Responses compatibility (2026-10-21)
 
 Supabase Studio's assistant (`supabase/studio:2026.10.12`, `ai@7.0.59`,

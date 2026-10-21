@@ -112,10 +112,74 @@ impl ApiError {
     }
 }
 
+/// Failures that repeat on every retry: invalid or incomplete output shapes
+/// and provider restrictions that need operator action. Each SDK retry would
+/// be another paid upstream call, or another certain local rejection.
+const DETERMINISTIC_FAILURES: &[&str] = &[
+    "invalid_structured_output",
+    "incomplete_structured_output",
+    "invalid_json_output",
+    "invalid_provider_tool_call",
+    "incomplete_provider_output",
+    "output_limit_exceeded",
+    "subscription_sharing_usage_limit_exceeded",
+    "subscription_sharing_user_not_eligible",
+    "subscription_sharing_route_not_supported",
+    "subscription_sharing_invalid_user",
+    "chatpass_v2_scope_not_authorized",
+    "chatpass_v2_invalid_authorization_context",
+    "openai_usage_blocked",
+    "openai_ineligible",
+    "openai_auth_required",
+    "agy_auth_required",
+    "agy_auth_blocked",
+    "agy_account_blocked",
+    "agy_protocol_blocked",
+    "agy_baseline_update_required",
+    "agy_oauth_registration_changed",
+    "agy_oauth_configuration_required",
+    "agy_onboarding_required",
+    "agy_scope_required",
+    "provider_authentication_failed",
+    "provider_account_restricted",
+    "provider_disabled",
+];
+
+impl ApiError {
+    /// Retry guidance for SDKs that retry 408/409/429/5xx by default.
+    /// Validation errors and deterministic failures say not to retry; other
+    /// 503s name a wait. The API layer adds `retry-after` to rate limits.
+    pub fn retry_header(&self) -> Option<(&'static str, &'static str)> {
+        if DETERMINISTIC_FAILURES.contains(&self.code.as_str())
+            || ((400..500).contains(&self.status) && !matches!(self.status, 408 | 409 | 429))
+        {
+            Some(("x-should-retry", "false"))
+        } else if self.status == 503 {
+            // Local saturation clears quickly. A provider latch (such as
+            // overload) clears at the next catalogue probe, at most 60 s.
+            let seconds = if matches!(self.code.as_str(), "busy" | "shutting_down") {
+                "10"
+            } else {
+                "30"
+            };
+            Some(("retry-after", seconds))
+        } else {
+            None
+        }
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = StatusCode::from_u16(self.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        (status, Json(self.response_body())).into_response()
+        let retry = self.retry_header();
+        let mut response = (status, Json(self.response_body())).into_response();
+        if let Some((name, value)) = retry {
+            response
+                .headers_mut()
+                .insert(name, axum::http::HeaderValue::from_static(value));
+        }
+        response
     }
 }
 
@@ -167,6 +231,10 @@ pub struct RunRequest {
     pub tools: Vec<ToolDefinition>,
     pub schema: Option<Value>,
     pub effort: Option<String>,
+    /// Accepted fields that change nothing, for response disclosure only.
+    /// Never serialized and never sent to a provider.
+    #[serde(skip)]
+    pub ignored: Vec<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RunResult {
@@ -230,9 +298,21 @@ const MAX_ITEMS: usize = 1000;
 const MAX_TEXT_BYTES: usize = 1024 * 1024;
 const MAX_TOOLS: usize = 128;
 
+/// Sampling hints are range-checked, never forwarded, and disclosed as
+/// ignored: neither adapter has a verified sampling control.
+pub const SAMPLING_HINTS: [&str; 5] = [
+    "temperature",
+    "top_p",
+    "seed",
+    "frequency_penalty",
+    "presence_penalty",
+];
+/// Disclosure marker for Responses reasoning replay without encrypted state.
+pub const DROPPED_REASONING: &str = "reasoning_without_encrypted_content";
+
 pub fn normalize_chat(value: Value, request_id: String) -> Result<RunRequest, ApiError> {
     let root = object(&value, "request")?;
-    validate_common(root, false)?;
+    let mut ignored = validate_common(root, false)?;
     let model = model(root)?;
     let mut tools = parse_tools(root.get("tools"), false)?;
     apply_tool_choice(root.get("tool_choice"), &mut tools)?;
@@ -263,6 +343,8 @@ pub fn normalize_chat(value: Value, request_id: String) -> Result<RunRequest, Ap
                 "tool_calls",
                 "tool_call_id",
                 "refusal",
+                "annotations",
+                "reasoning_content",
             ],
             "message",
         )?;
@@ -276,21 +358,55 @@ pub fn normalize_chat(value: Value, request_id: String) -> Result<RunRequest, Ap
             }
         }
         let has_calls = nonnull(msg.get("tool_calls")).is_some();
-        let content = msg.get("content").unwrap_or(&Value::Null);
+        let mut normalized_message = message.clone();
+        let normalized = normalized_message
+            .as_object_mut()
+            .ok_or_else(|| ApiError::internal("Normalized message is not an object"))?;
+        if let Some(content) = normalized.get_mut("content") {
+            note(&mut ignored, strip_cache_control(content)?, "cache_control");
+        }
+        if role == "assistant" {
+            // Replayed completions can carry citations or another server's
+            // reasoning text. Neither is model input here, so both are dropped.
+            if let Some(annotations) = normalized.remove("annotations").filter(|v| !v.is_null()) {
+                let annotations = annotations
+                    .as_array()
+                    .filter(|items| {
+                        items.iter().all(|item| {
+                            item.get("type").and_then(Value::as_str) == Some("url_citation")
+                                && item.get("url_citation").is_some_and(Value::is_object)
+                        })
+                    })
+                    .ok_or_else(|| {
+                        ApiError::unsupported("message.annotations (only url_citation)")
+                    })?;
+                note(&mut ignored, !annotations.is_empty(), "annotations");
+            }
+            if let Some(reasoning) = normalized
+                .remove("reasoning_content")
+                .filter(|v| !v.is_null())
+            {
+                bounded_text(string(&reasoning, "reasoning_content")?)?;
+                note(&mut ignored, true, "reasoning_content");
+            }
+        } else {
+            for field in ["annotations", "reasoning_content"] {
+                if nonnull(msg.get(field)).is_some() {
+                    return Err(ApiError::unsupported(&format!("message.{field}")));
+                }
+            }
+        }
+        let content = normalized.get("content").cloned().unwrap_or(Value::Null);
         validate_content(
-            content,
+            &content,
             false,
             role == "assistant" && (has_calls || nonnull(msg.get("refusal")).is_some()),
         )?;
-        let mut normalized_message = message.clone();
         if role == "assistant" {
             if let Some(refusal) = nonnull(msg.get("refusal")) {
                 let refusal = string(refusal, "refusal")?;
                 bounded_text(refusal)?;
-                let normalized = normalized_message
-                    .as_object_mut()
-                    .ok_or_else(|| ApiError::internal("Normalized message is not an object"))?;
-                let mut parts = match nonnull(msg.get("content")) {
+                let mut parts = match nonnull(Some(&content)) {
                     None => Vec::new(),
                     Some(Value::String(text)) => vec![json!({"type":"text", "text":text})],
                     Some(Value::Array(parts)) => parts.clone(),
@@ -362,6 +478,7 @@ pub fn normalize_chat(value: Value, request_id: String) -> Result<RunRequest, Ap
     }
     let mut request = make_request(request_id, model, transcript, system, tools, schema, effort)?;
     request.endpoint = "chat".into();
+    request.ignored = ignored;
     request.parallel_tool_calls = root
         .get("parallel_tool_calls")
         .and_then(Value::as_bool)
@@ -371,7 +488,7 @@ pub fn normalize_chat(value: Value, request_id: String) -> Result<RunRequest, Ap
 
 pub fn normalize_response(value: Value, request_id: String) -> Result<RunRequest, ApiError> {
     let root = object(&value, "request")?;
-    validate_common(root, true)?;
+    let mut ignored = validate_common(root, true)?;
     let model = model(root)?;
     let mut tools = parse_tools(root.get("tools"), true)?;
     apply_tool_choice(root.get("tool_choice"), &mut tools)?;
@@ -435,19 +552,21 @@ pub fn normalize_response(value: Value, request_id: String) -> Result<RunRequest
                 if !["system", "developer", "user", "assistant"].contains(&role) {
                     return Err(ApiError::unsupported("input message role"));
                 }
-                validate_content(
-                    data.get("content").ok_or_else(|| {
-                        ApiError::bad_request("input message content is required")
-                    })?,
-                    true,
-                    false,
-                )?;
+                let mut normalized = item.clone();
+                let content = normalized
+                    .get_mut("content")
+                    .ok_or_else(|| ApiError::bad_request("input message content is required"))?;
+                note(&mut ignored, strip_cache_control(content)?, "cache_control");
+                if role == "assistant" {
+                    refusal_parts_to_text(content)?;
+                }
+                validate_content(content, true, false)?;
                 validate_item_metadata(data)?;
                 if leading && (role == "system" || role == "developer") {
-                    system.push(item);
+                    system.push(normalized);
                 } else {
                     leading = false;
-                    transcript.push(item);
+                    transcript.push(normalized);
                 }
             }
             "function_call" => {
@@ -496,6 +615,19 @@ pub fn normalize_response(value: Value, request_id: String) -> Result<RunRequest
                     "reasoning item",
                 )?;
                 validate_item_metadata(data)?;
+                // Clients that restore history from memory replay reasoning
+                // without its opaque state. Neither provider can use it, so
+                // the item is dropped and the response discloses that.
+                if nonnull(data.get("encrypted_content")).is_none() {
+                    if data
+                        .get("summary")
+                        .is_some_and(|v| !v.is_null() && !v.is_array())
+                    {
+                        return Err(ApiError::bad_request("reasoning.summary must be an array"));
+                    }
+                    note(&mut ignored, true, DROPPED_REASONING);
+                    continue;
+                }
                 let encrypted = required_string(data, "encrypted_content")?;
                 bounded_text(encrypted)?;
                 if encrypted.is_empty() {
@@ -518,6 +650,7 @@ pub fn normalize_response(value: Value, request_id: String) -> Result<RunRequest
     }
     let mut request = make_request(request_id, model, transcript, system, tools, schema, effort)?;
     request.endpoint = "responses".into();
+    request.ignored = ignored;
     request.parallel_tool_calls = root
         .get("parallel_tool_calls")
         .and_then(Value::as_bool)
@@ -581,10 +714,12 @@ fn make_request(
         tools,
         schema,
         effort,
+        ignored: Vec::new(),
     })
 }
 
-fn validate_common(root: &Map<String, Value>, responses: bool) -> Result<(), ApiError> {
+/// Returns accepted fields that change nothing, in request order.
+fn validate_common(root: &Map<String, Value>, responses: bool) -> Result<Vec<String>, ApiError> {
     let supported = if responses {
         vec![
             "model",
@@ -598,6 +733,7 @@ fn validate_common(root: &Map<String, Value>, responses: bool) -> Result<(), Api
             "text",
             "max_output_tokens",
             "store",
+            "stream_options",
         ]
     } else {
         vec![
@@ -618,6 +754,7 @@ fn validate_common(root: &Map<String, Value>, responses: bool) -> Result<(), Api
     if responses && nonnull(root.get("store")).is_some_and(|v| !v.is_boolean()) {
         return Err(ApiError::bad_request("store must be boolean"));
     }
+    let mut ignored = Vec::new();
     for (field, value) in root {
         if value.is_null() || supported.contains(&field.as_str()) {
             continue;
@@ -627,8 +764,36 @@ fn validate_common(root: &Map<String, Value>, responses: bool) -> Result<(), Api
         let benign = match field.as_str() {
             "n" => value.as_u64() == Some(1),
             "store" | "background" | "logprobs" => value.as_bool() == Some(false),
-            "frequency_penalty" | "presence_penalty" => value.as_f64() == Some(0.0),
             "top_logprobs" => value.as_u64() == Some(0),
+            // Sampling hints change only randomness, which is never promised.
+            // They are range-checked like OpenAI, then disclosed as ignored.
+            "temperature" | "top_p" | "seed" | "frequency_penalty" | "presence_penalty" => {
+                validate_sampling_hint(field, value)?;
+                ignored.push(field.clone());
+                true
+            }
+            // Request metadata, end-user identifiers and the standard service
+            // tier never change generation. Responses echo metadata.
+            "metadata" => {
+                validate_metadata(value)?;
+                ignored.push(field.clone());
+                true
+            }
+            "user" | "safety_identifier" => {
+                let id = string(value, field)?;
+                if id.len() > 512 {
+                    return Err(ApiError::bad_request(format!("{field} exceeds 512 bytes")));
+                }
+                ignored.push(field.clone());
+                true
+            }
+            "service_tier" => match string(value, field)? {
+                "auto" | "default" => {
+                    ignored.push(field.clone());
+                    true
+                }
+                tier => return Err(ApiError::unsupported(&format!("service_tier {tier}"))),
+            },
             "stop" => value.as_array().is_some_and(Vec::is_empty),
             // The OpenAI adapter always requests and returns encrypted
             // reasoning; AGY returns no reasoning items, so nothing is claimed.
@@ -640,7 +805,16 @@ fn validate_common(root: &Map<String, Value>, responses: bool) -> Result<(), Api
                             .iter()
                             .all(|entry| entry.as_str() == Some("reasoning.encrypted_content"))
             }),
-            "truncation" => responses && value.as_str() == Some("disabled"),
+            // The router never truncates history: an oversized context fails
+            // at the provider's limit. "auto" therefore changes nothing.
+            "truncation" => match value.as_str() {
+                Some("disabled") => responses,
+                Some("auto") if responses => {
+                    ignored.push(field.clone());
+                    true
+                }
+                _ => false,
+            },
             "verbosity" => !responses && value.as_str() == Some("medium"),
             // n8n supplies these OpenAI cache hints automatically. They never
             // reach AGY or change the prompt; retention remains provider-owned.
@@ -668,11 +842,13 @@ fn validate_common(root: &Map<String, Value>, responses: bool) -> Result<(), Api
     }
     if let Some(options) = nonnull(root.get("stream_options")) {
         let options = object(options, "stream_options")?;
-        allowed_fields(
-            options,
-            &["include_usage", "include_obfuscation"],
-            "stream_options",
-        )?;
+        // Responses define only include_obfuscation; false is our behaviour.
+        let fields: &[&str] = if responses {
+            &["include_obfuscation"]
+        } else {
+            &["include_usage", "include_obfuscation"]
+        };
+        allowed_fields(options, fields, "stream_options")?;
         if nonnull(options.get("include_usage")).is_some_and(|v| !v.is_boolean()) {
             return Err(ApiError::bad_request("include_usage must be boolean"));
         }
@@ -682,6 +858,41 @@ fn validate_common(root: &Map<String, Value>, responses: bool) -> Result<(), Api
         if root.get("stream").and_then(Value::as_bool) != Some(true) {
             return Err(ApiError::bad_request("stream_options requires stream=true"));
         }
+    }
+    Ok(ignored)
+}
+
+fn validate_sampling_hint(field: &str, value: &Value) -> Result<(), ApiError> {
+    if field == "seed" {
+        if value.is_i64() || value.is_u64() {
+            return Ok(());
+        }
+        return Err(ApiError::bad_request("seed must be an integer"));
+    }
+    let (min, max) = match field {
+        "temperature" => (0.0, 2.0),
+        "top_p" => (0.0, 1.0),
+        _ => (-2.0, 2.0),
+    };
+    match value.as_f64() {
+        Some(number) if (min..=max).contains(&number) => Ok(()),
+        _ => Err(ApiError::bad_request(format!(
+            "{field} must be a number between {min} and {max}"
+        ))),
+    }
+}
+
+/// OpenAI's limits: at most 16 string pairs, 64-byte keys, 512-byte values.
+fn validate_metadata(value: &Value) -> Result<(), ApiError> {
+    let metadata = object(value, "metadata")?;
+    if metadata.len() > 16
+        || metadata
+            .iter()
+            .any(|(key, value)| key.len() > 64 || value.as_str().is_none_or(|v| v.len() > 512))
+    {
+        return Err(ApiError::bad_request(
+            "metadata must map at most 16 keys of up to 64 bytes to strings of up to 512 bytes",
+        ));
     }
     Ok(())
 }
@@ -810,7 +1021,8 @@ fn parse_effort(value: Option<&Value>) -> Result<Option<String>, ApiError> {
         return Ok(None);
     };
     let effort = string(value, "reasoning effort")?;
-    if !["low", "medium", "high", "xhigh", "max"].contains(&effort) {
+    // Provider policy for none/minimal is applied after model resolution.
+    if !["none", "minimal", "low", "medium", "high", "xhigh", "max"].contains(&effort) {
         return Err(ApiError::unsupported("reasoning effort"));
     }
     Ok(Some(effort.to_owned()))
@@ -1074,6 +1286,38 @@ fn validate_item_metadata(data: &Map<String, Value>) -> Result<(), ApiError> {
     }
     Ok(())
 }
+/// Anthropic-style cache markers on content parts have no provider
+/// equivalent here. They are removed before validation; true if present.
+fn strip_cache_control(content: &mut Value) -> Result<bool, ApiError> {
+    let mut found = false;
+    for part in content.as_array_mut().into_iter().flatten() {
+        if let Some(marker) = part.as_object_mut().and_then(|p| p.remove("cache_control")) {
+            if !marker.is_null() && !marker.is_object() {
+                return Err(ApiError::bad_request("cache_control must be an object"));
+            }
+            found |= !marker.is_null();
+        }
+    }
+    Ok(found)
+}
+/// A replayed Responses refusal is assistant text, as on Chat Completions.
+fn refusal_parts_to_text(content: &mut Value) -> Result<(), ApiError> {
+    for part in content.as_array_mut().into_iter().flatten() {
+        if part.get("type").and_then(Value::as_str) != Some("refusal") {
+            continue;
+        }
+        let fields = object(part, "content block")?;
+        allowed_fields(fields, &["type", "refusal"], "content block")?;
+        let refusal = required_string(fields, "refusal")?.to_owned();
+        *part = json!({"type":"output_text", "text":refusal});
+    }
+    Ok(())
+}
+fn note(ignored: &mut Vec<String>, present: bool, field: &str) {
+    if present && !ignored.iter().any(|f| f == field) {
+        ignored.push(field.to_owned());
+    }
+}
 fn validate_call_id(id: &str) -> Result<(), ApiError> {
     if id.is_empty() || id.len() > 256 || !id.bytes().all(|b| b.is_ascii_graphic()) {
         return Err(ApiError::bad_request(
@@ -1184,19 +1428,42 @@ mod tests {
         assert_eq!(request.input[2]["call_id"], "call_EXACT");
         assert_eq!(request.input[2]["output"], "sunny");
     }
+    fn normalize(responses: bool) -> fn(Value, String) -> Result<RunRequest, ApiError> {
+        if responses {
+            normalize_response
+        } else {
+            normalize_chat
+        }
+    }
+    fn base(responses: bool) -> Value {
+        if responses {
+            json!({"model":"gemini-test", "input":"hello"})
+        } else {
+            chat()
+        }
+    }
     #[test]
     fn rejects_unimplemented_controls_and_allows_inert_sdk_defaults() {
-        for field in [
-            "temperature",
-            "top_p",
-            "max_output_tokens",
-            "seed",
-            "previous_response_id",
-        ] {
+        for field in ["max_output_tokens", "previous_response_id"] {
             let mut input = chat();
             input[field] = json!(1);
             let error = normalize_chat(input, "req".to_owned()).unwrap_err();
             assert_eq!(error.code, "unsupported_parameter", "{field}");
+        }
+        // Active sampling behaviour stays rejected rather than silently dropped.
+        for (field, value) in [
+            ("n", json!(2)),
+            ("logit_bias", json!({"50256": -100})),
+            ("logprobs", json!(true)),
+            ("top_logprobs", json!(2)),
+            ("stop", json!(["\n\n"])),
+            ("stop", json!("END")),
+        ] {
+            let mut input = chat();
+            input[field] = value;
+            let error = normalize_chat(input, "req".to_owned()).unwrap_err();
+            assert_eq!(error.code, "unsupported_parameter", "{field}");
+            assert!(error.message.starts_with(field));
         }
         let mut input = chat();
         input["temperature"] = Value::Null;
@@ -1205,7 +1472,265 @@ mod tests {
         input["parallel_tool_calls"] = json!(true);
         input["frequency_penalty"] = json!(0);
         input["logprobs"] = json!(false);
+        input["stop"] = json!([]);
         assert!(normalize_chat(input, "req".to_owned()).is_ok());
+    }
+    #[test]
+    fn sampling_hints_are_range_checked_and_ignored_without_changing_the_request() {
+        for responses in [false, true] {
+            let expected =
+                serde_json::to_value(normalize(responses)(base(responses), "req".into()).unwrap())
+                    .unwrap();
+            for (field, value) in [
+                ("temperature", json!(0)),
+                ("temperature", json!(0.7)),
+                ("temperature", json!(2)),
+                ("top_p", json!(0)),
+                ("top_p", json!(1)),
+                ("seed", json!(42)),
+                ("seed", json!(-7)),
+                ("frequency_penalty", json!(-2)),
+                ("presence_penalty", json!(1.5)),
+            ] {
+                let mut input = base(responses);
+                input[field] = value;
+                let request = normalize(responses)(input, "req".into()).unwrap();
+                assert_eq!(request.ignored, [field]);
+                assert_eq!(serde_json::to_value(request).unwrap(), expected);
+            }
+            for (field, value) in [
+                ("temperature", json!(-0.1)),
+                ("temperature", json!(2.5)),
+                ("temperature", json!("0.7")),
+                ("top_p", json!(1.01)),
+                ("seed", json!(1.5)),
+                ("seed", json!("42")),
+                ("frequency_penalty", json!(-2.5)),
+                ("presence_penalty", json!(3)),
+                ("presence_penalty", json!(true)),
+            ] {
+                let mut input = base(responses);
+                input[field] = value;
+                let error = normalize(responses)(input, "req".into()).unwrap_err();
+                assert_eq!(error.code, "invalid_request", "{field}");
+                assert_eq!(
+                    error.response_body()["error"]["type"],
+                    "invalid_request_error"
+                );
+                assert!(error.message.starts_with(field));
+            }
+        }
+    }
+    #[test]
+    fn reasoning_effort_none_and_minimal_parse_on_both_apis() {
+        for effort in ["none", "minimal", "low", "max"] {
+            let mut input = chat();
+            input["reasoning_effort"] = json!(effort);
+            assert_eq!(
+                normalize_chat(input, "req".into())
+                    .unwrap()
+                    .effort
+                    .as_deref(),
+                Some(effort)
+            );
+            let input = json!({"model":"gemini-test", "input":"hello", "store":false,
+                "include":["reasoning.encrypted_content"], "reasoning":{"effort":effort}});
+            assert_eq!(
+                normalize_response(input, "req".into())
+                    .unwrap()
+                    .effort
+                    .as_deref(),
+                Some(effort)
+            );
+        }
+        let mut input = chat();
+        input["reasoning_effort"] = json!("turbo");
+        assert_eq!(
+            normalize_chat(input, "req".into()).unwrap_err().code,
+            "unsupported_parameter"
+        );
+    }
+    #[test]
+    fn no_op_request_fields_are_validated_and_disclosed() {
+        for responses in [false, true] {
+            let expected =
+                serde_json::to_value(normalize(responses)(base(responses), "req".into()).unwrap())
+                    .unwrap();
+            let mut accepted = vec![
+                ("metadata", json!({"workflow":"synthetic", "empty":""})),
+                ("user", json!("user-123")),
+                ("safety_identifier", json!("sid")),
+                ("service_tier", json!("auto")),
+                ("service_tier", json!("default")),
+            ];
+            if responses {
+                accepted.push(("truncation", json!("auto")));
+            }
+            for (field, value) in accepted {
+                let mut input = base(responses);
+                input[field] = value;
+                let request = normalize(responses)(input, "req".into()).unwrap();
+                assert_eq!(request.ignored, [field]);
+                assert_eq!(serde_json::to_value(request).unwrap(), expected);
+            }
+            for tier in ["flex", "priority", "scale"] {
+                let mut input = base(responses);
+                input["service_tier"] = json!(tier);
+                let error = normalize(responses)(input, "req".into()).unwrap_err();
+                assert_eq!(error.code, "unsupported_parameter");
+                assert_eq!(
+                    error.message,
+                    format!("service_tier {tier} is not supported by this adapter")
+                );
+            }
+            let long_key: Map<String, Value> = [("k".repeat(65), json!("v"))].into_iter().collect();
+            let many: Map<String, Value> = (0..17).map(|i| (format!("k{i}"), json!("v"))).collect();
+            for (field, value) in [
+                ("metadata", json!({"k": 1})),
+                ("metadata", Value::Object(long_key)),
+                ("metadata", json!({"k": "v".repeat(513)})),
+                ("metadata", Value::Object(many)),
+                ("metadata", json!(["k"])),
+                ("user", json!(7)),
+                ("safety_identifier", json!("x".repeat(513))),
+                ("service_tier", json!(1)),
+            ] {
+                let mut input = base(responses);
+                input[field] = value;
+                let error = normalize(responses)(input, "req".into()).unwrap_err();
+                assert_eq!(error.code, "invalid_request", "{field}");
+            }
+        }
+        // Truncation is a Responses field; only its no-op values are accepted.
+        let mut input = chat();
+        input["truncation"] = json!("auto");
+        assert!(normalize_chat(input, "req".into()).is_err());
+        let input = json!({"model":"gemini-test", "input":"hello", "truncation":"disabled"});
+        assert!(
+            normalize_response(input, "req".into())
+                .unwrap()
+                .ignored
+                .is_empty()
+        );
+        let input = json!({"model":"gemini-test", "input":"hello", "truncation":"middle"});
+        assert!(normalize_response(input, "req".into()).is_err());
+        // Responses stream_options defines only include_obfuscation.
+        let input = json!({"model":"gemini-test", "input":"hello", "stream":true,
+            "stream_options":{"include_obfuscation":false}});
+        assert!(
+            normalize_response(input, "req".into())
+                .unwrap()
+                .ignored
+                .is_empty()
+        );
+        for options in [
+            json!({"include_obfuscation":true}),
+            json!({"include_usage":true}),
+        ] {
+            let input = json!({"model":"gemini-test", "input":"hello", "stream":true,
+                "stream_options":options});
+            assert_eq!(
+                normalize_response(input, "req".into()).unwrap_err().code,
+                "unsupported_parameter"
+            );
+        }
+        let input = json!({"model":"gemini-test", "input":"hello",
+            "stream_options":{"include_obfuscation":false}});
+        assert_eq!(
+            normalize_response(input, "req".into()).unwrap_err().code,
+            "invalid_request"
+        );
+    }
+    #[test]
+    fn replayed_history_extras_are_dropped_or_mapped_and_disclosed() {
+        // Responses: unencrypted reasoning is dropped; a refusal part is text.
+        let input = json!({"model":"gemini-test", "input":[
+            {"role":"user","content":"hi"},
+            {"type":"reasoning","id":"rs_1","summary":[]},
+            {"type":"message","role":"assistant","content":[{"type":"refusal","refusal":"no"}]},
+            {"role":"user","content":[{"type":"input_text","text":"again","cache_control":{"type":"ephemeral"}}]}]});
+        let request = normalize_response(input, "req".into()).unwrap();
+        assert_eq!(request.input.len(), 3);
+        assert_eq!(
+            request.input[1]["content"],
+            json!([{"type":"output_text","text":"no"}])
+        );
+        assert_eq!(
+            request.input[2]["content"],
+            json!([{"type":"input_text","text":"again"}])
+        );
+        assert_eq!(
+            request.ignored,
+            ["reasoning_without_encrypted_content", "cache_control"]
+        );
+        // Encrypted reasoning is still replayed; malformed state still fails.
+        let input = json!({"model":"gemini-test", "input":[{"role":"user","content":"hi"},
+            {"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"opaque"}]});
+        assert_eq!(
+            normalize_response(input, "req".into()).unwrap().input.len(),
+            2
+        );
+        for reasoning in [
+            json!({"type":"reasoning","id":"rs_1","encrypted_content":""}),
+            json!({"type":"reasoning","id":"rs_1","summary":"text"}),
+        ] {
+            let input =
+                json!({"model":"gemini-test", "input":[{"role":"user","content":"hi"}, reasoning]});
+            assert!(normalize_response(input, "req".into()).is_err());
+        }
+        for content in [
+            json!([{"type":"refusal","refusal":"no","extra":true}]),
+            json!([{"type":"refusal"}]),
+        ] {
+            let input = json!({"model":"gemini-test", "input":[{"role":"user","content":"hi"},
+                {"type":"message","role":"assistant","content":content}]});
+            assert!(normalize_response(input, "req".into()).is_err());
+        }
+        // A user cannot send a refusal part.
+        let input = json!({"model":"gemini-test", "input":[{"role":"user",
+            "content":[{"type":"refusal","refusal":"no"}]}]});
+        assert!(normalize_response(input, "req".into()).is_err());
+
+        // Chat: citations and reasoning_content are ignored; empty annotations are silent.
+        let plain = json!({"model":"gemini-test","messages":[{"role":"user","content":"hello"},
+            {"role":"assistant","content":"hi","refusal":null},{"role":"user","content":"again"}]});
+        let expected = serde_json::to_value(normalize_chat(plain, "req".into()).unwrap()).unwrap();
+        let replay = json!({"model":"gemini-test","messages":[{"role":"user","content":"hello"},
+            {"role":"assistant","content":"hi","refusal":null,"annotations":[]},{"role":"user","content":"again"}]});
+        let request = normalize_chat(replay, "req".into()).unwrap();
+        assert!(request.ignored.is_empty());
+        assert_eq!(serde_json::to_value(request).unwrap(), expected);
+        let replay = json!({"model":"gemini-test","messages":[{"role":"user","content":"hello"},
+            {"role":"assistant","content":"hi","refusal":null,"reasoning_content":"private chain",
+             "annotations":[{"type":"url_citation","url_citation":{"url":"https://example.invalid","title":"t","start_index":0,"end_index":2}}]},
+            {"role":"user","content":"again"}]});
+        let request = normalize_chat(replay, "req".into()).unwrap();
+        assert_eq!(request.ignored, ["annotations", "reasoning_content"]);
+        assert_eq!(serde_json::to_value(request).unwrap(), expected);
+        let cached = json!({"model":"gemini-test","messages":[{"role":"system","content":[{"type":"text","text":"rules","cache_control":{"type":"ephemeral"}}]},
+            {"role":"user","content":[{"type":"text","text":"hi","cache_control":{"type":"ephemeral","ttl":"5m"}}]}]});
+        let request = normalize_chat(cached, "req".into()).unwrap();
+        assert_eq!(request.ignored, ["cache_control"]);
+        assert_eq!(
+            request.instructions[0]["content"],
+            json!([{"type":"text","text":"rules"}])
+        );
+        assert_eq!(
+            request.input[0]["content"],
+            json!([{"type":"text","text":"hi"}])
+        );
+        for message in [
+            json!({"role":"assistant","content":"hi","annotations":[{"type":"file_citation"}]}),
+            json!({"role":"assistant","content":"hi","annotations":"none"}),
+            json!({"role":"assistant","content":"hi","reasoning_content":7}),
+            json!({"role":"user","content":"hi","annotations":[]}),
+            json!({"role":"user","content":"hi","reasoning_content":"x"}),
+            json!({"role":"user","content":[{"type":"text","text":"hi","cache_control":"ephemeral"}]}),
+        ] {
+            let input =
+                json!({"model":"gemini-test","messages":[message,{"role":"user","content":"go"}]});
+            assert!(normalize_chat(input, "req".into()).is_err());
+        }
     }
     #[test]
     fn token_budgets_add_only_best_effort_answer_length_guidance() {

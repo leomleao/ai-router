@@ -919,8 +919,9 @@ fn block_error(code: &str) -> ApiError {
             "openai_usage_blocked",
             "ChatGPT plan usage is blocked; review ChatGPT Usage and run ai-router openai resume",
         ),
+        // A provider-side restriction, not a client-key permission failure.
         "ineligible" => ApiError::new(
-            403,
+            503,
             "openai_ineligible",
             "This ChatGPT registration is not eligible for plan inference; correct authorization and run ai-router openai resume",
         ),
