@@ -60,8 +60,9 @@ pub struct AppState {
     stream_commit_wait: Duration,
 }
 
-/// Longest a stream waits for provider acceptance before committing its 200:
-/// the keepalive interval, so the wait adds no longer silence than an open stream.
+/// Longest a stream waits for its first client-visible output before
+/// committing its 200: the keepalive interval, so the wait adds no longer
+/// silence than an open stream.
 const STREAM_COMMIT_WAIT: Duration = Duration::from_secs(15);
 
 impl AppState {
@@ -413,8 +414,19 @@ pub struct RequestContext {
     pub id: String,
     selection: std::sync::Mutex<Option<(String, String)>>,
     fallback: std::sync::Mutex<Option<ModelFallback>>,
+    disclosures: std::sync::Mutex<Vec<(&'static str, String)>>,
     pub started: Instant,
     pub recorded: AtomicBool,
+}
+impl RequestContext {
+    /// Records how the router interpreted the request. `protect` adds every
+    /// recorded header to the final response, whether it succeeds, streams,
+    /// or fails before or after a stream commits.
+    fn disclose(&self, name: &'static str, value: impl Into<String>) {
+        let mut disclosures = self.disclosures.lock().unwrap();
+        disclosures.retain(|(existing, _)| *existing != name);
+        disclosures.push((name, value.into()));
+    }
 }
 
 /// A served substitute for an unknown requested model, disclosed on every
@@ -423,7 +435,6 @@ pub struct RequestContext {
 struct ModelFallback {
     requested: String,
     served: String,
-    effort: Option<String>,
 }
 impl ModelFallback {
     fn new(requested: &str, served: &str) -> Self {
@@ -439,16 +450,6 @@ impl ModelFallback {
                 requested
             },
             served: served.into(),
-            effort: None,
-        }
-    }
-    fn disclose(&self, response: &mut Response) {
-        let headers = response.headers_mut();
-        if let Ok(value) = format!("{} -> {}", self.requested, self.served).parse() {
-            headers.insert("x-ai-router-model-fallback", value);
-        }
-        if let Some(effort) = self.effort.as_deref().and_then(|e| e.parse().ok()) {
-            headers.insert("x-ai-router-reasoning-effort", effort);
         }
     }
 }
@@ -602,6 +603,7 @@ async fn protect(
     let context = Arc::new(RequestContext {
         selection: std::sync::Mutex::new(None),
         fallback: std::sync::Mutex::new(None),
+        disclosures: std::sync::Mutex::new(Vec::new()),
         id: Uuid::new_v4().to_string(),
         started: Instant::now(),
         recorded: AtomicBool::new(false),
@@ -617,10 +619,12 @@ async fn protect(
     request.extensions_mut().insert(key);
     request.extensions_mut().insert(context.clone());
     let mut response = next.run(request).await;
-    let fallback = context.fallback.lock().unwrap().clone();
-    if let Some(fallback) = &fallback {
-        fallback.disclose(&mut response);
+    for (name, value) in context.disclosures.lock().unwrap().iter() {
+        if let Ok(value) = value.parse() {
+            response.headers_mut().insert(*name, value);
+        }
     }
+    let fallback = context.fallback.lock().unwrap().clone();
     if response.status().as_u16() >= 400 && !context.recorded.load(Ordering::Relaxed) {
         let selection = context.selection.lock().unwrap().clone();
         state
@@ -728,7 +732,8 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> Json<Value> {
             "prompt_cache_controls":{"mode":"ignored","retention_guarantee":false},
             "sampling_controls":{"mode":"ignored","accepted":SAMPLING_HINTS,"rejected":["n>1","logit_bias","logprobs","top_logprobs>0","stop"]},
             "ignored_fields":{"accepted":["metadata","user","safety_identifier","service_tier:auto","service_tier:default","truncation:auto","stream_options.include_obfuscation:false","annotations","cache_control","reasoning_content"],"metadata_echo":"responses","truncation":"never"},
-            "reasoning_effort":{"accepted":["none","minimal","low","medium","high","xhigh","max"],"openai":{"none":"forwarded","minimal":"lowest_listed_level_when_unlisted"},"agy":{"none":"ignored","minimal":"ignored","other":"must_match_model_id"}},
+            "reasoning_effort":{"accepted":["none","minimal","low","medium","high","xhigh","max"],"openai":{"none":"forwarded","minimal":"lowest_listed_level_when_unlisted"},"agy":{"none":"ignored","minimal":"ignored","other":"must_match_model_id","fallback_served":"served_model_tier"},
+                "disclosure_header":"x-ai-router-reasoning-effort","header_values":["ignored","mapped=<level>"],"values_per_request":1},
             "reasoning_replay":{"unencrypted":"dropped"},
             "retry_hints":{"deterministic":"x-should-retry:false","transient_503":"retry-after","local_saturation":{"status":503,"code":"busy"},"rate_limit":{"status":429}},
             "responses_include":["reasoning.encrypted_content"],
@@ -736,7 +741,10 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> Json<Value> {
             "model_fallback":{"enabled":state.config.model_fallback,"applies_to":"model_ids_never_served","exact_ids_win":true,"listed_in_models":false,
                 "gemini_prefix_target":state.config.fallback_gemini_model,"default_target":state.config.fallback_openai_model,"unavailable_target":"other_target","neither_available":"model_not_found",
                 "disclosure_header":"x-ai-router-model-fallback","antigravity_effort":"served_model_tier","effort_disclosure_header":"x-ai-router-reasoning-effort"},
-            "tool_choice":{"accepted":["auto","none","required","function","allowed_tools"],"inventory":"narrowed_to_selection","missing_required_call":"error"},
+            "tool_choice":{"accepted":["auto","none","required","function","allowed_tools"],"inventory":"narrowed_to_selection","missing_required_call":"error","missing_required_call_error":{"status":502,"code":"missing_required_tool_call","retry":false},"error_param":"tool_choice"},
+            "stream_commit":{"after":"first_client_output","max_wait_seconds":STREAM_COMMIT_WAIT.as_secs(),"failure_before_commit":"http_error","failure_after_commit":"error_event","responses_error_event":"error_then_response.failed"},
+            "disclosure_headers":{"scope":"every_response_after_validation","model_fallback_scope":"every_response","streaming_and_errors":"same_as_nonstreaming",
+                "headers":["x-ai-router-model-fallback","x-ai-router-reasoning-effort","x-ai-router-sampling-controls","x-ai-router-ignored-fields","x-ai-router-reasoning-replay","x-ai-router-reasoning-summary","x-ai-router-prompt-cache-controls","x-ai-router-token-budget-mode","x-ai-router-item-storage"]},
             "item_references":{"enabled":true,"storage":"memory","default_store":true,"ttl_seconds":items::TTL_SECONDS,"max_items":items::MAX_ITEMS,"max_bytes":items::MAX_BYTES,"per_client_items":items::CLIENT_ITEMS,"per_client_bytes":items::CLIENT_BYTES,"cleared_on_restart":true}}},
         "providers":{
             "agy":{"enabled":state.config.antigravity_enabled,"ready":snapshot.entries.iter().any(|e|e.provider==ProviderId::Agy),"adapter":agy.version,"baseline":crate::antigravity_auth::BASELINE_REVISION,"checked_at":agy.checked_at,"error":agy.error,"quota":agy.quota,"transport":"direct","fallback":false,"release_advisory":release,"tool_choice_forcing":"prompt_instruction"},
@@ -792,18 +800,6 @@ async fn generate(
             &body,
         )
         .await;
-    let has_cache_hints = ["prompt_cache_key", "prompt_cache_retention"]
-        .iter()
-        .any(|field| body.get(*field).is_some_and(|value| !value.is_null()));
-    let wants_reasoning_summary = responses
-        && body
-            .pointer("/reasoning/summary")
-            .is_some_and(|v| !v.is_null());
-    let storage_mode = if body.get("store").and_then(Value::as_bool) == Some(false) {
-        "disabled"
-    } else {
-        "memory"
-    };
     let remaining = Duration::from_secs(state.config.request_timeout_secs)
         .checked_sub(context.started.elapsed())
         .unwrap_or_default();
@@ -812,27 +808,7 @@ async fn generate(
         generate_body(state.clone(), key, context.clone(), body, responses),
     )
     .await
-    .unwrap_or_else(|_| Err(error(504, "provider_timeout", "Request deadline exceeded")))
-    .map(|mut response| {
-        if responses {
-            response
-                .headers_mut()
-                .insert("x-ai-router-item-storage", storage_mode.parse().unwrap());
-        }
-        if has_cache_hints {
-            response.headers_mut().insert(
-                "x-ai-router-prompt-cache-controls",
-                "ignored".parse().unwrap(),
-            );
-        }
-        if wants_reasoning_summary {
-            response.headers_mut().insert(
-                "x-ai-router-reasoning-summary",
-                "unavailable".parse().unwrap(),
-            );
-        }
-        response
-    });
+    .unwrap_or_else(|_| Err(error(504, "provider_timeout", "Request deadline exceeded")));
     if let Err(error) = &result {
         state
             .telemetry
@@ -857,7 +833,7 @@ async fn generate_body(
         .and_then(Value::as_str)
         .ok_or_else(|| ApiError::bad_request("model must be a string"))?
         .to_owned();
-    let mut fallback = state
+    let fallback = state
         .fallback_model(&requested)
         .await
         .map(|served| ModelFallback::new(&requested, &served));
@@ -865,6 +841,10 @@ async fn generate_body(
         // The response body reports the served ID, as OpenAI does for snapshots.
         body["model"] = json!(fallback.served);
         *context.fallback.lock().unwrap() = Some(fallback.clone());
+        context.disclose(
+            "x-ai-router-model-fallback",
+            format!("{} -> {}", fallback.requested, fallback.served),
+        );
     }
     let model_id = fallback.as_ref().map_or(requested.as_str(), |f| &f.served);
     let selected = state.resolve_model(model_id).await?;
@@ -892,6 +872,13 @@ async fn generate_body(
         .pointer("/stream_options/include_usage")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let has_cache_hints = ["prompt_cache_key", "prompt_cache_retention"]
+        .iter()
+        .any(|field| body.get(*field).is_some_and(|value| !value.is_null()));
+    let wants_reasoning_summary = responses
+        && body
+            .pointer("/reasoning/summary")
+            .is_some_and(|v| !v.is_null());
     // Responses echo request metadata, as OpenAI does. It never reaches a provider.
     let metadata = body
         .get("metadata")
@@ -904,23 +891,32 @@ async fn generate_body(
     } else {
         normalize_chat(body, id.clone())?
     };
+    // From here the request is valid, so its disclosures describe every
+    // response, including provider failures before or after a stream commits.
     let mut disclosures = disclosure_headers(&request.ignored);
-    if let Some(mode) = apply_effort_policy(&state, selected, &mut request).await {
+    if let Some(mode) = apply_effort_policy(&state, selected, fallback.is_some(), &mut request).await
+    {
         disclosures.push(("x-ai-router-reasoning-effort", mode));
+    }
+    if responses {
+        let storage = if store_items { "memory" } else { "disabled" };
+        disclosures.push(("x-ai-router-item-storage", storage.into()));
+    }
+    if has_cache_hints {
+        disclosures.push(("x-ai-router-prompt-cache-controls", "ignored".into()));
+    }
+    if wants_reasoning_summary {
+        disclosures.push(("x-ai-router-reasoning-summary", "unavailable".into()));
+    }
+    if has_token_budget {
+        disclosures.push(("x-ai-router-token-budget-mode", "prompt-guidance".into()));
+    }
+    for (name, value) in disclosures {
+        context.disclose(name, value);
     }
     request.owner = key.id.clone();
     request.endpoint = if responses { "responses" } else { "chat" }.into();
     request.provider_generation = pinned_generation.clone();
-    if let Some(fallback) = fallback.as_mut().filter(|_| selected == ProviderId::Agy) {
-        // Antigravity wire IDs fix the effort tier. A client's effort was chosen
-        // for the model it asked for, so the served tier wins and is disclosed.
-        let tier = request.model.rsplit('-').next().map(str::to_owned);
-        if request.effort.is_some() && request.effort != tier {
-            request.effort = None;
-            fallback.effort = tier;
-            *context.fallback.lock().unwrap() = Some(fallback.clone());
-        }
-    }
     let started = context.started;
     let admission = state.admit_provider(selected).await?;
     if state.resolve_model(&request.model).await? != selected {
@@ -1008,10 +1004,7 @@ async fn generate_body(
                         }
                     }
                     guard.capture_response(&output);
-                    return Ok(disclose(
-                        token_budget_response(Json(output).into_response(), has_token_budget),
-                        &disclosures,
-                    ));
+                    return Ok(Json(output).into_response());
                 }
                 RunEvent::Error(e) => return Err(e),
                 _ => {}
@@ -1025,54 +1018,64 @@ async fn generate_body(
         guard.observe(&RunEvent::Error(failure.clone()));
         return Err(failure);
     }
-    // Commit the SSE 200 only after the provider's first event (Init once it
-    // accepted the request). Earlier failures keep the non-streaming status,
-    // code and headers, as on OpenAI. A provider still silent after the commit
-    // wait gets a committed stream with keepalives; later failures are events.
-    let mut pending = match tokio::time::timeout(state.stream_commit_wait, run.events.recv()).await
-    {
-        Err(_) => None,
-        Ok(Some(RunEvent::Error(failure))) => {
-            guard.observe(&RunEvent::Error(failure.clone()));
-            return Err(failure);
-        }
-        Ok(Some(event)) => Some(event),
-        Ok(None) => {
-            let failure = error(
-                502,
-                "incomplete_provider_output",
-                "Provider ended without a result",
-            );
-            guard.observe(&RunEvent::Error(failure.clone()));
-            return Err(failure);
-        }
+    let stream_output = StreamOutput {
+        responses,
+        store_items,
+        owner,
+        item_scope,
+        completion_id: completion_id.clone(),
+        created,
+        model: model.clone(),
+        metadata: metadata.clone(),
     };
+    // Commit the SSE 200 only once the stream has client-visible output (a
+    // delta, call or terminal result), never before the provider's Init.
+    // Earlier failures, including withheld output that fails validation or a
+    // required tool call, keep the non-streaming status, body and headers, as
+    // on OpenAI. A stream still silent after the commit wait is committed with
+    // keepalives; later failures are events.
+    let mut render = StreamRenderer::new(
+        responses,
+        completion_id.clone(),
+        model.clone(),
+        created,
+        include_usage,
+        store_items,
+        metadata.clone(),
+    );
+    let mut pending = render.begin();
+    let begun = pending.len();
+    let mut terminal = false;
+    let deadline = tokio::time::Instant::now() + state.stream_commit_wait;
+    while pending.len() == begun {
+        let event = match tokio::time::timeout_at(deadline, run.events.recv()).await {
+            Err(_) => break,
+            Ok(Some(event)) => event,
+            Ok(None) => {
+                let failure = error(
+                    502,
+                    "incomplete_provider_output",
+                    "Provider ended without a result",
+                );
+                guard.observe(&RunEvent::Error(failure.clone()));
+                return Err(failure);
+            }
+        };
+        let event = settle_stream_event(&state, &mut guard, event, &stream_output);
+        if let RunEvent::Error(failure) = event {
+            return Err(failure);
+        }
+        terminal = matches!(&event, RunEvent::Completed(_));
+        pending.extend(render.event(event));
+    }
     let stream = async_stream::stream! {
         let mut guard = guard;
-        let mut render = StreamRenderer::new(responses, completion_id.clone(), model.clone(), created, include_usage, store_items, metadata.clone());
-        for item in render.begin() { yield Ok::<Event,Infallible>(item); }
-        let mut terminal = false;
-        while let Some(mut event) = match pending.take() { Some(event) => Some(event), None => run.events.recv().await } {
-            if let RunEvent::Completed(result) = &event {
-                if let Err(error) = validate_result(result) { event = RunEvent::Error(error); }
-            }
-            if store_items {
-                if let RunEvent::Completed(result) = &event {
-                    let output = echo_metadata(response_object(&completion_id, created, &model, result, true), &metadata);
-                    if let Err(error) = state.items.save_scoped(&owner, &output, &item_scope) {
-                        event = RunEvent::Error(error);
-                    }
-                }
-            }
-            guard.observe(&event);
-            if let RunEvent::Completed(result) = &event {
-                let output = if responses { echo_metadata(response_object(&completion_id, created, &model, result, store_items), &metadata) }
-                    else { chat_object(&completion_id, created, &model, result) };
-                guard.capture_response(&output);
-            }
+        for item in pending { yield Ok::<Event,Infallible>(item); }
+        while !terminal {
+            let Some(event) = run.events.recv().await else { break };
+            let event = settle_stream_event(&state, &mut guard, event, &stream_output);
             terminal = matches!(&event, RunEvent::Completed(_) | RunEvent::Error(_));
             for item in render.event(event) { yield Ok(item); }
-            if terminal { break; }
         }
         if !terminal {let failure=RunEvent::Error(error(502,"incomplete_provider_output","Provider ended without a result"));guard.observe(&failure);for item in render.event(failure) {yield Ok(item);}}
     };
@@ -1085,10 +1088,63 @@ async fn generate_body(
     response
         .headers_mut()
         .insert("cache-control", "no-cache, no-transform".parse().unwrap());
-    Ok(disclose(
-        token_budget_response(response, has_token_budget),
-        &disclosures,
-    ))
+    Ok(response)
+}
+
+/// What a streamed result stores and reports, so validation, item storage and
+/// telemetry are identical before and after the stream commits.
+struct StreamOutput {
+    responses: bool,
+    store_items: bool,
+    owner: String,
+    item_scope: String,
+    completion_id: String,
+    created: i64,
+    model: String,
+    metadata: Value,
+}
+
+fn settle_stream_event(
+    state: &AppState,
+    guard: &mut CompletionGuard,
+    mut event: RunEvent,
+    out: &StreamOutput,
+) -> RunEvent {
+    if let RunEvent::Completed(result) = &event {
+        if let Err(error) = validate_result(result) {
+            event = RunEvent::Error(error);
+        }
+    }
+    if out.store_items {
+        if let RunEvent::Completed(result) = &event {
+            let output = echo_metadata(
+                response_object(&out.completion_id, out.created, &out.model, result, true),
+                &out.metadata,
+            );
+            if let Err(error) = state.items.save_scoped(&out.owner, &output, &out.item_scope) {
+                event = RunEvent::Error(error);
+            }
+        }
+    }
+    guard.observe(&event);
+    if let RunEvent::Completed(result) = &event {
+        let output = if out.responses {
+            echo_metadata(
+                response_object(
+                    &out.completion_id,
+                    out.created,
+                    &out.model,
+                    result,
+                    out.store_items,
+                ),
+                &out.metadata,
+            )
+        } else {
+            chat_object(&out.completion_id, out.created, &out.model, result)
+        };
+        guard.capture_response(&output);
+    }
+    event
 }
 
 /// Accepted fields with no effect are named in response headers, so a
@@ -1117,22 +1173,20 @@ fn disclosure_headers(ignored: &[String]) -> Vec<(&'static str, String)> {
     headers
 }
 
-fn disclose(mut response: Response, headers: &[(&'static str, String)]) -> Response {
-    for (name, value) in headers {
-        if let Ok(value) = value.parse() {
-            response.headers_mut().insert(*name, value);
-        }
-    }
-    response
-}
-
-/// `none` and `minimal` are OpenAI effort levels. An Antigravity model ID
-/// fixes its effort, so there they mean "no explicit effort". OpenAI forwards
-/// both unless its catalogue lists the model's levels without `minimal`.
-/// The returned header value discloses any change.
+/// The one effort decision for a request, made against the served model.
+/// At most one `x-ai-router-reasoning-effort` value results, by precedence:
+/// 1. Antigravity `none`/`minimal` -> `ignored`: its model ID fixes the effort,
+///    so they mean "no explicit effort" (exact or fallback-served ID).
+/// 2. A fallback-served Antigravity ID with a different effort ->
+///    `mapped=<tier>`: the client chose that effort for the model it asked for.
+///    An exact ID's conflict is still rejected by the adapter.
+/// 3. OpenAI `minimal` that the catalogue does not list -> `mapped=<level>`,
+///    the lowest listed level above it.
+/// Anything else reaches the provider unchanged, without the header.
 async fn apply_effort_policy(
     state: &AppState,
     provider: ProviderId,
+    fallback: bool,
     request: &mut RunRequest,
 ) -> Option<String> {
     let effort = request.effort.as_deref()?;
@@ -1140,6 +1194,14 @@ async fn apply_effort_policy(
         ProviderId::Agy if matches!(effort, "none" | "minimal") => {
             request.effort = None;
             Some("ignored".into())
+        }
+        ProviderId::Agy if fallback => {
+            let tier = request.model.rsplit('-').next()?.to_owned();
+            if effort == tier {
+                return None;
+            }
+            request.effort = None;
+            Some(format!("mapped={tier}"))
         }
         ProviderId::OpenAi if effort == "minimal" => {
             let applied = state
@@ -1156,16 +1218,6 @@ async fn apply_effort_policy(
 fn echo_metadata(mut output: Value, metadata: &Value) -> Value {
     output["metadata"] = metadata.clone();
     output
-}
-
-fn token_budget_response(mut response: Response, has_budget: bool) -> Response {
-    if has_budget {
-        response.headers_mut().insert(
-            "x-ai-router-token-budget-mode",
-            "prompt-guidance".parse().unwrap(),
-        );
-    }
-    response
 }
 
 pub fn chat_usage(usage: &Option<Usage>) -> Value {
@@ -1521,9 +1573,9 @@ impl StreamRenderer {
                 // Official SDKs (and so LangChain) raise only on a top-level
                 // `error` object, so it accompanies the spec error fields.
                 let mut detail = e.response_body()["error"].take();
-                detail["param"] = Value::Null;
+                detail["param"] = json!(e.param);
                 if self.responses {
-                    vec![self.emit("error",json!({"code":e.code,"message":e.message,"param":null,"error":detail})),
+                    vec![self.emit("error",json!({"code":e.code,"message":e.message,"param":e.param,"error":detail})),
                         self.emit("response.failed",json!({"response":{"id":self.id,"object":"response","created_at":self.created,"model":self.model,"status":"failed","output":[],"error":{"code":e.code,"message":e.message,"upstream_request_id":e.upstream_request_id},"usage":null}}))]
                 } else {
                     vec![

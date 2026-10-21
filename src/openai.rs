@@ -901,7 +901,8 @@ fn parse_result(
         return Err(failure(502, "invalid_provider_tool_call"));
     }
     if request.tool_required && calls.is_empty() {
-        return Err(failure(502, "missing_required_tool_call"));
+        // The unmet field, as for tool_choice validation errors.
+        return Err(failure(502, "missing_required_tool_call").with_param("tool_choice"));
     }
     if text.is_empty() && !streamed_text.is_empty() {
         text = streamed_text.into();

@@ -921,7 +921,7 @@ async fn unsupported_model_ids_are_served_by_disclosed_fallback_targets() {
     ] {
         let served = serve(&harness, path, "gemini-9-ultra", effort.clone()).await;
         assert_eq!(served.status, StatusCode::OK, "{}", served.body);
-        assert_eq!(served.effort.as_deref(), Some("medium"));
+        assert_eq!(served.effort.as_deref(), Some("mapped=medium"));
         let served = serve(&harness, path, "gemini-9-ultra", json!({})).await;
         assert!(served.effort.is_none());
         let exact = serve(&harness, path, MODEL, effort).await;
@@ -1118,27 +1118,16 @@ async fn forced_tool_choice_client_bodies_call_the_selected_tool_or_fail_closed(
                     .send(Method::POST, path, Some(body), Some("test-key"))
                     .await;
                 let status = response.status();
+                let retry = response.headers().get("x-should-retry").cloned();
                 let wire = read_bytes(response).await;
-                if !streaming {
-                    assert_eq!(status, StatusCode::BAD_GATEWAY);
-                    let error: Value = serde_json::from_slice(&wire).unwrap();
-                    assert_eq!(error["error"]["code"], "missing_required_tool_call");
-                    continue;
-                }
-                assert_eq!(status, StatusCode::OK);
-                let frames = frames(&wire);
-                assert!(frames.iter().all(|frame| {
-                    frame.event != "response.output_text.delta"
-                        && !frame.data.contains("synthetic answer")
-                        && !frame.data.contains("Hello from fixture")
-                }));
-                let failure = frames
-                    .iter()
-                    .find(|frame| frame.data.contains("missing_required_tool_call"))
-                    .unwrap_or_else(|| panic!("{model} {path} did not fail closed"));
-                if path == "/v1/responses" {
-                    assert_eq!(failure.event, "response.failed");
-                }
+                // Withheld text means no output has started, so a stream fails
+                // before it commits, exactly like the nonstreaming request.
+                assert_eq!(status, StatusCode::BAD_GATEWAY, "{model} {path} {streaming}");
+                assert_eq!(retry.as_ref().map(|v| v.to_str().unwrap()), Some("false"));
+                let error: Value = serde_json::from_slice(&wire).unwrap();
+                assert_eq!(error["error"]["code"], "missing_required_tool_call");
+                let wire = String::from_utf8(wire).unwrap();
+                assert!(!wire.contains("synthetic answer") && !wire.contains("Hello from fixture"));
             }
 
             // allowed_tools keeps auto selection but removes the other tools:
@@ -1201,4 +1190,277 @@ async fn forced_tool_choice_client_bodies_call_the_selected_tool_or_fail_closed(
             .unwrap()
             .contains(&json!("forced_tool_choice"))
     );
+}
+
+// Integration of the compatibility changes: each request gets one effort
+// decision, made against the served model, and one disclosure-header set that
+// is the same whether it streams, fails before the stream commits, or fails.
+fn studio_body(path: &str, model: &str, effort: &str, input: &str, streaming: bool) -> Value {
+    let mut body = if path.ends_with("completions") {
+        json!({"model":model,"messages":[{"role":"user","content":input}],"reasoning_effort":effort})
+    } else {
+        json!({"model":model,"input":input,"store":false,"include":["reasoning.encrypted_content"],
+            "reasoning":{"effort":effort,"summary":"detailed"}})
+    };
+    body["temperature"] = json!(0);
+    body["stream"] = json!(streaming);
+    body
+}
+fn values<'a>(headers: &'a axum::http::HeaderMap, name: &str) -> Vec<&'a str> {
+    headers
+        .get_all(name)
+        .iter()
+        .map(|value| value.to_str().unwrap())
+        .collect()
+}
+const DISCLOSURES: &[&str] = &[
+    "x-ai-router-model-fallback",
+    "x-ai-router-reasoning-effort",
+    "x-ai-router-sampling-controls",
+    "x-ai-router-ignored-fields",
+    "x-ai-router-reasoning-replay",
+    "x-ai-router-reasoning-summary",
+    "x-ai-router-prompt-cache-controls",
+    "x-ai-router-token-budget-mode",
+    "x-ai-router-item-storage",
+];
+fn disclosures(headers: &axum::http::HeaderMap) -> Vec<(&'static str, Vec<String>)> {
+    DISCLOSURES
+        .iter()
+        .map(|name| {
+            let found = values(headers, name).into_iter().map(str::to_owned);
+            (*name, found.collect())
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn studio_fallback_with_effort_none_forwards_to_openai_and_is_ignored_on_antigravity() {
+    let harness = fallback_harness(|_| {}).await;
+    for path in ["/v1/chat/completions", "/v1/responses"] {
+        for streaming in [false, true] {
+            let body = studio_body(path, "gpt-5.4-nano", "none", "title this chat", streaming);
+            let (status, headers, wire) = exchange(&harness, path, body).await;
+            assert_eq!(status, StatusCode::OK, "{path} {wire}");
+            assert_eq!(
+                values(&headers, "x-ai-router-model-fallback"),
+                ["gpt-5.4-nano -> synthetic-openai"]
+            );
+            // OpenAI receives none unchanged, so nothing is disclosed.
+            assert!(values(&headers, "x-ai-router-reasoning-effort").is_empty());
+            assert_eq!(values(&headers, "x-ai-router-sampling-controls"), ["ignored"]);
+            let upstream = harness.captured.lock().await.last().unwrap().clone();
+            assert_eq!(upstream["model"], "synthetic-openai");
+            assert_eq!(upstream["reasoning"]["effort"], "none");
+            assert!(upstream.get("temperature").is_none());
+            // minimal is outside the fixture catalogue, so it maps to low.
+            let body = studio_body(path, "gpt-5.4-nano", "minimal", "title", streaming);
+            let (status, headers, _) = exchange(&harness, path, body).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(values(&headers, "x-ai-router-reasoning-effort"), ["mapped=low"]);
+            let upstream = harness.captured.lock().await.last().unwrap().clone();
+            assert_eq!(upstream["reasoning"]["effort"], "low");
+        }
+    }
+    // Only Antigravity live: the same requests cross to the Gemini target.
+    harness.model_mode.store(1, Ordering::SeqCst);
+    harness.state.refresh_openai().await;
+    for path in ["/v1/chat/completions", "/v1/responses"] {
+        for streaming in [false, true] {
+            for (effort, disclosed) in [
+                ("none", Some("ignored")),
+                ("minimal", Some("ignored")),
+                ("high", Some("mapped=medium")),
+                ("medium", None),
+            ] {
+                let body = studio_body(path, "gpt-5.4-nano", effort, "title", streaming);
+                let (status, headers, wire) = exchange(&harness, path, body).await;
+                assert_eq!(status, StatusCode::OK, "{path} {effort} {wire}");
+                assert_eq!(
+                    values(&headers, "x-ai-router-model-fallback"),
+                    [format!("gpt-5.4-nano -> {MODEL}")]
+                );
+                assert_eq!(
+                    values(&headers, "x-ai-router-reasoning-effort"),
+                    disclosed.into_iter().collect::<Vec<_>>(),
+                    "{path} {effort} {streaming}"
+                );
+                assert!(wire.contains(MODEL) && !wire.contains("\"gpt-5.4-nano\""));
+            }
+        }
+    }
+    // An exact Antigravity ID keeps the strict effort check.
+    let body = studio_body("/v1/responses", MODEL, "high", "title", false);
+    let (status, headers, _) = exchange(&harness, "/v1/responses", body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(values(&headers, "x-ai-router-reasoning-effort").is_empty());
+    assert_eq!(values(&headers, "x-should-retry"), ["false"]);
+    let (_, capabilities) = harness
+        .json(Method::GET, "/v1/capabilities", None, Some("test-key"))
+        .await;
+    let effort = &capabilities["profiles"]["model"]["reasoning_effort"];
+    assert_eq!(effort["agy"]["fallback_served"], "served_model_tier");
+    assert_eq!(effort["values_per_request"], 1);
+    assert_eq!(effort["header_values"], json!(["ignored", "mapped=<level>"]));
+}
+
+#[tokio::test]
+async fn failures_before_stream_commit_carry_retry_fallback_and_disclosure_headers() {
+    for (model, fixture, status, retry) in [
+        (
+            "gpt-5.4-nano",
+            "overload-fixture",
+            StatusCode::SERVICE_UNAVAILABLE,
+            ("retry-after", "30"),
+        ),
+        (
+            "gpt-5.4-nano",
+            "quota-fixture",
+            StatusCode::TOO_MANY_REQUESTS,
+            ("x-should-retry", "false"),
+        ),
+        // A transient Antigravity failure is a 502 that SDKs retry by default.
+        (
+            "gemini-9-ultra",
+            "overload-fixture",
+            StatusCode::BAD_GATEWAY,
+            ("x-should-retry", ""),
+        ),
+    ] {
+        for path in ["/v1/chat/completions", "/v1/responses"] {
+            let mut seen = Vec::new();
+            for streaming in [false, true] {
+                // Overload latches the provider, so each mode gets a fresh gateway.
+                let harness = fallback_harness(|_| {}).await;
+                let mut body = studio_body(path, model, "none", fixture, streaming);
+                body["metadata"] = json!({"thread":"synthetic"});
+                body["prompt_cache_key"] = json!("thread-1");
+                body["max_tokens"] = json!(64);
+                if path.ends_with("responses") {
+                    body["max_output_tokens"] = body["max_tokens"].take();
+                }
+                let (got, headers, wire) = exchange(&harness, path, body).await;
+                assert_eq!(got, status, "{model} {fixture} {path} {streaming}: {wire}");
+                let expected: &[&str] = if retry.1.is_empty() { &[] } else { &[retry.1] };
+                assert_eq!(values(&headers, retry.0), expected, "{model} {fixture}");
+                let error: Value = serde_json::from_str(&wire).unwrap();
+                assert!(error["error"]["code"].is_string());
+                assert!(!wire.contains("synthetic-provider-private-detail"));
+                let found = disclosures(&headers);
+                for name in [
+                    "x-ai-router-model-fallback",
+                    "x-ai-router-sampling-controls",
+                    "x-ai-router-ignored-fields",
+                    "x-ai-router-prompt-cache-controls",
+                    "x-ai-router-token-budget-mode",
+                ] {
+                    assert!(
+                        found.iter().any(|(n, v)| *n == name && v.len() == 1),
+                        "{name} missing on {model} {fixture} {path} {streaming}"
+                    );
+                }
+                seen.push((found, wire));
+            }
+            assert_eq!(seen[0], seen[1], "{model} {fixture} {path}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn committed_streams_carry_the_same_disclosures_as_nonstreaming_requests() {
+    let harness = fallback_harness(|_| {}).await;
+    for model in ["gpt-5.4-nano", "gemini-9-ultra"] {
+        for path in ["/v1/chat/completions", "/v1/responses"] {
+            let mut seen = Vec::new();
+            for streaming in [false, true] {
+                let mut body = studio_body(path, model, "none", "hello", streaming);
+                body["user"] = json!("user-1");
+                let (status, headers, wire) = exchange(&harness, path, body).await;
+                assert_eq!(status, StatusCode::OK, "{wire}");
+                seen.push(disclosures(&headers));
+            }
+            assert_eq!(seen[0], seen[1], "{model} {path}");
+            assert!(seen[0].iter().all(|(_, v)| v.len() <= 1));
+        }
+        // A failure after partial output is an event inside a committed 200
+        // whose headers match the nonstreaming failure's.
+        for path in ["/v1/chat/completions", "/v1/responses"] {
+            let mut seen = Vec::new();
+            for streaming in [false, true] {
+                let harness = fallback_harness(|_| {}).await;
+                let body = studio_body(path, model, "none", "midstream-fixture", streaming);
+                let (status, headers, wire) = exchange(&harness, path, body).await;
+                assert_eq!(status == StatusCode::OK, streaming, "{wire}");
+                if streaming {
+                    assert!(wire.contains("partial "));
+                    assert!(wire.contains("\"error\""));
+                }
+                seen.push(disclosures(&headers));
+            }
+            assert_eq!(seen[0], seen[1], "{model} {path}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn missing_required_tool_call_is_not_retried_and_follows_stream_commit() {
+    let body = |path: &str, input: &str, streaming: bool| {
+        if path.ends_with("completions") {
+            json!({"model":"synthetic-openai","messages":[{"role":"user","content":input}],"stream":streaming,
+                "tools":[lookup_tool(false)],"tool_choice":"required"})
+        } else {
+            json!({"model":"synthetic-openai","input":input,"stream":streaming,
+                "tools":[lookup_tool(true)],"tool_choice":"required"})
+        }
+    };
+    // No output has started: an HTTP error in both modes, never retried, with
+    // the field at fault.
+    let harness = DualHarness::new().await;
+    for path in ["/v1/chat/completions", "/v1/responses"] {
+        for streaming in [false, true] {
+            let (status, headers, wire) =
+                exchange(&harness, path, body(path, "no-call-fixture", streaming)).await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "{path} {streaming} {wire}");
+            assert_eq!(values(&headers, "x-should-retry"), ["false"]);
+            let error: Value = serde_json::from_str(&wire).unwrap();
+            assert_eq!(error["error"]["code"], "missing_required_tool_call");
+            assert_eq!(error["error"]["param"], "tool_choice");
+        }
+        // Validation errors keep their param before commit too.
+        let mut invalid = body(path, "hello", true);
+        invalid["tool_choice"] = json!({"type":"custom","name":"lookup"});
+        let (status, headers, wire) = exchange(&harness, path, invalid).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(values(&headers, "x-should-retry"), ["false"]);
+        assert_eq!(serde_json::from_str::<Value>(&wire).unwrap()["error"]["param"], "tool_choice");
+    }
+    // A stream already committed by the wait bound reports it as an event.
+    let harness = DualHarness::with_commit_wait(5, Duration::from_millis(100)).await;
+    for path in ["/v1/chat/completions", "/v1/responses"] {
+        let (status, _, wire) = exchange(
+            &harness,
+            path,
+            body(path, "deadline-fixture no-call-fixture", true),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{wire}");
+        let frames = frames(wire.as_bytes());
+        assert!(!wire.contains("synthetic answer") && !wire.contains("Hello from fixture"));
+        if path.ends_with("responses") {
+            let kinds: Vec<&str> = frames.iter().map(|f| f.event.as_str()).collect();
+            assert_eq!(
+                kinds,
+                ["response.created", "response.in_progress", "error", "response.failed"]
+            );
+            let error = event_json(&frames[2]);
+            assert_eq!(error["code"], "missing_required_tool_call");
+            assert_eq!(error["param"], "tool_choice");
+            assert_eq!(error["error"]["param"], "tool_choice");
+        } else {
+            assert_eq!(frames.last().unwrap().data, "[DONE]");
+            let error = event_json(&frames[frames.len() - 2]);
+            assert_eq!(error["error"]["code"], "missing_required_tool_call");
+            assert_eq!(error["error"]["param"], "tool_choice");
+        }
+    }
 }

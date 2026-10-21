@@ -42,7 +42,8 @@ fn missing_required_tool_call() -> ApiError {
         502,
         code,
         crate::protocol::error_explanation("agy", code).unwrap_or_default(),
-    );
+    )
+    .with_param("tool_choice");
     error.diagnostics = Some(crate::protocol::FailureDiagnostics::metadata(
         json!({"phase":"tool_validation","reason":code}),
     ));

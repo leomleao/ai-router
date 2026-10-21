@@ -136,6 +136,7 @@ const DETERMINISTIC_FAILURES: &[&str] = &[
     "invalid_provider_tool_call",
     "incomplete_provider_output",
     "output_limit_exceeded",
+    "missing_required_tool_call",
     "subscription_sharing_usage_limit_exceeded",
     "subscription_sharing_user_not_eligible",
     "subscription_sharing_route_not_supported",
