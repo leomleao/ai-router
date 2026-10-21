@@ -27,6 +27,9 @@ pub(crate) fn error_explanation(provider: &str, code: &str) -> Option<&'static s
         ("openai", "incomplete_structured_output") => Some(
             "OpenAI stopped before completing the requested JSON output. The output was withheld.",
         ),
+        (_, "missing_required_tool_call") => Some(
+            "The model answered without the tool call that tool_choice required. The output was withheld.",
+        ),
         (_, "client_disconnected") => {
             Some("The client disconnected before the response completed.")
         }
@@ -41,6 +44,9 @@ pub struct ApiError {
     pub(crate) diagnostics: Option<FailureDiagnostics>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_request_id: Option<String>,
+    // The request field at fault, as OpenAI reports it; absent when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub param: Option<String>,
     pub status: u16,
     pub code: String,
     pub message: String,
@@ -74,6 +80,7 @@ impl ApiError {
         Self {
             diagnostics: None,
             upstream_request_id: None,
+            param: None,
             status,
             code: code.into(),
             message: message.into(),
@@ -95,6 +102,10 @@ impl ApiError {
             format!("{field} is not supported by this adapter"),
         )
     }
+    pub fn with_param(mut self, param: &str) -> Self {
+        self.param = Some(param.to_owned());
+        self
+    }
     pub fn response_body(&self) -> Value {
         let error_type = match self.status {
             400 => "invalid_request_error",
@@ -107,6 +118,9 @@ impl ApiError {
             json!({"error":{"message":self.message,"type":error_type,"code":self.code}});
         if let Some(id) = &self.upstream_request_id {
             value["error"]["upstream_request_id"] = json!(id);
+        }
+        if let Some(param) = &self.param {
+            value["error"]["param"] = json!(param);
         }
         value
     }
@@ -167,6 +181,15 @@ pub struct RunRequest {
     pub tools: Vec<ToolDefinition>,
     pub schema: Option<Value>,
     pub effort: Option<String>,
+    /// tool_choice demands a call. Providers withhold visible text until the
+    /// result is known and fail closed when no call is returned.
+    #[serde(default)]
+    pub tool_required: bool,
+}
+impl RunRequest {
+    pub fn withholds_text(&self) -> bool {
+        self.schema.is_some() || self.tool_required
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RunResult {
@@ -235,8 +258,9 @@ pub fn normalize_chat(value: Value, request_id: String) -> Result<RunRequest, Ap
     validate_common(root, false)?;
     let model = model(root)?;
     let mut tools = parse_tools(root.get("tools"), false)?;
-    apply_tool_choice(root.get("tool_choice"), &mut tools)?;
+    let tool_required = apply_tool_choice(root.get("tool_choice"), &mut tools, false)?;
     let schema = chat_schema(root.get("response_format"))?;
+    required_tool_without_schema(tool_required, &schema)?;
     let effort = parse_effort(root.get("reasoning_effort"))?;
     let messages = root
         .get("messages")
@@ -362,6 +386,7 @@ pub fn normalize_chat(value: Value, request_id: String) -> Result<RunRequest, Ap
     }
     let mut request = make_request(request_id, model, transcript, system, tools, schema, effort)?;
     request.endpoint = "chat".into();
+    request.tool_required = tool_required;
     request.parallel_tool_calls = root
         .get("parallel_tool_calls")
         .and_then(Value::as_bool)
@@ -374,8 +399,9 @@ pub fn normalize_response(value: Value, request_id: String) -> Result<RunRequest
     validate_common(root, true)?;
     let model = model(root)?;
     let mut tools = parse_tools(root.get("tools"), true)?;
-    apply_tool_choice(root.get("tool_choice"), &mut tools)?;
+    let tool_required = apply_tool_choice(root.get("tool_choice"), &mut tools, true)?;
     let schema = response_schema(root.get("text"))?;
+    required_tool_without_schema(tool_required, &schema)?;
     let effort = if let Some(reasoning) = nonnull(root.get("reasoning")) {
         let reasoning = object(reasoning, "reasoning")?;
         allowed_fields(reasoning, &["effort", "summary"], "reasoning")?;
@@ -518,6 +544,7 @@ pub fn normalize_response(value: Value, request_id: String) -> Result<RunRequest
     }
     let mut request = make_request(request_id, model, transcript, system, tools, schema, effort)?;
     request.endpoint = "responses".into();
+    request.tool_required = tool_required;
     request.parallel_tool_calls = root
         .get("parallel_tool_calls")
         .and_then(Value::as_bool)
@@ -581,6 +608,7 @@ fn make_request(
         tools,
         schema,
         effort,
+        tool_required: false,
     })
 }
 
@@ -788,21 +816,126 @@ fn parse_tools(value: Option<&Value>, responses: bool) -> Result<Vec<ToolDefinit
     Ok(tools)
 }
 
+/// Forced choices are enforced here and by the adapters rather than assumed
+/// of a provider: the inventory is narrowed to the permitted tools, and a
+/// request that requires a call fails closed when none is returned.
 fn apply_tool_choice(
     value: Option<&Value>,
     tools: &mut Vec<ToolDefinition>,
-) -> Result<(), ApiError> {
-    match nonnull(value) {
-        None => Ok(()),
-        Some(Value::String(choice)) if choice == "auto" => Ok(()),
-        Some(Value::String(choice)) if choice == "none" => {
-            tools.clear();
-            Ok(())
+    responses: bool,
+) -> Result<bool, ApiError> {
+    parse_tool_choice(value, tools, responses).map_err(|error| error.with_param("tool_choice"))
+}
+
+fn parse_tool_choice(
+    value: Option<&Value>,
+    tools: &mut Vec<ToolDefinition>,
+    responses: bool,
+) -> Result<bool, ApiError> {
+    let (allowed, required) = match nonnull(value) {
+        None => return Ok(false),
+        Some(Value::String(choice)) => match choice.as_str() {
+            "auto" => return Ok(false),
+            "none" => {
+                tools.clear();
+                return Ok(false);
+            }
+            "required" => (None, true),
+            _ => return Err(ApiError::unsupported("tool_choice value")),
+        },
+        Some(Value::Object(choice)) => match required_string(choice, "type")? {
+            "function" => (Some(vec![tool_choice_name(choice, responses)?]), true),
+            "allowed_tools" => {
+                let config = if responses {
+                    allowed_fields(choice, &["type", "mode", "tools"], "tool_choice")?;
+                    choice
+                } else {
+                    allowed_fields(choice, &["type", "allowed_tools"], "tool_choice")?;
+                    let config = object(
+                        choice.get("allowed_tools").ok_or_else(|| {
+                            ApiError::bad_request("tool_choice.allowed_tools is required")
+                        })?,
+                        "tool_choice.allowed_tools",
+                    )?;
+                    allowed_fields(config, &["mode", "tools"], "tool_choice.allowed_tools")?;
+                    config
+                };
+                let required = match required_string(config, "mode")? {
+                    "auto" => false,
+                    "required" => true,
+                    _ => return Err(ApiError::unsupported("tool_choice mode")),
+                };
+                let entries = config
+                    .get("tools")
+                    .and_then(Value::as_array)
+                    .filter(|entries| !entries.is_empty() && entries.len() <= MAX_TOOLS)
+                    .ok_or_else(|| {
+                        ApiError::bad_request("tool_choice tools must list 1 to 128 tools")
+                    })?;
+                let mut names = Vec::new();
+                for entry in entries {
+                    let entry = object(entry, "tool_choice tool")?;
+                    if required_string(entry, "type")? != "function" {
+                        return Err(ApiError::unsupported("tool_choice tool type"));
+                    }
+                    names.push(tool_choice_name(entry, responses)?);
+                }
+                (Some(names), required)
+            }
+            _ => return Err(ApiError::unsupported("tool_choice type")),
+        },
+        Some(_) => {
+            return Err(ApiError::bad_request(
+                "tool_choice must be a string or an object",
+            ));
         }
-        _ => Err(ApiError::unsupported(
-            "tool_choice (only auto and none are implemented)",
-        )),
+    };
+    if tools.is_empty() {
+        return Err(ApiError::bad_request(
+            "tool_choice requires at least one function tool in tools",
+        ));
     }
+    if let Some(names) = allowed {
+        for name in &names {
+            validate_tool_name(name)?;
+            if !tools.iter().any(|tool| tool.name == *name) {
+                return Err(ApiError::bad_request(format!(
+                    "tool_choice selects {name}, which is not in tools"
+                )));
+            }
+        }
+        tools.retain(|tool| names.contains(&tool.name.as_str()));
+    }
+    Ok(required)
+}
+
+// Chat nests each selected name under `function`; Responses flattens it.
+fn tool_choice_name(entry: &Map<String, Value>, responses: bool) -> Result<&str, ApiError> {
+    if responses {
+        allowed_fields(entry, &["type", "name"], "tool_choice")?;
+        return required_string(entry, "name");
+    }
+    allowed_fields(entry, &["type", "function"], "tool_choice")?;
+    let function = object(
+        entry
+            .get("function")
+            .ok_or_else(|| ApiError::bad_request("tool_choice.function is required"))?,
+        "tool_choice.function",
+    )?;
+    allowed_fields(function, &["name"], "tool_choice.function")?;
+    required_string(function, "name")
+}
+
+/// A forced call ends the turn without the structured text a schema promises,
+/// so the pair could only ever fail after a paid provider call.
+fn required_tool_without_schema(required: bool, schema: &Option<Value>) -> Result<(), ApiError> {
+    if required && schema.is_some() {
+        return Err(ApiError::bad_request(
+            "tool_choice that requires a call cannot be combined with a structured output format",
+        )
+        .with_param("tool_choice"));
+    }
+    Ok(())
 }
 
 fn parse_effort(value: Option<&Value>) -> Result<Option<String>, ApiError> {
@@ -1511,20 +1644,117 @@ mod tests {
         );
     }
     #[test]
-    fn tool_choice_none_removes_inventory_and_forced_choice_is_explicit_error() {
+    fn tool_choice_none_removes_inventory() {
         let mut input = chat();
         input["tools"] = json!([tool()]);
         input["tool_choice"] = json!("none");
-        assert!(
-            normalize_chat(input.clone(), "req".to_owned())
-                .unwrap()
-                .tools
-                .is_empty()
-        );
-        input["tool_choice"] = json!({"type":"function", "function":{"name":"weather"}});
+        let request = normalize_chat(input, "req".to_owned()).unwrap();
+        assert!(request.tools.is_empty() && !request.tool_required);
+    }
+    #[test]
+    fn forced_tool_choices_narrow_the_inventory_and_require_a_call() {
+        let named = |name: &str| {
+            let mut tool = tool();
+            tool["function"]["name"] = json!(name);
+            tool
+        };
+        let chat_with = |choice: Value| {
+            let mut input = chat();
+            input["tools"] = json!([named("weather"), named("search")]);
+            input["tool_choice"] = choice;
+            normalize_chat(input, "req".to_owned())
+        };
+        let names = |request: &RunRequest| -> Vec<String> {
+            request.tools.iter().map(|tool| tool.name.clone()).collect()
+        };
+        let required = chat_with(json!("required")).unwrap();
+        assert!(required.tool_required);
+        assert_eq!(names(&required), ["weather", "search"]);
+        let forced = chat_with(json!({"type":"function","function":{"name":"search"}})).unwrap();
+        assert!(forced.tool_required);
+        assert_eq!(names(&forced), ["search"]);
+        let allowed = chat_with(
+            json!({"type":"allowed_tools","allowed_tools":{"mode":"auto",
+            "tools":[{"type":"function","function":{"name":"search"}}]}}),
+        )
+        .unwrap();
+        assert!(!allowed.tool_required);
+        assert_eq!(names(&allowed), ["search"]);
+        assert!(!chat_with(json!("auto")).unwrap().tool_required);
+
+        let mut input = json!({"model":"gemini-test","input":"hello","tools":[
+            {"type":"function","name":"weather"},{"type":"function","name":"search"}]});
+        input["tool_choice"] = json!({"type":"function","name":"weather"});
+        let request = normalize_response(input.clone(), "req".to_owned()).unwrap();
+        assert!(request.tool_required);
+        assert_eq!(names(&request), ["weather"]);
+        input["tool_choice"] = json!({"type":"allowed_tools","mode":"required",
+            "tools":[{"type":"function","name":"search"},{"type":"function","name":"weather"}]});
+        let request = normalize_response(input.clone(), "req".to_owned()).unwrap();
+        assert!(request.tool_required);
+        assert_eq!(names(&request), ["weather", "search"]);
+
+        for (choice, code) in [
+            (
+                json!({"type":"function","function":{"name":"missing"}}),
+                "invalid_request",
+            ),
+            (
+                json!({"type":"function","name":"weather"}),
+                "unsupported_parameter",
+            ),
+            (
+                json!({"type":"allowed_tools","allowed_tools":{"mode":"auto","tools":[]}}),
+                "invalid_request",
+            ),
+            (
+                json!({"type":"allowed_tools","allowed_tools":{"mode":"sometimes","tools":[]}}),
+                "unsupported_parameter",
+            ),
+            (
+                json!({"type":"custom","name":"weather"}),
+                "unsupported_parameter",
+            ),
+            (json!({"type":"web_search"}), "unsupported_parameter"),
+            (json!("any"), "unsupported_parameter"),
+            (json!(true), "invalid_request"),
+        ] {
+            let error = chat_with(choice.clone()).unwrap_err();
+            assert_eq!(error.code, code, "{choice}");
+            assert_eq!(error.response_body()["error"]["param"], "tool_choice");
+        }
+        let error =
+            chat_with(json!({"type":"function","function":{"name":"missing"}})).unwrap_err();
         assert_eq!(
-            normalize_chat(input, "req".to_owned()).unwrap_err().code,
-            "unsupported_parameter"
+            error.message,
+            "tool_choice selects missing, which is not in tools"
+        );
+        let mut input = chat();
+        input["tool_choice"] = json!("required");
+        assert_eq!(
+            normalize_chat(input, "req".to_owned())
+                .unwrap_err()
+                .param
+                .as_deref(),
+            Some("tool_choice")
+        );
+        // A forced call never produces the promised JSON text.
+        let mut input = chat();
+        input["tools"] = json!([tool()]);
+        input["tool_choice"] = json!("required");
+        input["response_format"] = json!({"type":"json_object"});
+        assert_eq!(
+            normalize_chat(input, "req".to_owned())
+                .unwrap_err()
+                .param
+                .as_deref(),
+            Some("tool_choice")
+        );
+        // Errors without a known field keep OpenAI's shape without inventing one.
+        assert!(
+            ApiError::bad_request("x").response_body()["error"]
+                .get("param")
+                .is_none()
         );
     }
     #[test]

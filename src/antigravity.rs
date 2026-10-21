@@ -270,7 +270,7 @@ impl Antigravity {
                     });
                 }
             }
-            if request.schema.is_some() && !decoded.text.is_empty() {
+            if request.withholds_text() && !decoded.text.is_empty() {
                 send(
                     sender,
                     RunEvent::TextDelta {

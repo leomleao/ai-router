@@ -36,6 +36,31 @@ fn invalid_tool(reason: &'static str) -> ApiError {
     error
 }
 
+fn missing_required_tool_call() -> ApiError {
+    let code = "missing_required_tool_call";
+    let mut error = ApiError::new(
+        502,
+        code,
+        crate::protocol::error_explanation("agy", code).unwrap_or_default(),
+    );
+    error.diagnostics = Some(crate::protocol::FailureDiagnostics::metadata(
+        json!({"phase":"tool_validation","reason":code}),
+    ));
+    error
+}
+
+pub(crate) fn required_tool_instruction(request: &RunRequest) -> String {
+    let names: Vec<_> = request
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect();
+    format!(
+        "This turn must call a tool. Respond with a function call to {}; do not answer with text alone.",
+        names.join(" or ")
+    )
+}
+
 fn text_content(value: &Value) -> Result<String, ApiError> {
     if value.is_null() {
         return Ok(String::new());
@@ -260,6 +285,12 @@ pub fn serialize(request: &RunRequest, project: &str, replay: &[Value]) -> Resul
         // Local post-validation remains authoritative. CCA's native schema
         // dialect is narrower than accepted JSON Schema; do not erase keywords.
         system.push(json!({"text":format!("Return only one JSON value matching this JSON Schema: {}", schema)}));
+    }
+    if request.tool_required {
+        // CCA forcing modes are unverified (only VALIDATED is reviewed), so
+        // the requirement is an instruction over the narrowed inventory and
+        // the decoder fails closed when no call is returned.
+        system.push(json!({"text":required_tool_instruction(request)}));
     }
     let mut contents: Vec<Value> = Vec::new();
     let mut calls: HashMap<String, (String, usize)> = HashMap::new();
@@ -912,7 +943,7 @@ impl Decoder {
                 self.text.push_str(text);
                 // A schema response is not public until complete validation by
                 // the adapter; returning no deltas prevents accidental leakage.
-                if self.request.schema.is_none() {
+                if !self.request.withholds_text() {
                     deltas.push(text.to_owned());
                 }
             }
@@ -980,6 +1011,9 @@ impl Decoder {
         let complete = reason == "STOP";
         if complete && self.text.is_empty() && self.calls.is_empty() {
             return Err(invalid("empty_provider_output"));
+        }
+        if self.request.tool_required && (!complete || self.calls.is_empty()) {
+            return Err(missing_required_tool_call());
         }
         if let Some(schema) = &self.request.schema {
             if !complete || !self.calls.is_empty() {
@@ -1537,6 +1571,51 @@ mod tests {
         assert!(decoded.tool_calls.is_empty());
         assert!(decoded.replay.is_empty());
         assert!(decoded.usage_partial);
+    }
+
+    #[test]
+    fn required_tool_choice_instructs_keeps_validated_mode_and_fails_closed() {
+        let mut request = tools_request();
+        request.tool_required = true;
+        let body = serialize(&request, "project-test", &[]).unwrap();
+        // The reviewed baseline proves only VALIDATED; ANY is never guessed.
+        assert_eq!(
+            body["request"]["toolConfig"]["functionCallingConfig"],
+            json!({"mode":"VALIDATED"})
+        );
+        let system = body["request"]["systemInstruction"]["parts"].to_string();
+        assert!(system.contains("This turn must call a tool."));
+        assert!(system.contains("function call to weather"));
+        let call = json!({"functionCall":{"name":"weather","args":{"city":"London"}}});
+        let mut decoder = Decoder::new(&request, MAX_STREAM_BYTES);
+        assert!(
+            decoder
+                .push(&terminal(json!([{"text":"Checking."}, call])))
+                .unwrap()
+                .is_empty()
+        );
+        let decoded = decoder.finish().unwrap();
+        assert_eq!(decoded.tool_calls.len(), 1);
+        assert_eq!(decoded.text, "Checking.");
+        // Text alone, or a length stop that drops the call, is never public.
+        let mut decoder = Decoder::new(&request, MAX_STREAM_BYTES);
+        assert!(
+            decoder
+                .push(&terminal(json!([{"text":"It is sunny."}])))
+                .unwrap()
+                .is_empty()
+        );
+        let error = decoder.finish().err().unwrap();
+        assert_eq!(
+            (error.status, error.code.as_str()),
+            (502, "missing_required_tool_call")
+        );
+        let truncated =
+            frame(json!({"candidates":[{"content":{"parts":[call]},"finishReason":"MAX_TOKENS"}]}));
+        assert_eq!(
+            decode(&request, &truncated).err().unwrap().code,
+            "missing_required_tool_call"
+        );
     }
 
     #[test]

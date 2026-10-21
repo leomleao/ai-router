@@ -196,7 +196,7 @@ def token_budget_contracts():
 for response_api in (False,True):
     create=client.responses.create if response_api else client.chat.completions.create
     base={'model':model,'input':'hello'} if response_api else {'model':model,'messages':[{'role':'user','content':'hello'}]}
-    for options in ({'temperature':0.5},{'tool_choice':'required','tools':[response_tool] if response_api else [tool]},
+    for options in ({'temperature':0.5},{'tool_choice':{'type':'custom','name':'lookup'},'tools':[response_tool] if response_api else [tool]},
                     {'tools':[{'type':'web_search'}]}, {'extra_body':{'unknown_control':True}}):
         try:
             create(**base,**options)
@@ -210,6 +210,29 @@ for response_api in (False,True):
             raise AssertionError('unsupported verbosity accepted')
         except APIStatusError as error:
             check(error.status_code==400)
+
+# Forced tool choice narrows the inventory and requires a call. The fixture
+# model obeys the router's instruction; a text-only answer fails closed.
+for response_api in (False,True):
+    tools=[response_tool] if response_api else [tool]
+    if response_api:
+        forced=client.responses.create(model=model,input='hello',tools=tools,tool_choice='required')
+        check([item.name for item in forced.output if item.type=='function_call']==['lookup'])
+        named={'type':'function','name':'missing'}
+    else:
+        forced=client.chat.completions.create(model=model,messages=[{'role':'user','content':'hello'}],tools=tools,
+            tool_choice={'type':'function','function':{'name':'lookup'}},parallel_tool_calls=False)
+        check([call.function.name for call in forced.choices[0].message.tool_calls]==['lookup'])
+        named={'type':'function','function':{'name':'missing'}}
+    for options,status,code in (({'tool_choice':'required'},502,'missing_required_tool_call'),
+                                ({'tool_choice':named},400,'invalid_request')):
+        base={'model':model,'input':'no-call-fixture'} if response_api else {'model':model,'messages':[{'role':'user','content':'no-call-fixture'}]}
+        try:
+            (client.responses.create if response_api else client.chat.completions.create)(**base,tools=tools,**options)
+            raise AssertionError('forced tool choice completed without a call')
+        except APIStatusError as error:
+            check(error.status_code==status and error.code==code)
+            check(status!=400 or error.param=='tool_choice')
 with client.responses.stream(model=model,input='hello',store=False) as stream:
     list(stream)
     check(stream.get_final_response().output_text=='Hello from fixture')

@@ -407,7 +407,7 @@ impl OpenAi {
                             .as_str()
                             .ok_or_else(|| failure(502, "invalid_provider_event"))?;
                         text.push_str(delta);
-                        if request.schema.is_none() {
+                        if !request.withholds_text() {
                             send(
                                 sender,
                                 RunEvent::TextDelta {
@@ -474,7 +474,7 @@ impl OpenAi {
                         }
                         if !result.tool_calls.is_empty()
                             && !result.text.is_empty()
-                            && (request.schema.is_some() || text.is_empty())
+                            && (request.withholds_text() || text.is_empty())
                         {
                             send(
                                 sender,
@@ -722,6 +722,12 @@ fn serialize(request: &RunRequest) -> Result<Value, ApiError> {
             0,
             json!({"type":"additional_tools", "role":"developer", "tools":definitions}),
         );
+        // Named and allowed-tools choices are already narrowed to this
+        // catalogue, so "required" expresses each of them without naming a
+        // tool upstream. Local validation still fails closed without a call.
+        if request.tool_required {
+            body["tool_choice"] = json!("required");
+        }
     }
     if let Some(effort) = &request.effort {
         body["reasoning"] = json!({"effort":effort});
@@ -851,6 +857,9 @@ fn parse_result(
     }
     if !request.parallel_tool_calls && calls.len() > 1 {
         return Err(failure(502, "invalid_provider_tool_call"));
+    }
+    if request.tool_required && calls.is_empty() {
+        return Err(failure(502, "missing_required_tool_call"));
     }
     if text.is_empty() && !streamed_text.is_empty() {
         text = streamed_text.into();
@@ -1085,6 +1094,36 @@ mod tests {
         assert!(parse_result(&req, &terminal, "").is_err());
         terminal["output"][0]["name"] = json!("undeclared");
         assert!(parse_result(&req, &terminal, "").is_err());
+    }
+    #[test]
+    fn required_tool_choice_is_forwarded_and_text_alone_fails_closed() {
+        let mut req = request();
+        req.tools = vec![ToolDefinition {
+            name: "lookup".into(),
+            description: String::new(),
+            parameters: json!({"type":"object","required":["q"],"properties":{"q":{"type":"string"}}}),
+        }];
+        assert!(serialize(&req).unwrap().get("tool_choice").is_none());
+        req.tool_required = true;
+        assert!(req.withholds_text());
+        assert_eq!(serialize(&req).unwrap()["tool_choice"], "required");
+        let call = json!({"type":"function_call","call_id":"c1","name":"lookup","arguments":"{\"q\":\"yes\"}"});
+        let terminal = json!({"status":"completed","output":[call]});
+        assert_eq!(
+            parse_result(&req, &terminal, "").unwrap().tool_calls.len(),
+            1
+        );
+        let text = json!({"type":"message","content":[{"type":"output_text","text":"No call"}]});
+        for terminal in [
+            json!({"status":"completed","output":[text]}),
+            json!({"status":"incomplete","output":[call]}),
+        ] {
+            let error = parse_result(&req, &terminal, "").unwrap_err();
+            assert_eq!(
+                (error.status, error.code.as_str()),
+                (502, "missing_required_tool_call")
+            );
+        }
     }
     #[test]
     fn incomplete_never_hands_off_tools_and_missing_usage_is_partial() {

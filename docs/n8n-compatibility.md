@@ -15,7 +15,8 @@ execution. They do not launch an installed n8n instance or call signed-in models
 | Assistant / agent builder | Actual Vercel OpenAI provider, larger discovery/workspace/CRM-shaped tool inventory, changed inventory after discovery | `n8n_contract.mjs` |
 | Multi-turn agent conversations | Text and function replay, stored item references, store omitted/true/false, owner isolation, out-of-order parallel results | Both SDK suites and `src/api_contract_tests.rs` |
 | Both public APIs | Chat Completions and Responses, streaming and nonstreaming, terminal events, IDs, usage and JSON output | All three SDK suites |
-| Unsupported features | Active sampling/verbosity, forced tool choice, hosted tools, unknown controls, legacy Assistants endpoints | Official SDK negative checks and protocol tests |
+| Force Tool Call on First Iteration | `tool_choice:"required"` returns a validated call or fails closed with `missing_required_tool_call` | `sdk_contract.py`, `src/api_contract_tests.rs` |
+| Unsupported features | Active sampling/verbosity, custom/hosted tool choices, hosted tools, unknown controls, legacy Assistants endpoints | Official SDK negative checks and protocol tests |
 
 Pins are `ai@7.0.66`, `@ai-sdk/openai@4.0.20`,
 `@langchain/openai@1.4.4`, `@langchain/core@1.2.8`, and the official Python
