@@ -5,6 +5,48 @@ the schema fix, diagnostic privacy checks, restored CLI coverage, and separate
 Vercel/LangChain client matrices. Historical counts below describe the earlier
 implementation baseline.
 
+## Streaming error semantics (2026-10-21)
+
+External audit item B6: streamed requests sent HTTP 200 and
+`response.created`/`in_progress` before the provider had accepted the request,
+then reported upstream overload, quota and authentication failures only as
+`response.failed`. LangChain JS (and so n8n streaming agents) and the official
+Python SDK ignore that event, so the failure produced an empty answer.
+
+A stream now commits its 200 only after the provider's first event (`Init`,
+after accepted upstream headers). Earlier failures return the nonstreaming
+status, body and headers. The commit wait is bounded at 15 seconds, the existing
+keepalive interval; a provider still silent then gets a committed stream, as
+before. After commit, a Responses failure emits the spec `error` event
+(with the top-level `error` object the SDKs raise on) before `response.failed`,
+and a Chat failure emits a chunk with a top-level `error` object, typed like the
+HTTP body, before `[DONE]`.
+
+New synthetic fixtures cover pre-output overload, quota and authentication
+failures and a mid-stream failure after partial text, for both providers. The
+tests compare streamed against nonstreamed status, body, `retry-after` and
+telemetry classification, and check the event order and fields, the 15-second
+bound (shortened in the test harness), and client disconnects before and after
+commit. `tests/sdk_contract.py`, `tests/n8n_contract.mjs` and
+`tests/n8n_langchain_contract.mjs` gained a failure mode. Each client runs once
+per fresh gateway (overload and authentication latch provider state) across 2
+providers, 3 failures and both APIs: 36 runs, every one of which must raise. On
+the old code 30 of those 36 runs failed. Python and LangChain streamed Responses
+ended silently on all three failures, and pre-output Chat failures surfaced
+without an HTTP status. The existing overload and queue-deadline tests now
+expect 503 and 504 rather than 200.
+
+Audit probe replay (`gap-audit.md` harness, 164 cases): `error.responses.stream.overload`
+changed from HTTP 200 with `response.created, response.in_progress,
+response.failed` to HTTP 503 `server_is_overloaded`. The other 163 cases were
+unchanged.
+
+The Docker test stage passed: 208 Rust tests (203 before; 5 new), including
+the existing official SDK, n8n Vercel, Studio and LangChain matrices and the 36
+failure runs, plus monitor PTY checks and 5 login checks. Formatting passed;
+clippy reported only the existing style-warning categories. Only synthetic
+loopback fixtures were used.
+
 ## Supabase Studio Responses compatibility (2026-10-21)
 
 Supabase Studio's assistant (`supabase/studio:2026.10.12`, `ai@7.0.59`,

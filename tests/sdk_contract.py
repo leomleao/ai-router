@@ -16,6 +16,26 @@ def check(condition, message="contract failed"):
     assert condition, message
     checks += 1
 
+# Streamed provider failures must raise, not end quietly: HTTP errors before
+# provider acceptance and the top-level stream `error` object afterwards.
+failure = configuration.get('failure')
+if failure:
+    text = ''
+    try:
+        if failure['api'] == 'responses':
+            for event in client.responses.create(model=model, input=failure['fixture'], stream=True, store=False):
+                text += event.delta if event.type == 'response.output_text.delta' else ''
+        else:
+            for chunk in client.chat.completions.create(model=model, messages=[{'role':'user','content':failure['fixture']}], stream=True):
+                text += ''.join(choice.delta.content or '' for choice in chunk.choices)
+        raise AssertionError('streamed failure ended without an exception')
+    except APIStatusError as error:
+        check(failure['status'] == error.status_code and failure['code'] == error.code, f'{error.status_code} {error.code}')
+    except openai.APIError as error:
+        check(failure['status'] is None and failure['code'] == error.code and text == 'partial ', f'{error.code} {text!r}')
+    print(f'Official SDK streamed failure raised: {checks} checks')
+    sys.exit(0)
+
 check(model in [m.id for m in client.models.list()])
 for stream in (False, True):
     chat = client.chat.completions.create(model=model, messages=[{'role':'user','content':'hello'}], stream=stream)
