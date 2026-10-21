@@ -1099,6 +1099,7 @@ impl CompletionGuard {
                     "request_id":self.record.request_id,"model":self.record.model,"provider":self.record.provider,
                     "endpoint":self.record.endpoint,"elapsed_ms":self.started.elapsed().as_millis() as u64,
                     "status":e.status,"code":e.code,"upstream_request_id":e.upstream_request_id,
+                    "explanation":crate::protocol::error_explanation(&self.record.provider, &e.code),
                     "diagnostics":e.diagnostics.as_ref().map(|d| &d.metadata)})
                 );
                 self.record.status = if e.code == "request_cancelled" {
@@ -1413,6 +1414,15 @@ mod tests {
         if input.contains("quota-fixture") {
             return (StatusCode::TOO_MANY_REQUESTS, Json(json!({"error":{"code":"subscription_sharing_usage_limit_exceeded","message":"synthetic-provider-private-detail"}}))).into_response();
         }
+        if input.contains("overload-fixture") {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [("x-request-id", "synthetic-overload-id")],
+                Json(json!({"error":{
+                "code":"server_is_overloaded","message":"synthetic-provider-private-detail"}})),
+            )
+                .into_response();
+        }
         let continuing = body["input"]
             .as_array()
             .unwrap()
@@ -1483,6 +1493,9 @@ mod tests {
         let Some(fields) = value.as_object() else {
             return false;
         };
+        let Some(kind) = fields.get("type").and_then(Value::as_str) else {
+            return false;
+        };
         fields.iter().all(|(key, value)| match key.as_str() {
             "type" => value.as_str().is_some_and(|s| {
                 matches!(
@@ -1491,13 +1504,20 @@ mod tests {
                 )
             }),
             "title" | "description" => value.is_string(),
-            "enum" | "required" => value
-                .as_array()
-                .is_some_and(|items| items.iter().all(Value::is_string)),
-            "properties" => value
-                .as_object()
-                .is_some_and(|map| map.values().all(valid_cca_schema)),
-            "items" => valid_cca_schema(value),
+            "enum" | "required" => {
+                let expected = if key == "enum" { "string" } else { "object" };
+                kind == expected
+                    && value
+                        .as_array()
+                        .is_some_and(|items| items.iter().all(Value::is_string))
+            }
+            "properties" => {
+                kind == "object"
+                    && value
+                        .as_object()
+                        .is_some_and(|map| map.values().all(valid_cca_schema))
+            }
+            "items" => kind == "array" && valid_cca_schema(value),
             _ => false,
         })
     }
@@ -1818,6 +1838,74 @@ mod tests {
         );
     }
     #[tokio::test]
+    async fn openai_overload_has_actionable_errors_on_both_public_apis_without_retry() {
+        for responses in [false, true] {
+            for streaming in [false, true] {
+                let h = DualHarness::new().await;
+                let (path, body) = if responses {
+                    (
+                        "/v1/responses",
+                        json!({"model":"synthetic-openai","input":"overload-fixture","stream":streaming}),
+                    )
+                } else {
+                    (
+                        "/v1/chat/completions",
+                        json!({"model":"synthetic-openai","messages":[{"role":"user","content":"overload-fixture"}],"stream":streaming}),
+                    )
+                };
+                let (status, wire) = h.call(path, Some(body)).await;
+                assert_eq!(
+                    status,
+                    if streaming {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    }
+                );
+                assert!(wire.contains("server_is_overloaded"));
+                assert!(wire.contains("OpenAI is temporarily overloaded"));
+                assert!(wire.contains("did not retry automatically"));
+                assert!(wire.contains("synthetic-overload-id"));
+                assert!(!wire.contains("synthetic-provider-private-detail"));
+                assert_eq!(h.captured.lock().await.len(), 1);
+                assert_eq!(
+                    h.state.openai.availability_error().await.unwrap().code,
+                    "server_is_overloaded"
+                );
+                if streaming {
+                    let failed = wire
+                        .lines()
+                        .filter_map(|line| line.strip_prefix("data:"))
+                        .filter_map(|data| serde_json::from_str::<Value>(data.trim()).ok())
+                        .find(|event| {
+                            if responses {
+                                event["type"] == "response.failed"
+                            } else {
+                                event.get("error").is_some()
+                            }
+                        })
+                        .unwrap();
+                    let error = if responses {
+                        &failed["response"]["error"]
+                    } else {
+                        &failed["error"]
+                    };
+                    assert_eq!(error["code"], "server_is_overloaded");
+                }
+                // Overload clears through normal discovery, without re-login.
+                h.state.refresh_openai().await;
+                let (status, wire) = h
+                    .call(
+                        "/v1/responses",
+                        Some(json!({"model":"synthetic-openai","input":"hello"})),
+                    )
+                    .await;
+                assert_eq!(status, StatusCode::OK, "{wire}");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn openai_schema_tool_failures_and_quota_leave_agy_available() {
         let h = DualHarness::new().await;
         let schema = json!({"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false});
@@ -2077,6 +2165,23 @@ mod tests {
         assert!(valid_cca_schema(&crate::antigravity_schema::parameters(
             &schema
         )));
+    }
+
+    #[test]
+    fn cca_mock_rejects_type_incompatible_fields_in_nested_tool_schemas() {
+        for items in [
+            json!({"type":"string","properties":{"name":{"type":"string"}}}),
+            json!({"type":"string","required":["name"]}),
+            json!({"type":"object","items":{"type":"string"}}),
+            json!({"type":"object","enum":["name"]}),
+        ] {
+            let schema =
+                json!({"type":"object","properties":{"nodeTypes":{"type":"array","items":items}}});
+            assert!(!valid_cca_schema(&schema));
+            assert!(valid_cca_schema(&crate::antigravity_schema::parameters(
+                &schema
+            )));
+        }
     }
 
     #[tokio::test]

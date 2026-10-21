@@ -1155,6 +1155,18 @@ fn request_detail_lines(record: &RequestRecord, width: u16, p: Palette) -> Vec<L
             p.text,
         ),
     ];
+    if let Some(message) = record
+        .error_code
+        .as_deref()
+        .and_then(|code| crate::protocol::error_explanation(&record.provider, code))
+    {
+        // Show the explanation beside the error, before optional latency/usage
+        // detail, so it is visible in the compact request panel too.
+        fields.insert(5, (format!("Reason:     {message}"), p.warn));
+    }
+    if let Some(id) = &record.upstream_request_id {
+        fields.push((format!("Upstream request ID: {id}"), p.muted));
+    }
     if let Some(usage) = &record.usage {
         fields.extend([
             (
@@ -1537,6 +1549,38 @@ mod tests {
         ));
         assert!(app.light);
         assert!(app.key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE), 3, 0));
+    }
+
+    #[tokio::test]
+    async fn selected_request_explains_historical_openai_errors_without_private_call_data() {
+        let mut snapshot = fixture().await;
+        let record = snapshot.records.last_mut().unwrap();
+        record.provider = "openai".into();
+        record.status = "failed".into();
+        record.upstream_request_id = Some("synthetic-upstream-id".into());
+        let app = App::new(86400);
+        for (code, expected) in [
+            ("server_is_overloaded", "OpenAI is temporarily overloaded"),
+            ("invalid_structured_output", "OpenAI returned invalid JSON"),
+            ("client_disconnected", "The client disconnected"),
+        ] {
+            record.error_code = Some(code.into());
+            let rendered: String = request_detail_lines(record, 200, Palette::new(&app))
+                .iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(rendered.contains(expected));
+            assert!(rendered.contains("Upstream request ID: synthetic-upstream-id"));
+        }
+        record.provider = "agy".into();
+        record.error_code = Some("server_is_overloaded".into());
+        let rendered: String = request_detail_lines(record, 200, Palette::new(&app))
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!rendered.contains("OpenAI is temporarily overloaded"));
     }
 
     #[tokio::test]

@@ -147,6 +147,12 @@ for (const inventory of ['workflow-agent','assistant']) {
      'create_subagent','list_todos','update_todo','get_environment','chat_history','Outlook'];
   for (const name of names) tools[name]=tool({description:name,inputSchema:jsonSchema({type:'object',
     properties:{input:{type:'string'}},required:['input'],additionalProperties:false})});
+  // Real n8n discovery tools can accept node names or structured node selectors.
+  // The provider mock must reject mixed-type CCA fields, not just unknown keys.
+  tools.nodes=tool({description:'Find node types',inputSchema:jsonSchema({type:'object',
+    properties:{nodeTypes:{type:'array',items:{anyOf:[{type:'string'},
+      {type:'object',properties:{name:{type:'string'}},required:['name']}]}}},
+    required:['nodeTypes'],additionalProperties:false})});
   for (const style of ['chat','responses']) for (const streaming of [false,true]) {
     wire=[];
     const messages=[{role:'user',content:'tools-fixture'}];

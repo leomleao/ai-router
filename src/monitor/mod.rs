@@ -931,6 +931,13 @@ fn render(snapshot: &Snapshot) -> String {
             record.status,
             record.error_code.as_deref().unwrap_or("")
         ));
+        if let Some(message) = record
+            .error_code
+            .as_deref()
+            .and_then(|code| crate::protocol::error_explanation(&record.provider, code))
+        {
+            text.push_str(&format!("  {message}\n"));
+        }
     }
     text
 }
@@ -984,6 +991,22 @@ mod tests {
             usage_partial: false,
         }
     }
+    #[tokio::test]
+    async fn text_monitor_explains_openai_overload_using_retained_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let telemetry = Telemetry::open(root.path(), 30, 100).unwrap();
+        let mut failed = record("synthetic-overload");
+        failed.provider = "openai".into();
+        failed.status = "failed".into();
+        failed.error_code = Some("server_is_overloaded".into());
+        telemetry.record(failed).await;
+        let snapshot = telemetry.snapshot().await;
+        let output = render(&snapshot);
+        assert!(output.contains("server_is_overloaded"));
+        assert!(output.contains("OpenAI is temporarily overloaded"));
+        assert!(output.contains("did not retry automatically"));
+    }
+
     #[tokio::test]
     async fn legacy_telemetry_and_snapshots_default_to_agy_provider() {
         let dir = tempfile::tempdir().unwrap();

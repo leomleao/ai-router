@@ -8,6 +8,26 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 
+/// Fixed explanations can be rendered from historical metadata without retaining
+/// upstream messages, prompts, or other private payloads.
+pub(crate) fn error_explanation(provider: &str, code: &str) -> Option<&'static str> {
+    match (provider, code) {
+        ("openai", "server_is_overloaded") => Some(
+            "OpenAI is temporarily overloaded. Try again shortly. The router did not retry automatically.",
+        ),
+        ("openai", "invalid_structured_output") => Some(
+            "OpenAI returned invalid JSON or output that did not match the requested schema. The output was withheld.",
+        ),
+        ("openai", "incomplete_structured_output") => Some(
+            "OpenAI stopped before completing the requested JSON output. The output was withheld.",
+        ),
+        (_, "client_disconnected") => {
+            Some("The client disconnected before the response completed.")
+        }
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ApiError {
     // Never serialize provider payloads into public errors or durable records.

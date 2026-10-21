@@ -1391,6 +1391,51 @@ mod tests {
     }
 
     #[test]
+    fn mixed_node_type_items_have_valid_wire_hints_and_keep_both_client_branches() {
+        let mut request = tools_request();
+        request.tools[0].name = "nodes".into();
+        request.tools[0].parameters = json!({"type":"object",
+            "properties":{"nodeTypes":{"type":"array","items":{"anyOf":[
+                {"type":"string"},
+                {"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}
+            ]}}},"required":["nodeTypes"],"additionalProperties":false});
+        let wire = serialize(&request, "synthetic", &[]).unwrap();
+        let tool = &wire["request"]["tools"][0]["functionDeclarations"][0];
+        assert_eq!(
+            tool["parameters"]["properties"]["nodeTypes"]["items"],
+            json!({"type":"string"})
+        );
+        assert!(
+            tool["description"]
+                .as_str()
+                .unwrap()
+                .contains(&request.tools[0].parameters.to_string())
+        );
+        for args in [
+            json!({"nodeTypes":["http"]}),
+            json!({"nodeTypes":[{"name":"code"}]}),
+        ] {
+            assert!(
+                decode(
+                    &request,
+                    &terminal(json!([{"functionCall":{"name":"nodes","args":args}}]))
+                )
+                .is_ok()
+            );
+        }
+        assert_eq!(
+            decode(
+                &request,
+                &terminal(json!([{"functionCall":{"name":"nodes","args":{"nodeTypes":[42]}}}]))
+            )
+            .err()
+            .unwrap()
+            .code,
+            "invalid_provider_tool_call"
+        );
+    }
+
+    #[test]
     fn omitted_tool_ids_are_unique_and_replayable() {
         let result = decode(
             &tools_request(),

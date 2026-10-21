@@ -112,11 +112,22 @@ fn project(value: &Value, root: &Value, depth: usize, budget: &mut usize) -> Val
     }
     if source["type"] == "object" {
         source.entry("properties").or_insert_with(|| json!({}));
+    } else {
+        // Mixed unions and reference siblings can contribute fields from a
+        // different branch type. CCA rejects these even though JSON Schema
+        // permits type-specific keywords to be ignored on other types.
+        source.remove("properties");
+        source.remove("required");
     }
     if source["type"] == "array" {
         source
             .entry("items")
             .or_insert_with(|| json!({"type":"string"}));
+    } else {
+        source.remove("items");
+    }
+    if source["type"] != "string" {
+        source.remove("enum");
     }
     Value::Object(source)
 }
@@ -148,5 +159,57 @@ mod tests {
         let validator = jsonschema::validator_for(&schema).unwrap();
         assert!(validator.is_valid(&json!({"q":null})));
         assert!(!validator.is_valid(&json!({"q":"","extra":1})));
+    }
+
+    #[test]
+    fn mixed_union_items_emit_only_fields_allowed_for_the_projected_type() {
+        let schema = json!({"type":"object","properties":{"nodeTypes":{"type":"array",
+            "items":{"anyOf":[{"type":"string"},{"type":"object",
+                "properties":{"name":{"type":"string"}},"required":["name"]}]}}},
+            "required":["nodeTypes"],"additionalProperties":false});
+        let result = parameters(&schema);
+        assert_eq!(
+            result["properties"]["nodeTypes"]["items"],
+            json!({"type":"string"})
+        );
+
+        // Projection only narrows provider hints; both original branches remain
+        // valid locally, and unrelated/invalid arguments still fail validation.
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        assert!(validator.is_valid(&json!({"nodeTypes":["http",{"name":"code"}]})));
+        assert!(!validator.is_valid(&json!({"nodeTypes":[42]})));
+        assert!(!validator.is_valid(&json!({"nodeTypes":[],"extra":true})));
+    }
+
+    #[test]
+    fn incompatible_union_fields_are_removed_recursively_in_either_order() {
+        let branches = [
+            json!({"type":"string","enum":["http","code"]}),
+            json!({"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}),
+            json!({"type":"array","items":{"type":"number"}}),
+        ];
+        for keyword in ["anyOf", "oneOf", "allOf"] {
+            for first in &branches {
+                for second in &branches {
+                    let schema = json!({(keyword):[first,second]});
+                    let result = parameters(&schema);
+                    let kind = result["type"].as_str().unwrap();
+                    assert_eq!(
+                        result.get("properties").is_some(),
+                        kind == "object",
+                        "{result}"
+                    );
+                    assert!(
+                        result.get("required").is_none() || kind == "object",
+                        "{result}"
+                    );
+                    assert_eq!(result.get("items").is_some(), kind == "array", "{result}");
+                    assert!(result.get("enum").is_none() || kind == "string", "{result}");
+                }
+            }
+        }
+        let schema = json!({"$defs":{"Object":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}},
+            "$ref":"#/$defs/Object","type":"string"});
+        assert_eq!(parameters(&schema), json!({"type":"string"}));
     }
 }

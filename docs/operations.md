@@ -190,6 +190,31 @@ available.
 `AI_ROUTER_MAX_QUEUE`, also defaulting to 2 and 8. Do not mount the OpenAI auth
 volume into the Antigravity helper or the reverse.
 
+### Interpreting OpenAI failures
+
+`server_is_overloaded` means OpenAI reported temporary overload. Non-streaming
+Chat Completions and Responses requests return HTTP 503 with the original code
+and a fixed explanation to try again shortly. For streaming requests, the
+already-started HTTP response stays open long enough to deliver the explanation
+in the Chat error event or Responses `response.failed` event; its HTTP status
+cannot be changed after headers are sent. The router does not automatically
+retry, switch accounts or fall back to another provider. Normal successful
+provider discovery can clear this transient condition; it does not require
+signing in again.
+
+`invalid_structured_output` means the returned text was invalid JSON or failed
+the requested schema; `incomplete_structured_output` means generation ended
+before completing that JSON output. Both withhold unvalidated output and have
+distinct explanations. `client_disconnected` identifies a client connection
+ending before completion.
+
+The selected-request monitor and text snapshots derive these explanations from
+the saved provider/error code, so they also explain older records after private
+payloads expire or the server restarts. The selected-request panel shows the
+upstream request ID when one was supplied. Failure logs add the same fixed
+`explanation`; raw provider messages remain private and are not copied into
+public errors or persisted logs. Monitor JSON record fields are unchanged.
+
 ## Persistent and temporary state
 
 | Location | Contents and lifetime |

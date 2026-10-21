@@ -929,6 +929,7 @@ fn upstream_error(http_status: u16, value: &Value) -> ApiError {
         "provider_request_failed"
     };
     let status = match code {
+        "server_is_overloaded" => 503,
         "subscription_sharing_usage_limit_exceeded" => 429,
         "subscription_sharing_usage_unavailable" | "subscription_sharing_user_unavailable" => 503,
         "subscription_sharing_user_not_eligible"
@@ -970,7 +971,9 @@ fn failure(status: u16, code: &str) -> ApiError {
         if code == "subscription_sharing_usage_limit_exceeded" {
             "ChatGPT plan usage limit reached; manage usage at https://chatgpt.com/settings/usage"
         } else {
-            "OpenAI subscription provider could not complete this request; consult private provider status"
+            crate::protocol::error_explanation("openai", code).unwrap_or(
+                "OpenAI subscription provider could not complete this request; consult private provider status",
+            )
         },
     )
 }
@@ -1117,6 +1120,57 @@ mod tests {
         );
         assert_eq!(e.status, 429);
         assert!(!e.message.contains("synthetic-token"));
+    }
+
+    #[tokio::test]
+    async fn overload_errors_explain_the_upstream_failure_without_retry_or_private_messages() {
+        let private = "synthetic-private-provider-message";
+        let error = json!({"code":"server_is_overloaded","message":private});
+        for (body, status, media) in [
+            (
+                json!({"error":error.clone()}).to_string(),
+                503,
+                "application/json",
+            ),
+            (
+                json!({"error":error.clone()}).to_string(),
+                200,
+                "application/json",
+            ),
+            (
+                wire(json!({"type":"response.failed","response":{"error":error}})),
+                200,
+                "text/event-stream",
+            ),
+        ] {
+            let (_root, provider, captured, task) =
+                mock_provider_content_type(body, status, 1024 * 1024, media).await;
+            let events = collect(&provider, request()).await;
+            let error = events
+                .iter()
+                .find_map(|event| match event {
+                    RunEvent::Error(error) => Some(error),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(error.code, "server_is_overloaded");
+            assert_eq!(error.status, 503);
+            assert!(error.message.contains("OpenAI is temporarily overloaded"));
+            assert!(error.message.contains("did not retry automatically"));
+            assert!(!error.response_body().to_string().contains(private));
+            assert_eq!(
+                error.upstream_request_id.as_deref(),
+                Some("synthetic-upstream-id")
+            );
+            assert!(!durable_restriction(&error.code));
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, RunEvent::Completed(_)))
+            );
+            assert_eq!(captured.lock().await.len(), 1);
+            task.abort();
+        }
     }
 
     #[tokio::test]

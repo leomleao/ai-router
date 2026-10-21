@@ -67,6 +67,31 @@ assuming the separate Gemini `parametersJsonSchema` API is accepted by CCA.
 The strict independent mock rejects the original failing dialect and accepts
 only the supported schema fields.
 
+## Mixed-type union follow-up — 2026-10-21
+
+A live Flash High request was rejected with HTTP 400 / `INVALID_ARGUMENT` at
+`parameters.properties[nodeTypes].items.properties`: properties were present
+on a non-object type. Projection merged fields from string and object union
+branches but retained object properties after selecting a string hint.
+
+The projection now removes fields incompatible with the final type at every
+recursive schema node: `properties`/`required` belong to objects, `items` to
+arrays, and the supported string `enum` hint to strings. The original client
+schema remains in the tool description and still validates returned arguments;
+both original union branches remain valid locally. Provider hints for mixed
+types are still narrower than the full client contract.
+
+Two new projection regressions reproduced the bad shape before the fix. Coverage
+now also checks the serialized tool request and original argument validation,
+rejects type-incompatible fields in the independent CCA mock, and includes a
+mixed `nodeTypes` discovery tool in the real Vercel SDK matrix. This local fix
+does not update the deployed server; acceptance of the exact original client
+request must be rechecked after deploying the rebuilt image.
+
+Local validation passed 194 Rust tests, including the official Python, Vercel
+and LangChain SDK matrices, plus monitor PTY and five login-helper tests. Test
+execution used synthetic credentials and disabled external networking.
+
 ## Diagnostics
 
 `model_request` records provider/model, request ID, endpoint, tool inventory,
