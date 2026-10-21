@@ -175,7 +175,10 @@ fallback occurs.
 
 `AI_ROUTER_ANTIGRAVITY_ENABLED=false` disables Antigravity routing without
 disabling OpenAI. The direct adapter never falls back to a CLI, another account,
-or another provider after a failure.
+or another provider after a failure. The only cross-provider path is model
+fallback for chat model IDs the router has never served (see
+[capabilities](capabilities.md)); a known ID, including each fallback target,
+always reports its own provider's outage.
 
 ## OpenAI opt-in
 
@@ -228,7 +231,16 @@ top-level `error` object, or a Responses `error` event followed by
 `response.failed`; its HTTP status cannot change once headers are sent. The router does not automatically
 retry, switch accounts or fall back to another provider. Normal successful
 provider discovery can clear this transient condition; it does not require
-signing in again.
+signing in again. While it lasts, known OpenAI IDs, including the fallback
+target, return the same 503; only never-served IDs may be served by the
+Gemini fallback target, with `X-AI-Router-Model-Fallback`.
+
+An upstream 401 or 403 (for example `invalid_token`) is a 503 with the
+provider's code and `x-should-retry: false`: it repeats until the operator signs
+in again, so clients are told not to retry. `provider_timeout` (504) also says
+not to retry, because each retry is up to another full request deadline of
+paid generation. Antigravity overload is a 503 `agy_upstream_error` with
+`retry-after: 30`, like OpenAI's.
 
 `invalid_structured_output` means the returned text was invalid JSON or failed
 the requested schema; `incomplete_structured_output` means generation ended
@@ -249,7 +261,7 @@ public errors or persisted logs. Monitor JSON record fields are unchanged.
 | --- | --- |
 | `ai-router-antigravity-auth` at `/var/lib/ai-router/antigravity-auth` | Router-owned Antigravity OAuth session and persistent restriction state. |
 | `ai-router-openai-auth` at `/var/lib/ai-router/openai-auth` | Separate OpenAI registrations and account state. |
-| `ai-router-telemetry` at `/var/lib/ai-router/telemetry` | Bounded request metadata, retained up to the configured days/event count. |
+| `ai-router-telemetry` at `/var/lib/ai-router/telemetry` | Bounded request metadata, retained up to the configured days/event count. Also `known-models.json`: the provider of every model ID served, at most 4,096 (model IDs only), so fallback never cross-serves a known model after a restart. It is the only writable volume under the read-only root filesystem that is not credential state. Deleting it is safe but, until each provider's catalogue is probed again, lets a known ID whose provider is down be treated as never seen. A corrupt file is ignored and rewritten. |
 | `/run/ai-router` and `/tmp` | Container tmpfs for the private monitor socket and bounded temporary data; cleared at stop. |
 | Process memory | Responses output items and provider-private replay state; cleared at restart. |
 

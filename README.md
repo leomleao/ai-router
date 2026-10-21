@@ -25,8 +25,11 @@ flowchart LR
 
 Both providers have separate account state, readiness, admission limits, and
 failure handling. A provider outage does not reroute a request for a known
-model ID to another provider; only a never-served ID's fallback target can
-change. Client tools are returned to the client after schema validation; the
+model ID to another provider: IDs the router has served are remembered across
+restarts (in the telemetry volume) and keep returning their own 503 with retry
+guidance. Only a never-served chat model ID's fallback target can change; with
+no target live, a remembered target's 503 is returned, and `model_not_found`
+only when neither target has ever been seen. Client tools are returned to the client after schema validation; the
 client executes them and sends results in later history. Forced (`required`),
 named and `allowed_tools` choices narrow the tool inventory and fail closed when
 the model answers without a call. Media input and native execution are not supported.

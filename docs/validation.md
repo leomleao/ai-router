@@ -7,6 +7,66 @@ implementation baseline. Each 2026-10-21 compatibility section after the
 integration section records the run on that change's own branch, against the
 203-test `main` baseline; the integration section has the combined counts.
 
+## Review fixes (T7, 2026-10-21)
+
+The independent review of `compat-integration` @ 42a9f9e found three majors and
+eight minors. All are fixed on top of the integration, with one regression test
+each; reverting each fix in a scratch copy makes its test fail (17 reverts, all
+detected).
+
+- **Restart outage (M1).** Remembered ownership persists in
+  `known-models.json` in the telemetry volume. After a restart whose OpenAI
+  probe fails, `gpt-6-luna` and another previously served OpenAI ID return 503
+  with `retry-after: 30` and no fallback header, never Gemini. The code is
+  `provider_unavailable`, refined to the provider's own latched reason when it
+  has one (`provider_request_failed` for the fixture's failed probe), as for
+  every remembered ID. A target requested directly is never cross-served; on a
+  first start with no store it is 503 `provider_unavailable`.
+- **No live target (M2).** A remembered target is selected anyway, so Studio's
+  `gpt-5.4-nano` gets the target's 503 with `retry-after` and the fallback
+  header instead of a non-retryable 400. `model_not_found` remains only when
+  neither target has ever been seen.
+- **Effort `none` (M3).** It follows the catalogue like `minimal`: with the
+  fixture's low/medium/high list it becomes `low` (`mapped=low`). It is
+  forwarded when listed or when no list exists. The live ChatGPT catalogue
+  levels for `gpt-6-luna` still need operator confirmation.
+- **Minors.** Invalid and non-chat IDs no longer fall back (m1). `busy` is
+  counted and recorded as `busy` (m2). Upstream 401/403 is
+  `x-should-retry: false` (m3). Latched transient failures replay as 503 with
+  `retry-after` (m4), and so does Antigravity overload (m5).
+  `provider_timeout` says not to retry (m6). `response.failed` keeps the
+  partial message and `metadata` (m7). A crossed fallback refuses reasoning
+  replay with a retryable 503 (m8). The disclosed ID marks replaced characters
+  and truncation (n1). Metadata limits and narrowed `tool_choice` calls carry
+  `param` (n2).
+
+Probe replay (164 audit cases, the review's harness): as-is 48 fixed, 0
+regressed, 5 changed and 76 still failing against `main`, identical case for
+case to 42a9f9e. Stand-in: 50 fixed, 0 regressed, 6 changed and 74 still
+failing. The only difference from 42a9f9e is `model.text-embedding-3-small`,
+now `400 model_not_found` by design (m1). Effort-`none` OpenAI cases also
+gained `X-AI-Router-Reasoning-Effort: mapped=low`. The review's scenarios now
+give:
+
+- (i) Non-chat IDs: 400.
+- (ii) Junk IDs: 400.
+- (iv) Narrowed calls: carry `param:"tool_choice"`.
+- (v) Upstream auth: `x-should-retry: false`.
+- (vi) Metadata errors: carry `param`.
+- Mid-stream failure: the partial output is kept, and the next request is a
+  latched 503 with `retry-after`.
+- (vii) The OpenAI target on a fresh start during an OpenAI outage: 503
+  `provider_unavailable`, not Gemini.
+- (viii) All three variants: 503 `server_is_overloaded` with the fallback
+  header and `retry-after`, not 400. The both-down control, with neither
+  target ever seen, is still 400 `model_not_found`.
+
+Docker test stage (`ai-router-test:compat-t7`, from a clean `git archive`,
+since removed): 242 Rust tests passed (230 before), including the official SDK,
+n8n and Studio contracts. The Studio contract now expects `mapped=low` for
+OpenAI effort `none`. Monitor PTY checks and the login contract passed, and
+rustfmt is clean.
+
 ## Compatibility integration (2026-10-21)
 
 Branch `compat-integration` merges the four audit fixes into `main` (6b0ffaf)

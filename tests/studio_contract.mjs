@@ -122,8 +122,9 @@ check(wire[0].body.reasoning?.effort === 'none' && wire[0].body.reasoning?.summa
   && JSON.stringify(wire[0].body.include) === '["reasoning.encrypted_content"]' && wire[0].body.temperature === 0,
   'SDK sends effort none, encrypted include and temperature');
 check(wire[0].sampling === 'ignored', 'Ignored temperature is disclosed');
-check(wire[0].effort === (reasoningProvider ? null : 'ignored'),
-  'OpenAI receives effort none; Antigravity discloses that the model ID decides');
+// The fixture catalogue lists low/medium/high, so OpenAI gets its lowest level.
+check(wire[0].effort === (reasoningProvider ? 'mapped=low' : 'ignored'),
+  'OpenAI maps unlisted effort none to the lowest listed level; Antigravity discloses that the model ID decides');
 
 // Other include values remain explicit errors, never silently dropped.
 wire = [];

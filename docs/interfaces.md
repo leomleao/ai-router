@@ -96,9 +96,9 @@ without `encrypted_content` are dropped, Chat assistant `annotations` and
 `reasoning_content` and content-part `cache_control` are removed, and Responses
 assistant `refusal` parts become `output_text`. Effort accepts `none` and
 `minimal`; the API applies the provider policy after model resolution
-(Antigravity clears both, OpenAI may replace `minimal` with the lowest
-catalogue-listed level, and a fallback-served Antigravity ID keeps its own
-tier) and discloses changes in response headers.
+(Antigravity clears both, OpenAI may replace `none` or `minimal` with the
+lowest catalogue-listed level above it, and a fallback-served Antigravity ID
+keeps its own tier) and discloses changes in response headers.
 Responses accept `include: ["reasoning.encrypted_content"]` and a
 `reasoning.summary` hint of `auto`, `concise` or `detailed`; neither changes
 `RunRequest`, and summaries are disclosed as unavailable. Other include values
@@ -108,8 +108,13 @@ provider tokens or truncate text, schema output, or tool arguments.
 
 `ApiError::retry_header` gives retry guidance on JSON error responses:
 `x-should-retry: false` for validation errors, deterministic output-shape
-failures and durable provider restrictions, and `retry-after` for other 503s.
-The API layer adds `retry-after` to 429 rate limits that are not durable.
+failures, durable provider restrictions, errors marked `durable` (upstream
+401/403 credential rejections) and `504 provider_timeout`, and `retry-after`
+for other 503s. The API layer adds `retry-after` to 429 rate limits that are
+not durable. `IntoResponse` also stores the code as a `protocol::ErrorCode`
+response extension, which the protect middleware uses for the monitor bucket
+(`Telemetry::note_error`, falling back to the HTTP status) and the request
+record's `error_code`.
 `ApiError::new` is the only constructor (`api::error` delegates to it);
 `with_param` sets the optional `param` that `response_body` serializes, and
 `missing_required_tool_call` carries `param:"tool_choice"` like tool-choice
@@ -134,13 +139,22 @@ even though the MCP relay was removed.
 (`"openai"`). Ownership is exact and never inferred from model prefixes. The
 registry withholds conflicting IDs and remembers up to 4,096 last-known owners
 so a hidden provider model reports unavailable instead of being routed to the
-other provider. Readiness requires authentication and a catalogue no older than
+other provider. `Registry::open` restores that map from
+`known-models.json` in the telemetry directory and rewrites it (0600, atomic
+rename) whenever ownership changes; an unreadable or corrupt file starts empty. Readiness requires authentication and a catalogue no older than
 180 seconds.
 
 `Snapshot::fallback(requested, openai_target, gemini_target)` is the only
-prefix rule. It returns a target only for an ID that is not live, conflicting,
-or remembered: the Gemini target for a case-insensitive `gemini` prefix,
-otherwise the OpenAI target, and the other target when the first is not live.
+prefix rule. It returns a `FallbackTarget` only for a valid chat model ID that
+is not live, conflicting, remembered or itself a target: the Gemini target for
+a case-insensitive `gemini` prefix, otherwise the OpenAI target, and the other
+target when the first is not live (`crossed`). With neither live it still
+returns the first remembered target, so `resolve` reports that target's
+availability error; with neither ever seen it returns `None`. A non-chat model
+family is an `Err(400 model_not_found)`, and a target requested directly that
+no catalogue has published is an `Err(503 provider_unavailable)`. A crossed
+fallback to Antigravity refuses Responses input that replays reasoning
+(`ItemStore::carries_reasoning`) with 503 `provider_unavailable`.
 The API rewrites the request's `model` to the served ID before normalization,
 so ownership, item scope, response bodies and telemetry use the served ID.
 `RequestRecord.requested_model` keeps the sanitized requested ID (omitted when
@@ -151,8 +165,8 @@ request context as soon as the fallback is chosen.
 normalization, against the served model, and returns at most one
 `x-ai-router-reasoning-effort` value: Antigravity `none`/`minimal` are cleared
 (`ignored`); a fallback-served Antigravity ID clears a differing effort
-(`mapped=<tier>`); OpenAI `minimal` may become the lowest catalogue-listed level
-(`mapped=<level>`). Other efforts are forwarded, and the Antigravity adapter
+(`mapped=<tier>`); OpenAI `none` or `minimal` that the catalogue lists levels
+without becomes the lowest listed level above it (`mapped=<level>`). Other efforts are forwarded, and the Antigravity adapter
 still rejects an exact ID's conflicting effort.
 
 Disclosures are recorded with `RequestContext::disclose` once the request has
