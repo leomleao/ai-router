@@ -2,6 +2,8 @@
 //!
 //! Provider probes publish independently. A registry view takes a coherent pair
 //! of published statuses and never infers a provider from a model-name prefix.
+//! The only prefix rule is the operator-configured fallback, which maps IDs the
+//! registry has never seen onto one of two exact live catalogue IDs.
 use crate::protocol::{ApiError, ModelInfo, ProviderStatus};
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -135,6 +137,34 @@ impl Snapshot {
     pub fn owner(&self, model: &str) -> Option<ProviderId> {
         self.hidden.get(model).copied()
     }
+    /// Select the served ID for a model the registry has never seen. Exact
+    /// live, conflicting, or remembered IDs keep their own result so a known
+    /// model's outage is reported rather than hidden behind another model.
+    pub fn fallback<'a>(
+        &self,
+        requested: &str,
+        openai: &'a str,
+        gemini: &'a str,
+    ) -> Option<&'a str> {
+        if requested.trim().is_empty()
+            || self.conflicts.contains(requested)
+            || self.hidden.contains_key(requested)
+            || self.entries.iter().any(|entry| entry.model.id == requested)
+        {
+            return None;
+        }
+        let gemini_first = requested
+            .get(..6)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("gemini"));
+        let order = if gemini_first {
+            [gemini, openai]
+        } else {
+            [openai, gemini]
+        };
+        order
+            .into_iter()
+            .find(|target| self.entries.iter().any(|entry| entry.model.id == *target))
+    }
     pub fn resolve(&self, model: &str) -> Result<ProviderId, ApiError> {
         if self.conflicts.contains(model) {
             return Err(crate::api::error(
@@ -202,6 +232,51 @@ mod tests {
             snapshot.resolve("unknown").unwrap_err().code,
             "model_not_found"
         );
+    }
+    #[test]
+    fn fallback_maps_only_unseen_ids_and_crosses_to_the_available_target() {
+        let now = Utc::now();
+        let mut registry = Registry::default();
+        let agy = status(&["gemini-3.8-flash-medium", "claude-x-high"], now);
+        let openai = status(&["gpt-6-luna", "gpt-exact"], now);
+        let both = registry.snapshot(&agy, &openai, true, now);
+        let pick = |s: &Snapshot, id: &str| s.fallback(id, "gpt-6-luna", "gemini-3.8-flash-medium");
+        assert_eq!(pick(&both, "gpt-5.4-nano"), Some("gpt-6-luna"));
+        assert_eq!(pick(&both, "gpt-5.3-codex"), Some("gpt-6-luna"));
+        assert_eq!(pick(&both, "o3"), Some("gpt-6-luna"));
+        assert_eq!(pick(&both, "claude-unknown"), Some("gpt-6-luna"));
+        assert_eq!(
+            pick(&both, "gemini-9-ultra"),
+            Some("gemini-3.8-flash-medium")
+        );
+        assert_eq!(pick(&both, "GeMiNi-9"), Some("gemini-3.8-flash-medium"));
+        for exact in [
+            "gpt-exact",
+            "claude-x-high",
+            "gpt-6-luna",
+            "gemini-3.8-flash-medium",
+        ] {
+            assert_eq!(pick(&both, exact), None, "{exact}");
+        }
+        assert_eq!(pick(&both, ""), None);
+        // OpenAI disabled: its remembered IDs keep provider_unavailable, while
+        // unseen IDs cross over to the Gemini target.
+        let disabled = registry.snapshot(&agy, &openai, false, now);
+        assert_eq!(
+            pick(&disabled, "gpt-5.4-nano"),
+            Some("gemini-3.8-flash-medium")
+        );
+        assert_eq!(pick(&disabled, "gpt-exact"), None);
+        assert_eq!(
+            disabled.resolve("gpt-exact").unwrap_err().code,
+            "provider_unavailable"
+        );
+        let no_gemini = Registry::default().snapshot(&status(&["other"], now), &openai, true, now);
+        assert_eq!(pick(&no_gemini, "gemini-9-ultra"), Some("gpt-6-luna"));
+        let neither =
+            Registry::default().snapshot(&status(&["other"], now), &status(&[], now), true, now);
+        assert_eq!(pick(&neither, "gpt-5.4-nano"), None);
+        assert_eq!(pick(&neither, "gemini-9-ultra"), None);
     }
     #[test]
     fn stale_hidden_removed_and_disabled_models_never_reroute() {

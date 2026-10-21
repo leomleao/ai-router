@@ -1206,6 +1206,12 @@ fn request_detail_lines(record: &RequestRecord, width: u16, p: Palette) -> Vec<L
         // detail, so it is visible in the compact request panel too.
         fields.insert(5, (format!("Reason:     {message}"), p.warn));
     }
+    if let Some(requested) = &record.requested_model {
+        fields.insert(
+            2,
+            (format!("Requested:  {requested} (model fallback)"), p.warn),
+        );
+    }
     if let Some(id) = &record.upstream_request_id {
         fields.push((format!("Upstream request ID: {id}"), p.muted));
     }
@@ -1438,6 +1444,7 @@ mod tests {
                     request_id: format!("req-{i:02}"),
                     client_id: "demo-client".into(),
                     model: "gemini-demo".into(),
+                    requested_model: None,
                     provider: "agy".into(),
                     endpoint: "/v1/responses".into(),
                     started_at: (now - chrono::Duration::minutes(i * 3)).to_rfc3339(),
@@ -1704,6 +1711,7 @@ mod tests {
         record.request_id = "r".repeat(80);
         record.client_id = "c".repeat(64);
         record.model = "m".repeat(128);
+        record.requested_model = Some("q".repeat(128));
         record.endpoint = format!("/{}", "e".repeat(79));
         record.error_code = Some("x".repeat(80));
         record.usage = None;
@@ -1717,6 +1725,7 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
         assert!(text.contains(&record.request_id) && text.contains(&record.model));
+        assert!(text.contains(record.requested_model.as_deref().unwrap()));
         assert!(text.contains("token counts unknown") && text.contains("startup unknown"));
         assert!(!text.contains("input 0"));
         let max_scroll = lines.len().saturating_sub(11) as u16;

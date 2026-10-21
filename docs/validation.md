@@ -98,6 +98,33 @@ failure runs, plus monitor PTY checks and 5 login checks. Formatting passed;
 clippy reported only the existing style-warning categories. Only synthetic
 loopback fixtures were used.
 
+## Model fallback for unserved IDs (2026-10-21)
+
+Supabase Studio hard-codes `gpt-6-luna`, `gpt-5.4-nano` and `gpt-5.3-codex` and
+never reads `/v1/models`, so an ID absent from the catalogue returned
+`400 model_not_found`. By operator decision, an ID the router has never served now
+maps to `gemini-3.8-flash-medium` when it starts with `gemini` (any case), and to
+`gpt-6-luna` otherwise. If that target is not live, the other target is used; if
+neither is, `model_not_found` is unchanged. Exact live, conflicting, or remembered
+IDs are never remapped, so a known model's outage still reports
+`provider_unavailable`. `X-AI-Router-Model-Fallback: <requested> -> <served>`
+discloses each mapping, response bodies report the served ID, and monitor records
+keep the sanitized requested ID. For an Antigravity target, a different client
+effort yields to the ID's tier with `X-AI-Router-Reasoning-Effort` instead of the
+exact-ID conflict error. `AI_ROUTER_MODEL_FALLBACK=false` restores strict
+behaviour; both targets are configurable and validated at startup.
+
+HTTP contract tests cover both APIs, streamed and nonstreamed, with the fixture
+catalogue's IDs as targets: `gpt-5.4-nano`, `gpt-5.3-codex` and an unknown
+`claude-*` ID are served by the OpenAI target, `gemini-9-ultra` by the Gemini
+target, exact IDs are untouched, the effort tier is disclosed, an OpenAI outage
+crosses to the Gemini target, and the disabled switch returns `model_not_found`.
+Replaying the audit probe files with the same targets changed only four cases:
+`model.gpt-5.4-nano`, `model.gpt-4o-mini` and `model.text-embedding-3-small` went
+from 400 to 200, and Studio's literal `gpt-5.4-nano` title request now reaches the
+served model and stops at its separate `reasoning effort` rejection. The other 160
+probe results were unchanged. 207 Rust tests (203 before) passed in the Docker test stage, with the official SDK, n8n and Studio contracts, monitor PTY checks and 5 login checks. Formatting passed and clippy reported only the existing warning categories.
+
 ## Supabase Studio Responses compatibility (2026-10-21)
 
 Supabase Studio's assistant (`supabase/studio:2026.10.12`, `ai@7.0.59`,

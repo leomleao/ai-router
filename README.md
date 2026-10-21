@@ -2,7 +2,9 @@
 
 A Rust gateway for OpenAI-compatible Chat Completions and Responses clients.
 It routes exact model IDs to a direct Antigravity adapter or, when enabled,
-the independent OpenAI Responses provider. The gateway runs model requests
+the independent OpenAI Responses provider. An ID it has never served is mapped
+to a configured fallback model and disclosed in a response header; see
+[capabilities](docs/capabilities.md). The gateway runs model requests
 only; it does not run client tools, native agents, uploads, or artifacts.
 
 The former AGY CLI implementation is preserved on the published
