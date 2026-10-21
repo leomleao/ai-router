@@ -1011,3 +1011,194 @@ async fn disabled_model_fallback_restores_strict_model_not_found() {
         .await;
     assert_eq!(capabilities["profiles"]["model"]["model_fallback"]["enabled"], false);
 }
+
+// Exact forced-choice client bodies: Twenty's workspace-setup kickoff and
+// n8n's "Force Tool Call" (Responses, "required"), and LangChain Python
+// with_structured_output(method="function_calling") (Chat, named, with
+// parallel_tool_calls=false). Fixture models call the first offered tool only
+// when forcing reaches them, so each call proves the narrowed inventory too.
+#[tokio::test]
+async fn forced_tool_choice_client_bodies_call_the_selected_tool_or_fail_closed() {
+    let harness = DualHarness::new().await;
+    let find = json!({"type":"function","name":"find_records","description":"Find","parameters":{"type":"object",
+        "properties":{"q":{"type":"string"}},"required":["q"],"additionalProperties":false},"strict":false});
+    let joke = json!({"type":"function","function":{"name":"Joke","description":"Joke to tell user.","parameters":{"type":"object",
+        "properties":{"setup":{"type":"string"},"punchline":{"type":"string"}},"required":["setup","punchline"]}}});
+    let mut n8n_tool = lookup_tool(true);
+    n8n_tool["strict"] = json!(false);
+    let chat_calls = |streaming: bool, wire: &[u8]| -> Vec<Value> {
+        if !streaming {
+            let value: Value = serde_json::from_slice(wire).unwrap();
+            return value["choices"][0]["message"]["tool_calls"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+        }
+        frames(wire)
+            .iter()
+            .filter(|frame| frame.data != "[DONE]")
+            .flat_map(|frame| {
+                event_json(frame)["choices"][0]["delta"]["tool_calls"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .collect()
+    };
+    for model in ["synthetic-openai", MODEL] {
+        for streaming in [false, true] {
+            let twenty = |text: &str| {
+                json!({"model":model,"input":[{"role":"developer","content":"You are Twenty's assistant"},
+                    {"role":"user","content":[{"type":"input_text","text":text}]}],
+                    "store":false,"prompt_cache_key":"thread-123","include":["reasoning.encrypted_content"],
+                    "reasoning":{"effort":"medium","summary":"auto"},"tools":[find.clone()],"tool_choice":"required","stream":streaming})
+            };
+            let n8n = json!({"model":model,"input":[{"type":"message","role":"system","content":"You are helpful"},
+                {"type":"message","role":"user","content":"hello"}],"stream":streaming,"text":{},
+                "tools":[n8n_tool.clone()],"tool_choice":"required"});
+            let allowed = json!({"model":model,"input":"hello","stream":streaming,"tools":[lookup_tool(true),find.clone()],
+                "tool_choice":{"type":"allowed_tools","mode":"required","tools":[{"type":"function","name":"find_records"}]}});
+            for (body, name) in [
+                (twenty("find acme"), "find_records"),
+                (n8n, "lookup"),
+                (allowed, "find_records"),
+            ] {
+                let output = completed_response(&harness, body).await;
+                let calls: Vec<_> = output["output"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|item| item["type"] == "function_call")
+                    .collect();
+                assert_eq!(calls.len(), 1, "{model} {output}");
+                assert_eq!(calls[0]["name"], name);
+                let arguments: Value =
+                    serde_json::from_str(calls[0]["arguments"].as_str().unwrap()).unwrap();
+                assert_eq!(arguments, json!({"q":"synthetic"}));
+            }
+            let langchain = |text: &str| {
+                json!({"model":model,"messages":[{"role":"user","content":text}],"stream":streaming,
+                    "parallel_tool_calls":false,"tools":[lookup_tool(false),joke.clone()],
+                    "tool_choice":{"type":"function","function":{"name":"Joke"}}})
+            };
+            let response = harness
+                .send(
+                    Method::POST,
+                    "/v1/chat/completions",
+                    Some(langchain("Tell me a joke about cats")),
+                    Some("test-key"),
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let calls = chat_calls(streaming, &read_bytes(response).await);
+            assert_eq!(calls.len(), 1, "{model}");
+            assert_eq!(calls[0]["function"]["name"], "Joke");
+            let arguments: Value =
+                serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+            assert_eq!(
+                arguments,
+                json!({"setup":"synthetic","punchline":"synthetic"})
+            );
+            if model == "synthetic-openai" {
+                let upstream = harness.captured.lock().await.last().cloned().unwrap();
+                assert_eq!(upstream["tool_choice"], "required");
+                assert_eq!(upstream["parallel_tool_calls"], false);
+                assert_eq!(upstream["input"][0]["type"], "additional_tools");
+                assert_eq!(upstream["input"][0]["tools"].as_array().unwrap().len(), 1);
+                assert_eq!(upstream["input"][0]["tools"][0]["name"], "Joke");
+            }
+
+            // A model that answers in text instead is withheld, never
+            // completed with a fabricated call.
+            for (path, body) in [
+                ("/v1/responses", twenty("find acme no-call-fixture")),
+                ("/v1/chat/completions", langchain("no-call-fixture joke")),
+            ] {
+                let response = harness
+                    .send(Method::POST, path, Some(body), Some("test-key"))
+                    .await;
+                let status = response.status();
+                let wire = read_bytes(response).await;
+                if !streaming {
+                    assert_eq!(status, StatusCode::BAD_GATEWAY);
+                    let error: Value = serde_json::from_slice(&wire).unwrap();
+                    assert_eq!(error["error"]["code"], "missing_required_tool_call");
+                    continue;
+                }
+                assert_eq!(status, StatusCode::OK);
+                let frames = frames(&wire);
+                assert!(frames.iter().all(|frame| {
+                    frame.event != "response.output_text.delta"
+                        && !frame.data.contains("synthetic answer")
+                        && !frame.data.contains("Hello from fixture")
+                }));
+                let failure = frames
+                    .iter()
+                    .find(|frame| frame.data.contains("missing_required_tool_call"))
+                    .unwrap_or_else(|| panic!("{model} {path} did not fail closed"));
+                if path == "/v1/responses" {
+                    assert_eq!(failure.event, "response.failed");
+                }
+            }
+
+            // allowed_tools keeps auto selection but removes the other tools:
+            // the fixture's habitual lookup call is now outside the inventory.
+            let (status, error) = harness
+                .post(
+                    "/v1/responses",
+                    json!({"model":model,"input":"tools-fixture","stream":false,"tools":[lookup_tool(true),find.clone()],
+                        "tool_choice":{"type":"allowed_tools","mode":"auto","tools":[{"type":"function","name":"find_records"}]}}),
+                )
+                .await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY);
+            assert_eq!(error["error"]["code"], "invalid_provider_tool_call");
+        }
+        for (path, body) in [
+            (
+                "/v1/chat/completions",
+                json!({"model":model,"messages":[{"role":"user","content":"hello"}],"tools":[lookup_tool(false)],
+                    "tool_choice":{"type":"function","function":{"name":"Missing"}}}),
+            ),
+            (
+                "/v1/responses",
+                json!({"model":model,"input":"hello","tools":[lookup_tool(true)],"tool_choice":{"type":"function","name":"Missing"}}),
+            ),
+            (
+                "/v1/responses",
+                json!({"model":model,"input":"hello","tools":[lookup_tool(true)],
+                    "tool_choice":{"type":"allowed_tools","mode":"auto","tools":[{"type":"function","name":"Missing"}]}}),
+            ),
+            (
+                "/v1/responses",
+                json!({"model":model,"input":"hello","tool_choice":"required"}),
+            ),
+        ] {
+            let (status, error) = harness.post(path, body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(error["error"]["type"], "invalid_request_error");
+            assert_eq!(error["error"]["code"], "invalid_request");
+            assert_eq!(error["error"]["param"], "tool_choice");
+        }
+    }
+    let (_, capabilities) = harness
+        .json(Method::GET, "/v1/capabilities", None, Some("test-key"))
+        .await;
+    assert_eq!(
+        capabilities["profiles"]["model"]["tool_choice"]["missing_required_call"],
+        "error"
+    );
+    assert_eq!(
+        capabilities["providers"]["agy"]["tool_choice_forcing"],
+        "prompt_instruction"
+    );
+    assert_eq!(
+        capabilities["providers"]["openai"]["tool_choice_forcing"],
+        "upstream_required"
+    );
+    assert!(
+        !capabilities["unsupported"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("forced_tool_choice"))
+    );
+}

@@ -406,13 +406,7 @@ impl Drop for Admission {
 }
 
 pub fn error(status: u16, code: &str, message: &str) -> ApiError {
-    ApiError {
-        diagnostics: None,
-        upstream_request_id: None,
-        status,
-        code: code.into(),
-        message: message.into(),
-    }
+    ApiError::new(status, code, message)
 }
 
 pub struct RequestContext {
@@ -742,12 +736,13 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> Json<Value> {
             "model_fallback":{"enabled":state.config.model_fallback,"applies_to":"model_ids_never_served","exact_ids_win":true,"listed_in_models":false,
                 "gemini_prefix_target":state.config.fallback_gemini_model,"default_target":state.config.fallback_openai_model,"unavailable_target":"other_target","neither_available":"model_not_found",
                 "disclosure_header":"x-ai-router-model-fallback","antigravity_effort":"served_model_tier","effort_disclosure_header":"x-ai-router-reasoning-effort"},
+            "tool_choice":{"accepted":["auto","none","required","function","allowed_tools"],"inventory":"narrowed_to_selection","missing_required_call":"error"},
             "item_references":{"enabled":true,"storage":"memory","default_store":true,"ttl_seconds":items::TTL_SECONDS,"max_items":items::MAX_ITEMS,"max_bytes":items::MAX_BYTES,"per_client_items":items::CLIENT_ITEMS,"per_client_bytes":items::CLIENT_BYTES,"cleared_on_restart":true}}},
         "providers":{
-            "agy":{"enabled":state.config.antigravity_enabled,"ready":snapshot.entries.iter().any(|e|e.provider==ProviderId::Agy),"adapter":agy.version,"baseline":crate::antigravity_auth::BASELINE_REVISION,"checked_at":agy.checked_at,"error":agy.error,"quota":agy.quota,"transport":"direct","fallback":false,"release_advisory":release},
-            "openai":{"enabled":state.config.openai_enabled,"ready":snapshot.entries.iter().any(|e|e.provider==ProviderId::OpenAi),"version":openai.version,"checked_at":openai.checked_at,"error":openai.error,"quota":openai.quota,"usage_url":"https://chatgpt.com/settings/usage","upstream":"responses","upstream_store":false,"upstream_stream":true,"client_tools":true,"media_input":false,"output_token_budget":{"mode":"prompt_guidance","hard_limit":false},"unsupported":["active_sampling_controls","hosted_tools","native"],"reasoning_effort":"model_dependent"}},
+            "agy":{"enabled":state.config.antigravity_enabled,"ready":snapshot.entries.iter().any(|e|e.provider==ProviderId::Agy),"adapter":agy.version,"baseline":crate::antigravity_auth::BASELINE_REVISION,"checked_at":agy.checked_at,"error":agy.error,"quota":agy.quota,"transport":"direct","fallback":false,"release_advisory":release,"tool_choice_forcing":"prompt_instruction"},
+            "openai":{"enabled":state.config.openai_enabled,"ready":snapshot.entries.iter().any(|e|e.provider==ProviderId::OpenAi),"version":openai.version,"checked_at":openai.checked_at,"error":openai.error,"quota":openai.quota,"usage_url":"https://chatgpt.com/settings/usage","upstream":"responses","upstream_store":false,"upstream_stream":true,"client_tools":true,"media_input":false,"output_token_budget":{"mode":"prompt_guidance","hard_limit":false},"unsupported":["active_sampling_controls","hosted_tools","native"],"reasoning_effort":"model_dependent","tool_choice_forcing":"upstream_required"}},
         "admission":{"total_max_concurrent":state.config.max_concurrent+if state.config.openai_enabled {state.config.openai_max_concurrent}else{0},"providers":{"agy":{"max_concurrent":state.config.max_concurrent,"max_queue":state.config.max_queue},"openai":{"enabled":state.config.openai_enabled,"max_concurrent":state.config.openai_max_concurrent,"max_queue":state.config.openai_max_queue}}},
-        "unsupported":["native","media_input","forced_tool_choice","active_sampling_controls","embeddings","audio","image_generation_api","realtime","batches","fine_tuning","provider_management"],
+        "unsupported":["native","media_input","active_sampling_controls","embeddings","audio","image_generation_api","realtime","batches","fine_tuning","provider_management"],
         "verification":{"adapter_contract":"automated_fixtures","live_direct_provider":"operator_validation_required"},
         "model_conflicts":snapshot.conflicts,
         "per_model":snapshot.entries.iter().map(|e|json!({"id":e.model.id,"provider":e.provider.as_str(),"chat_completions":true,"responses":true,"streaming":true,"client_tools":true,"native":false,"media_input":false,"output_token_budget":{"mode":"prompt_guidance","hard_limit":false}})).collect::<Vec<_>>()
@@ -1747,6 +1742,20 @@ mod tests {
                     json!({"type":"function_call","call_id":"call_two","name":"lookup","arguments":"{\"q\":\"two\"}","status":"completed"}),
                 ],
             )
+        } else if body["tool_choice"] == "required"
+            && !continuing
+            && !input.contains("no-call-fixture")
+        {
+            // An upstream that honours forcing calls the first offered tool.
+            let tool = &body["input"][0]["tools"][0];
+            let arguments = synthetic_arguments(&tool["parameters"]).to_string();
+            let call_id = format!("call_forced_{}", captured.lock().await.len());
+            (
+                String::new(),
+                vec![
+                    json!({"type":"function_call","call_id":call_id,"name":tool["name"],"arguments":arguments,"status":"completed"}),
+                ],
+            )
         } else if input.contains("reasoning-only-fixture") {
             (
                 String::new(),
@@ -1796,6 +1805,29 @@ mod tests {
             json!({"type":format!("response.{status}"),"response":terminal})
         ));
         ([("content-type", "text/event-stream")], wire).into_response()
+    }
+    // Fills only required fields; enough for a fixture model to obey forcing.
+    fn synthetic_arguments(schema: &Value) -> Value {
+        match schema["type"].as_str() {
+            Some("object") => Value::Object(
+                schema["required"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(|name| {
+                        (
+                            name.to_owned(),
+                            synthetic_arguments(&schema["properties"][name]),
+                        )
+                    })
+                    .collect(),
+            ),
+            Some("array") => json!([]),
+            Some("integer" | "number") => json!(0),
+            Some("boolean") => json!(false),
+            _ => json!("synthetic"),
+        }
     }
     // Independent legacy CCA validator: a permissive mock previously hid
     // production INVALID_ARGUMENT errors for ordinary n8n JSON Schemas.
@@ -1911,6 +1943,14 @@ mod tests {
             json!([{"text":"private reasoning","thought":true,"thoughtSignature":"c2lnbmF0dXJl"},
                 {"functionCall":{"name":"lookup","args":{"q":"one"}}},
                 {"functionCall":{"name":"lookup","args":{"q":"two"}}}])
+        } else if text.contains("This turn must call a tool.")
+            && !continuing
+            && !text.contains("no-call-fixture")
+        {
+            // A model that follows the forcing instruction calls the first tool.
+            let declaration = &body["request"]["tools"][0]["functionDeclarations"][0];
+            json!([{"functionCall":{"name":declaration["name"],
+                "args":synthetic_arguments(&declaration["parameters"])}}])
         } else {
             json!([{"text":if text.contains("schema-fixture") {"{\"answer\":\"valid\"}"} else if continuing {"tool results accepted"} else {"Hello from fixture"}}])
         };

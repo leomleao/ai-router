@@ -125,6 +125,42 @@ from 400 to 200, and Studio's literal `gpt-5.4-nano` title request now reaches t
 served model and stops at its separate `reasoning effort` rejection. The other 160
 probe results were unchanged. 207 Rust tests (203 before) passed in the Docker test stage, with the official SDK, n8n and Studio contracts, monitor PTY checks and 5 login checks. Formatting passed and clippy reported only the existing warning categories.
 
+## Forced tool choice (2026-10-21)
+
+Twenty's workspace-setup kickoff turn and n8n's "Force Tool Call on First
+Iteration" send `tool_choice:"required"`. LangChain Python
+`with_structured_output(method="function_calling")` and Cognee's instructor
+`tool_call` mode force a named function, with LangChain adding
+`parallel_tool_calls:false`. All of these returned
+`400 unsupported_parameter` before dispatch. Chat and Responses now accept
+`required`, a named function, and `allowed_tools` (`auto` or `required`). Named
+and allowed choices narrow the inventory the provider sees. A required call
+withholds visible text until the result is known. An answer without a
+validated call fails with `502 missing_required_tool_call`; no call is ever
+synthesized. OpenAI also receives `tool_choice:"required"` over the narrowed
+`additional_tools` catalogue. That route's preview limits don't list
+`tool_choice`, but live acceptance still needs operator validation.
+Antigravity keeps the reviewed `VALIDATED` mode, since nothing in the
+baseline proves `ANY` or `allowedFunctionNames` on CCA, and gets a system
+instruction instead. Unknown names, forcing without tools, and forcing
+combined with a structured output format return `400 invalid_request` with
+`param:"tool_choice"`. Custom, hosted and MCP choices stay unsupported.
+
+`forced_tool_choice_client_bodies_call_the_selected_tool_or_fail_closed`
+replays the Twenty, n8n and LangChain bodies, plus `allowed_tools`, against
+both provider fixtures, streamed and nonstreamed. It also covers the
+fail-closed path (no text deltas, `response.failed` or a Chat `error` event),
+a call outside `allowed_tools`, and the 400 cases. The fixture models call the
+first offered tool only when forcing reaches them, so each call also proves
+the narrowed inventory. Wire tests check the OpenAI `tool_choice` field, the
+unchanged Antigravity `VALIDATED` mode, and length-stopped calls failing
+closed. `sdk_contract.py` checks the official Python SDK on both public APIs.
+The audit probe's 9 tool-choice cases (Twenty, Cognee, n8n and the six generic
+shapes) changed from 400 to 200, and so did 8 Antigravity copies.
+The Docker test stage passed 207 Rust tests (203 before), including the
+official SDK, n8n and Studio contracts, plus the monitor PTY and login checks.
+Rust formatting passed.
+
 ## Supabase Studio Responses compatibility (2026-10-21)
 
 Supabase Studio's assistant (`supabase/studio:2026.10.12`, `ai@7.0.59`,

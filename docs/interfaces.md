@@ -74,9 +74,19 @@ later turns retain their original chronology.
 
 `normalize_chat` and `normalize_response` validate supported fields, text-only
 content, call/result pairing, identifiers, and bounded item counts. They
-support tool choice `auto` and `none`; `none` removes the tool inventory.
-Forced/named choices and active sampling controls (`n` other than 1,
-`logit_bias`, `logprobs`, `top_logprobs`, non-empty `stop`) fail explicitly.
+support tool choice `auto`, `none`, `required`, a named function and
+`allowed_tools`. `none` removes the tool inventory; named and allowed-tools
+choices narrow it to the selection; `required`, a named function and
+`allowed_tools` with `mode:"required"` set `RunRequest.tool_required`. With that
+flag, both adapters withhold visible text until the result is known
+(`RunRequest::withholds_text`, shared with schema output), and fail with
+`502 missing_required_tool_call` when no validated call is returned. OpenAI
+also receives `tool_choice:"required"`; Antigravity keeps `VALIDATED` mode and
+receives a system instruction naming the remaining tools. Tool-choice
+validation errors carry `param:"tool_choice"` (`ApiError::with_param`), and a
+forcing choice cannot be combined with a structured output format.
+Active sampling controls (`n` other than 1, `logit_bias`, `logprobs`,
+`top_logprobs`, non-empty `stop`) fail explicitly.
 Sampling hints (`temperature`, `top_p`, `seed`, `frequency_penalty`,
 `presence_penalty`) are range-checked and recorded in `ignored`, as are
 `metadata`, `user`, `safety_identifier`, `service_tier` `auto`/`default` and

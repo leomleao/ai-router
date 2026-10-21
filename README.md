@@ -26,8 +26,9 @@ flowchart LR
 Both providers have separate account state, readiness, admission limits, and
 failure handling. A provider outage does not reroute a request to another
 provider. Client tools are returned to the client after schema validation; the
-client executes them and sends results in later history. Forced or named tool
-selection is unsupported. Media input and native execution are not supported.
+client executes them and sends results in later history. Forced (`required`),
+named and `allowed_tools` choices narrow the tool inventory and fail closed when
+the model answers without a call. Media input and native execution are not supported.
 
 ## Local Docker quick start
 
