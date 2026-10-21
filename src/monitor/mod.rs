@@ -211,24 +211,20 @@ impl Telemetry {
     /// Arbitrary error strings map to one fixed bucket, preventing cardinality
     /// growth during an unauthenticated request flood.
     pub fn note_rejection(&self, code: &str) {
-        let bucket = match code {
-            "invalid_api_key" | "authentication_error" | "unauthorized" | "http_401" => 0,
-            "rate_limit_exceeded" | "http_429" => 1,
-            "insufficient_scope" | "http_403" => 2,
-            "invalid_request"
-            | "unsupported_parameter"
-            | "request_too_large"
-            | "input_too_large"
-            | "headers_too_large"
-            | "body_timeout"
-            | "http_400"
-            | "http_408"
-            | "http_413"
-            | "http_431"
-            | "invalid_request_error" => 3,
-            "busy" | "run_limit_exceeded" | "subscriber_limit" | "shutting_down" => 4,
-            _ => 5,
-        };
+        self.count_rejection(rejection_bucket(code).unwrap_or(5));
+    }
+
+    /// Count a router error by its code, or by its HTTP status when the code
+    /// has no bucket of its own (such as `model_not_found`, an invalid request).
+    pub fn note_error(&self, code: &str, status: u16) {
+        self.count_rejection(
+            rejection_bucket(code)
+                .or_else(|| rejection_bucket(&format!("http_{status}")))
+                .unwrap_or(5),
+        );
+    }
+
+    fn count_rejection(&self, bucket: usize) {
         let _ = self.rejections[bucket].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
             Some(n.saturating_add(1))
         });
@@ -611,6 +607,27 @@ fn prune_if_due(state: &mut State, days: u64, max: usize) {
         prune(&mut state.records, days, max);
         state.last_prune = Instant::now();
     }
+}
+
+fn rejection_bucket(code: &str) -> Option<usize> {
+    Some(match code {
+        "invalid_api_key" | "authentication_error" | "unauthorized" | "http_401" => 0,
+        "rate_limit_exceeded" | "http_429" => 1,
+        "insufficient_scope" | "http_403" => 2,
+        "invalid_request"
+        | "unsupported_parameter"
+        | "request_too_large"
+        | "input_too_large"
+        | "headers_too_large"
+        | "body_timeout"
+        | "http_400"
+        | "http_408"
+        | "http_413"
+        | "http_431"
+        | "invalid_request_error" => 3,
+        "busy" | "run_limit_exceeded" | "subscriber_limit" | "shutting_down" => 4,
+        _ => return None,
+    })
 }
 
 fn persist(path: &Path, records: &[RequestRecord]) -> Result<(), ()> {

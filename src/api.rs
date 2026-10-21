@@ -78,7 +78,13 @@ impl AppState {
             agy_queued: AtomicUsize::new(0),
             openai: OpenAi::new(config.clone()),
             openai_provider: RwLock::new(ProviderStatus::default()),
-            registry: std::sync::Mutex::new(Registry::default()),
+            // The telemetry volume is the router's writable state directory
+            // under a read-only root filesystem.
+            registry: std::sync::Mutex::new(Registry::open(
+                config
+                    .telemetry_dir
+                    .join(crate::providers::KNOWN_MODELS_FILE),
+            )),
             body_slots: Arc::new(Semaphore::new(32)),
             preauth: RateLimiter::new(config.preauth_per_minute, 4096),
             global: RateLimiter::new(config.global_preauth_per_minute, 1),
@@ -271,18 +277,20 @@ impl AppState {
     }
 
     /// Map an ID the registry has never served onto a configured target.
-    async fn fallback_model(&self, requested: &str) -> Option<String> {
+    /// Returns the served ID and whether it crossed to the second choice.
+    async fn fallback_model(&self, requested: &str) -> Result<Option<(String, bool)>, ApiError> {
         if !self.config.model_fallback {
-            return None;
+            return Ok(None);
         }
-        self.snapshot()
+        Ok(self
+            .snapshot()
             .await
             .fallback(
                 requested,
                 &self.config.fallback_openai_model,
                 &self.config.fallback_gemini_model,
-            )
-            .map(str::to_owned)
+            )?
+            .map(|target| (target.served.to_owned(), target.crossed)))
     }
 
     async fn runtime(&self) {
@@ -430,7 +438,8 @@ impl RequestContext {
 }
 
 /// A served substitute for an unknown requested model, disclosed on every
-/// response. `requested` is already bounded to a header- and log-safe ID.
+/// response. `requested` is bounded to a header- and log-safe ID: other
+/// characters become `_`, and a cut ID ends in `;truncated`.
 #[derive(Clone)]
 struct ModelFallback {
     requested: String,
@@ -438,11 +447,21 @@ struct ModelFallback {
 }
 impl ModelFallback {
     fn new(requested: &str, served: &str) -> Self {
-        let requested: String = requested
+        let mut safe: String = requested
             .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || "._:/-".contains(*c))
             .take(128)
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || "._:/-".contains(c) {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
+        if requested.chars().nth(128).is_some() {
+            safe.push_str(";truncated");
+        }
+        let requested = safe;
         Self {
             requested: if requested.is_empty() {
                 "invalid".into()
@@ -627,9 +646,15 @@ async fn protect(
     let fallback = context.fallback.lock().unwrap().clone();
     if response.status().as_u16() >= 400 && !context.recorded.load(Ordering::Relaxed) {
         let selection = context.selection.lock().unwrap().clone();
-        state
-            .telemetry
-            .note_rejection(&format!("http_{}", response.status().as_u16()));
+        // The router's own code when it produced the error, so saturation
+        // (`busy`) is counted as such rather than as an anonymous 503.
+        let status = response.status().as_u16();
+        let code = response
+            .extensions()
+            .get::<ErrorCode>()
+            .map(|code| code.0.clone())
+            .unwrap_or_else(|| format!("http_{status}"));
+        state.telemetry.note_error(&code, status);
         state
             .telemetry
             .record(RequestRecord {
@@ -651,7 +676,7 @@ async fn protect(
                 startup_ms: None,
                 first_output_ms: None,
                 status: "rejected".into(),
-                error_code: Some(format!("http_{}", response.status().as_u16())),
+                error_code: Some(code),
                 usage: None,
                 usage_partial: false,
             })
@@ -732,14 +757,16 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> Json<Value> {
             "prompt_cache_controls":{"mode":"ignored","retention_guarantee":false},
             "sampling_controls":{"mode":"ignored","accepted":SAMPLING_HINTS,"rejected":["n>1","logit_bias","logprobs","top_logprobs>0","stop"]},
             "ignored_fields":{"accepted":["metadata","user","safety_identifier","service_tier:auto","service_tier:default","truncation:auto","stream_options.include_obfuscation:false","annotations","cache_control","reasoning_content"],"metadata_echo":"responses","truncation":"never"},
-            "reasoning_effort":{"accepted":["none","minimal","low","medium","high","xhigh","max"],"openai":{"none":"forwarded","minimal":"lowest_listed_level_when_unlisted"},"agy":{"none":"ignored","minimal":"ignored","other":"must_match_model_id","fallback_served":"served_model_tier"},
+            "reasoning_effort":{"accepted":["none","minimal","low","medium","high","xhigh","max"],"openai":{"none":"lowest_listed_level_when_unlisted","minimal":"lowest_listed_level_when_unlisted","unlisted_catalogue":"forwarded"},"agy":{"none":"ignored","minimal":"ignored","other":"must_match_model_id","fallback_served":"served_model_tier"},
                 "disclosure_header":"x-ai-router-reasoning-effort","header_values":["ignored","mapped=<level>"],"values_per_request":1},
             "reasoning_replay":{"unencrypted":"dropped"},
-            "retry_hints":{"deterministic":"x-should-retry:false","transient_503":"retry-after","local_saturation":{"status":503,"code":"busy"},"rate_limit":{"status":429}},
+            "retry_hints":{"deterministic":"x-should-retry:false","transient_503":"retry-after","local_saturation":{"status":503,"code":"busy"},"rate_limit":{"status":429},"provider_timeout":"x-should-retry:false","upstream_credentials":"x-should-retry:false","latched_transient":{"status":503,"header":"retry-after"}},
             "responses_include":["reasoning.encrypted_content"],
             "reasoning_summary":{"mode":"unavailable","accepted":["auto","concise","detailed"]},
             "model_fallback":{"enabled":state.config.model_fallback,"applies_to":"model_ids_never_served","exact_ids_win":true,"listed_in_models":false,
-                "gemini_prefix_target":state.config.fallback_gemini_model,"default_target":state.config.fallback_openai_model,"unavailable_target":"other_target","neither_available":"model_not_found",
+                "gemini_prefix_target":state.config.fallback_gemini_model,"default_target":state.config.fallback_openai_model,"unavailable_target":"other_target","neither_available":"remembered_target_error","never_seen_targets":"model_not_found",
+                "never_applies_to":["live_model_ids","remembered_model_ids","fallback_targets","invalid_model_ids","non_chat_model_families"],"non_chat_model_families":"model_not_found","remembered_ids":"persisted_across_restarts",
+                "crossed_with_reasoning_replay":"provider_unavailable","unpublished_target_requested":"provider_unavailable",
                 "disclosure_header":"x-ai-router-model-fallback","antigravity_effort":"served_model_tier","effort_disclosure_header":"x-ai-router-reasoning-effort"},
             "tool_choice":{"accepted":["auto","none","required","function","allowed_tools"],"inventory":"narrowed_to_selection","missing_required_call":"error","missing_required_call_error":{"status":502,"code":"missing_required_tool_call","retry":false},"error_param":"tool_choice"},
             "stream_commit":{"after":"first_client_output","max_wait_seconds":STREAM_COMMIT_WAIT.as_secs(),"failure_before_commit":"http_error","failure_after_commit":"error_event","responses_error_event":"error_then_response.failed"},
@@ -833,10 +860,11 @@ async fn generate_body(
         .and_then(Value::as_str)
         .ok_or_else(|| ApiError::bad_request("model must be a string"))?
         .to_owned();
-    let fallback = state
-        .fallback_model(&requested)
-        .await
-        .map(|served| ModelFallback::new(&requested, &served));
+    let fallback_choice = state.fallback_model(&requested).await?;
+    let crossed = fallback_choice
+        .as_ref()
+        .is_some_and(|(_, crossed)| *crossed);
+    let fallback = fallback_choice.map(|(served, _)| ModelFallback::new(&requested, &served));
     if let Some(fallback) = &fallback {
         // The response body reports the served ID, as OpenAI does for snapshots.
         body["model"] = json!(fallback.served);
@@ -859,6 +887,20 @@ async fn generate_body(
         pinned_generation.as_deref().unwrap_or("agy")
     );
     let store_items = responses && body.get("store").and_then(Value::as_bool).unwrap_or(true);
+    // A crossed fallback serves Antigravity while the usual OpenAI target is
+    // down. Reasoning replay state from earlier OpenAI-served turns cannot be
+    // replayed there, so the outage is reported for a later retry instead.
+    if responses
+        && crossed
+        && selected == ProviderId::Agy
+        && state.items.carries_reasoning(&key.id, &body)
+    {
+        return Err(error(
+            503,
+            "provider_unavailable",
+            "The fallback target's usual provider is unavailable, and this conversation's reasoning state cannot move to another provider",
+        ));
+    }
     if responses {
         state
             .items
@@ -885,6 +927,11 @@ async fn generate_body(
         .filter(|value| !value.is_null())
         .cloned()
         .unwrap_or_else(|| json!({}));
+    // A provider call outside a narrowed or required inventory is reported
+    // against tool_choice, the field that set the narrower contract.
+    let narrowed = body
+        .get("tool_choice")
+        .is_some_and(|choice| !choice.is_null() && choice != "auto" && choice != "none");
     let id = context.id.clone();
     let mut request = if responses {
         normalize_response(body, id.clone())?
@@ -983,6 +1030,7 @@ async fn generate_body(
     let created = Utc::now().timestamp();
     if !streaming {
         while let Some(event) = run.events.recv().await {
+            let event = attribute_tool_choice(event, narrowed);
             guard.observe(&event);
             match event {
                 RunEvent::Completed(result) => {
@@ -1028,6 +1076,7 @@ async fn generate_body(
         created,
         model: model.clone(),
         metadata: metadata.clone(),
+        narrowed,
     };
     // Commit the SSE 200 only once the stream has client-visible output (a
     // delta, call or terminal result), never before the provider's Init.
@@ -1103,14 +1152,27 @@ struct StreamOutput {
     created: i64,
     model: String,
     metadata: Value,
+    narrowed: bool,
+}
+
+fn attribute_tool_choice(event: RunEvent, narrowed: bool) -> RunEvent {
+    match event {
+        RunEvent::Error(error)
+            if narrowed && error.code == "invalid_provider_tool_call" && error.param.is_none() =>
+        {
+            RunEvent::Error(error.with_param("tool_choice"))
+        }
+        event => event,
+    }
 }
 
 fn settle_stream_event(
     state: &AppState,
     guard: &mut CompletionGuard,
-    mut event: RunEvent,
+    event: RunEvent,
     out: &StreamOutput,
 ) -> RunEvent {
+    let mut event = attribute_tool_choice(event, out.narrowed);
     if let RunEvent::Completed(result) = &event {
         if let Err(error) = validate_result(result) {
             event = RunEvent::Error(error);
@@ -1184,8 +1246,9 @@ fn disclosure_headers(ignored: &[String]) -> Vec<(&'static str, String)> {
 /// 2. A fallback-served Antigravity ID with a different effort ->
 ///    `mapped=<tier>`: the client chose that effort for the model it asked for.
 ///    An exact ID's conflict is still rejected by the adapter.
-/// 3. OpenAI `minimal` that the catalogue does not list -> `mapped=<level>`,
-///    the lowest listed level above it.
+/// 3. OpenAI `none` or `minimal` that the catalogue lists levels without ->
+///    `mapped=<level>`, the lowest listed level above it. Either is forwarded
+///    when listed, or when the catalogue lists no levels for the model.
 ///
 /// Anything else reaches the provider unchanged, without the header.
 async fn apply_effort_policy(
@@ -1208,10 +1271,10 @@ async fn apply_effort_policy(
             request.effort = None;
             Some(format!("mapped={tier}"))
         }
-        ProviderId::OpenAi if effort == "minimal" => {
+        ProviderId::OpenAi if matches!(effort, "none" | "minimal") => {
             let applied = state
                 .openai
-                .minimal_effort_substitute(&request.model)
+                .effort_substitute(&request.model, effort)
                 .await?;
             request.effort = Some(applied.into());
             Some(format!("mapped={applied}"))
@@ -1580,8 +1643,20 @@ impl StreamRenderer {
                 let mut detail = e.response_body()["error"].take();
                 detail["param"] = json!(e.param);
                 if self.responses {
+                    // The terminal response keeps what the client already
+                    // received: partial text as an incomplete message, and
+                    // completed calls.
+                    let mut output = Vec::new();
+                    if self.text_started {
+                        output.push(json!({"id":format!("msg_{}",self.id),"type":"message","status":"incomplete","role":"assistant","content":[{"type":"output_text","text":self.text,"annotations":[]}]}));
+                    }
+                    output.extend(self.tool_order.iter().map(response_tool));
+                    let response = echo_metadata(
+                        json!({"id":self.id,"object":"response","created_at":self.created,"model":self.model,"status":"failed","output":output,"error":{"code":e.code,"message":e.message,"upstream_request_id":e.upstream_request_id},"usage":null}),
+                        &self.metadata,
+                    );
                     vec![self.emit("error",json!({"code":e.code,"message":e.message,"param":e.param,"error":detail})),
-                        self.emit("response.failed",json!({"response":{"id":self.id,"object":"response","created_at":self.created,"model":self.model,"status":"failed","output":[],"error":{"code":e.code,"message":e.message,"upstream_request_id":e.upstream_request_id},"usage":null}}))]
+                        self.emit("response.failed",json!({"response":response}))]
                 } else {
                     vec![
                         self.emit("error", json!({"error":detail})),
@@ -1612,6 +1687,22 @@ mod tests {
         );
         headers.insert("x-real-ip", "203.0.113.9, 198.51.100.1".parse().unwrap());
         assert_eq!(client_ip(&headers, peer, &config), peer);
+    }
+    #[test]
+    fn fallback_disclosure_marks_replaced_characters_and_truncation() {
+        let fallback = ModelFallback::new("gpt 4o\r\n\u{fc}", "gpt-6-luna");
+        assert_eq!(fallback.requested, "gpt_4o___");
+        let long = format!("gpt-{}", "x".repeat(200));
+        let fallback = ModelFallback::new(&long, "gpt-6-luna");
+        assert_eq!(fallback.requested, format!("{};truncated", &long[..128]));
+        assert!(
+            fallback
+                .requested
+                .parse::<axum::http::HeaderValue>()
+                .is_ok()
+        );
+        assert_eq!(ModelFallback::new("gpt-4o", "x").requested, "gpt-4o");
+        assert_eq!(ModelFallback::new("", "x").requested, "invalid");
     }
     #[test]
     fn missing_usage_is_null_not_fabricated_zero() {
@@ -2038,7 +2129,21 @@ mod tests {
             adjust: impl FnOnce(&mut Config),
             commit_wait: Duration,
         ) -> Self {
-            let root = tempfile::tempdir().unwrap();
+            Self::configured_in(tempfile::tempdir().unwrap(), adjust, commit_wait, 0).await
+        }
+        /// A new process over this harness's state directories, whose first
+        /// OpenAI catalogue probe uses `model_mode` (1: the probe fails).
+        async fn restart(mut self, adjust: impl FnOnce(&mut Config), model_mode: usize) -> Self {
+            let root = std::mem::replace(&mut self._root, tempfile::tempdir().unwrap());
+            drop(self);
+            Self::configured_in(root, adjust, STREAM_COMMIT_WAIT, model_mode).await
+        }
+        async fn configured_in(
+            root: tempfile::TempDir,
+            adjust: impl FnOnce(&mut Config),
+            commit_wait: Duration,
+            initial_mode: usize,
+        ) -> Self {
             let mut config = Config::for_test(root.path());
             config.openai_enabled = true;
             use sha2::{Digest, Sha256};
@@ -2054,15 +2159,20 @@ mod tests {
             adjust(&mut config);
             let config = Arc::new(config);
             let captured = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-            let model_mode = Arc::new(AtomicUsize::new(0));
+            let model_mode = Arc::new(AtomicUsize::new(initial_mode));
             let mode = model_mode.clone();
             let mock = Router::new().route("/models", get(move || {
                 let mode=mode.clone();
                 async move {
                     if mode.load(Ordering::SeqCst)==2 { tokio::time::sleep(Duration::from_secs(1)).await; }
                     if mode.load(Ordering::SeqCst)==1 { return StatusCode::SERVICE_UNAVAILABLE.into_response(); }
-                    Json(json!({"models":[{"slug":"synthetic-openai","display_name":"Synthetic OpenAI","visibility":"list",
-                        "supported_reasoning_levels":[{"effort":"low"},{"effort":"medium"},{"effort":"high"}]}]})).into_response()
+                    let mut models = vec![json!({"slug":"synthetic-openai","display_name":"Synthetic OpenAI","visibility":"list",
+                        "supported_reasoning_levels":[{"effort":"low"},{"effort":"medium"},{"effort":"high"}]})];
+                    // Mode 3 also publishes the default OpenAI fallback target.
+                    if mode.load(Ordering::SeqCst)==3 {
+                        models.push(json!({"slug":"gpt-6-luna","display_name":"Synthetic target","visibility":"list"}));
+                    }
+                    Json(json!({"models":models})).into_response()
                 }
             }))
                 .route("/responses", post(mock_openai_response))
@@ -2094,7 +2204,10 @@ mod tests {
             Arc::get_mut(&mut state).unwrap().stream_commit_wait = commit_wait;
             state.refresh_provider().await;
             assert!(state.provider.read().await.authenticated);
-            assert!(state.openai_provider.read().await.authenticated);
+            assert_eq!(
+                state.openai_provider.read().await.authenticated,
+                initial_mode != 1
+            );
             let app = router(state.clone());
             Self {
                 _root: root,

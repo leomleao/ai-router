@@ -150,6 +150,29 @@ impl ItemStore {
         Ok(())
     }
 
+    /// Whether a Responses input replays reasoning state: an inline reasoning
+    /// item, or a reference to a stored one owned by this client.
+    pub fn carries_reasoning(&self, owner: &str, body: &Value) -> bool {
+        let Some(items) = body.get("input").and_then(Value::as_array) else {
+            return false;
+        };
+        let state = self.state.lock().unwrap();
+        items.iter().any(|item| {
+            let kind = item.get("type").and_then(Value::as_str);
+            let reference = kind == Some("item_reference")
+                || (item.get("type").is_none_or(Value::is_null)
+                    && item.get("id").is_some()
+                    && item.get("role").is_none());
+            kind == Some("reasoning")
+                || (reference
+                    && item.get("id").and_then(Value::as_str).is_some_and(|id| {
+                        state.entries.iter().any(|e| {
+                            e.owner == owner && e.id == id && e.item["type"] == "reasoning"
+                        })
+                    }))
+        })
+    }
+
     pub fn resolve(&self, owner: &str, body: &mut Value, max_bytes: usize) -> Result<(), ApiError> {
         self.resolve_at(owner, body, max_bytes, Instant::now())
     }
@@ -397,5 +420,30 @@ mod tests {
             );
         }
         assert!(store.save_at("a", &output, now).is_err());
+    }
+    #[test]
+    fn reasoning_replay_detection_covers_inline_and_owned_references() {
+        let store = ItemStore::default();
+        let output = json!({"output":[{"id":"rs_1","type":"reasoning","summary":[],"encrypted_content":"synthetic-opaque"},
+            {"id":"msg_1","type":"message","role":"assistant","content":[]}]});
+        store.save_scoped("a", &output, "openai:g1").unwrap();
+        let carries =
+            |owner: &str, input: Value| store.carries_reasoning(owner, &json!({"input":input}));
+        assert!(carries("a", json!([{"type":"item_reference","id":"rs_1"}])));
+        assert!(carries("a", json!([{"id":"rs_1"}])));
+        assert!(carries(
+            "b",
+            json!([{"type":"reasoning","encrypted_content":"x","summary":[]}])
+        ));
+        assert!(!carries(
+            "b",
+            json!([{"type":"item_reference","id":"rs_1"}])
+        ));
+        assert!(!carries(
+            "a",
+            json!([{"type":"item_reference","id":"msg_1"}])
+        ));
+        assert!(!carries("a", json!([{"role":"user","content":"hi"}])));
+        assert!(!store.carries_reasoning("a", &json!({"input":"hello"})));
     }
 }

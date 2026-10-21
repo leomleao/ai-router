@@ -192,6 +192,12 @@ impl AntigravityTransport {
                     "agy_protocol_blocked",
                     "Antigravity rejected the reviewed protocol; operator review required",
                 ),
+                // Overload matches OpenAI's: a 503 that names a wait.
+                503 => ApiError::new(
+                    503,
+                    "agy_upstream_error",
+                    "Antigravity is temporarily overloaded; no retry was attempted",
+                ),
                 _ => ApiError::new(
                     502,
                     "agy_upstream_error",

@@ -106,7 +106,7 @@ impl OpenAi {
         }
         if let Some((blocked_generation, error)) = self.local_block.lock().await.as_ref() {
             if self.generation().await.as_ref().ok() == Some(blocked_generation) {
-                return Some(error.clone());
+                return Some(replayed(error));
             }
         }
         #[cfg(test)]
@@ -182,18 +182,30 @@ impl OpenAi {
         status
     }
 
-    /// The effort to send instead of `minimal`, when the discovered catalogue
-    /// lists this model's levels without it: the lowest listed level above
-    /// `minimal`. Unlisted levels are forwarded for the upstream to decide.
-    pub async fn minimal_effort_substitute(&self, model: &str) -> Option<&'static str> {
+    /// The effort to send instead of `none` or `minimal`, when the discovered
+    /// catalogue lists this model's levels without it: the lowest listed level
+    /// above it. Unlisted levels are forwarded for the upstream to decide.
+    pub async fn effort_substitute(&self, model: &str, effort: &str) -> Option<&'static str> {
+        const ORDER: [&str; 7] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
         let levels = self.reasoning_levels.lock().await;
         let levels = levels.get(model)?;
-        if levels.iter().any(|level| level == "minimal") {
+        if levels.iter().any(|level| level == effort) {
             return None;
         }
-        ["low", "medium", "high", "xhigh", "max"]
-            .into_iter()
-            .find(|effort| levels.iter().any(|level| level == effort))
+        let above = ORDER.iter().position(|level| *level == effort)? + 1;
+        ORDER[above..]
+            .iter()
+            .copied()
+            .find(|candidate| levels.iter().any(|level| level == candidate))
+    }
+    #[cfg(test)]
+    pub async fn set_reasoning_levels(&self, model: &str, levels: &[&str]) {
+        let mut catalogue = self.reasoning_levels.lock().await;
+        if levels.is_empty() {
+            catalogue.remove(model);
+        } else {
+            catalogue.insert(model.into(), levels.iter().map(|l| (*l).into()).collect());
+        }
     }
 
     async fn latch_transient(&self, generation: &str, error: &ApiError) {
@@ -993,10 +1005,27 @@ fn upstream_error(http_status: u16, value: &Value) -> ApiError {
         | "chatpass_v2_invalid_authorization_context"
         | "subscription_sharing_invalid_user" => 503,
         "subscription_sharing_unsupported_capability" => 400,
-        _ if matches!(http_status, 401 | 403) => 503,
+        // A rejected upstream credential fails every request until the
+        // operator logs in again, so clients are told not to retry.
+        _ if matches!(http_status, 401 | 403) => {
+            let mut error = failure(503, code);
+            error.durable = true;
+            return error;
+        }
         _ => http_status,
     };
     failure(status, code)
+}
+
+/// A latched failure answered locally. A transient server failure (such as a
+/// mid-stream `server_error`) replays as 503 with its own code, so it carries
+/// `retry-after` until the next catalogue probe clears it.
+fn replayed(error: &ApiError) -> ApiError {
+    let mut error = error.clone();
+    if !error.durable && !durable_restriction(&error.code) && matches!(error.status, 500..=599) {
+        error.status = 503;
+    }
+    error
 }
 
 fn durable_restriction(code: &str) -> bool {

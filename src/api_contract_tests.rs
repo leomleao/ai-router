@@ -462,7 +462,7 @@ fn header<'a>(headers: &'a axum::http::HeaderMap, name: &str) -> Option<&'a str>
 // Supabase Studio's simple endpoints (title, SQL edit, onboarding, policy)
 // send effort "none" with encrypted-reasoning include and store=false.
 #[tokio::test]
-async fn studio_effort_none_reaches_openai_and_is_disclosed_as_ignored_on_antigravity() {
+async fn studio_effort_none_follows_the_openai_catalogue_and_is_ignored_on_antigravity() {
     let harness = DualHarness::new().await;
     let tool = json!({"type":"function","name":"getSchemaDefinitions","description":"Get schema",
         "parameters":{"$schema":"http://json-schema.org/draft-07/schema#","type":"object",
@@ -477,10 +477,14 @@ async fn studio_effort_none_reaches_openai_and_is_disclosed_as_ignored_on_antigr
             let (status, headers, wire) = exchange(&harness, "/v1/responses", body).await;
             assert_eq!(status, StatusCode::OK, "{model}: {wire}");
             if model == "synthetic-openai" {
-                // OpenAI decides whether the model supports "none".
-                assert!(header(&headers, "x-ai-router-reasoning-effort").is_none());
+                // The fixture catalogue lists low/medium/high without none,
+                // so none becomes the lowest listed level, disclosed.
+                assert_eq!(
+                    header(&headers, "x-ai-router-reasoning-effort"),
+                    Some("mapped=low")
+                );
                 let upstream = harness.captured.lock().await.last().unwrap().clone();
-                assert_eq!(upstream["reasoning"], json!({"effort":"none"}));
+                assert_eq!(upstream["reasoning"], json!({"effort":"low"}));
             } else {
                 // The exact Antigravity model ID decides; no conflict error.
                 assert_eq!(
@@ -490,6 +494,53 @@ async fn studio_effort_none_reaches_openai_and_is_disclosed_as_ignored_on_antigr
             }
         }
     }
+    // none is forwarded unchanged when the catalogue lists it, or lists no
+    // levels for the model, so OpenAI decides.
+    for (levels, minimal) in [
+        (&["none", "low", "high"][..], "low"),
+        (&["minimal", "low"][..], "minimal"),
+        (&[][..], "minimal"),
+    ] {
+        harness
+            .state
+            .openai
+            .set_reasoning_levels("synthetic-openai", levels)
+            .await;
+        for path in ["/v1/chat/completions", "/v1/responses"] {
+            for (effort, sent) in [("none", None), ("minimal", Some(minimal))] {
+                let body = if path.ends_with("responses") {
+                    json!({"model":"synthetic-openai","input":"hello","reasoning":{"effort":effort}})
+                } else {
+                    json!({"model":"synthetic-openai","messages":[{"role":"user","content":"hello"}],"reasoning_effort":effort})
+                };
+                let (status, headers, wire) = exchange(&harness, path, body).await;
+                assert_eq!(status, StatusCode::OK, "{wire}");
+                let upstream = harness.captured.lock().await.last().unwrap().clone();
+                if effort == "none" && levels.first() == Some(&"minimal") {
+                    // Listed without none: the lowest listed level, minimal.
+                    assert_eq!(
+                        header(&headers, "x-ai-router-reasoning-effort"),
+                        Some("mapped=minimal")
+                    );
+                    assert_eq!(upstream["reasoning"]["effort"], "minimal");
+                    continue;
+                }
+                let applied = sent.unwrap_or(effort);
+                assert_eq!(upstream["reasoning"]["effort"], applied, "{levels:?} {effort}");
+                let disclosed = (applied != effort).then(|| format!("mapped={applied}"));
+                assert_eq!(
+                    header(&headers, "x-ai-router-reasoning-effort"),
+                    disclosed.as_deref(),
+                    "{levels:?} {effort}"
+                );
+            }
+        }
+    }
+    harness
+        .state
+        .openai
+        .set_reasoning_levels("synthetic-openai", &["low", "medium", "high"])
+        .await;
     // Chat sends reasoning_effort; minimal follows the same Antigravity rule.
     for effort in ["none", "minimal"] {
         let (status, headers, wire) = exchange(
@@ -549,7 +600,8 @@ async fn studio_effort_none_reaches_openai_and_is_disclosed_as_ignored_on_antigr
         .await;
     let effort = &capabilities["profiles"]["model"]["reasoning_effort"];
     assert_eq!(effort["agy"]["none"], "ignored");
-    assert_eq!(effort["openai"]["none"], "forwarded");
+    assert_eq!(effort["openai"]["none"], "lowest_listed_level_when_unlisted");
+    assert_eq!(effort["openai"]["unlisted_catalogue"], "forwarded");
 }
 
 #[tokio::test]
@@ -934,12 +986,42 @@ async fn unsupported_model_ids_are_served_by_disclosed_fallback_targets() {
                 .contains("conflicts with the exact model ID")
         );
     }
-    // The echoed ID is bounded and reduced to identifier characters.
-    let long = format!("gpt\u{1}\r\n{}", "x".repeat(300));
-    let served = serve(&harness, "/v1/responses", &long, json!({})).await;
-    assert_eq!(served.status, StatusCode::OK);
-    let header = served.fallback.unwrap();
-    assert_eq!(header, format!("gpt{} -> synthetic-openai", "x".repeat(125)));
+    // Invalid IDs (control characters, spaces, markup, over 128 bytes) and
+    // non-chat model families are never served as paid chat.
+    for junk in [
+        format!("gpt\u{1}\r\n{}", "x".repeat(300)),
+        "x".repeat(129),
+        "gpt 4o mini".into(),
+        "<b>gpt</b>".into(),
+    ] {
+        let served = serve(&harness, "/v1/responses", &junk, json!({})).await;
+        assert_eq!(served.status, StatusCode::BAD_REQUEST);
+        assert_eq!(served.body["error"]["code"], "model_not_found");
+        assert!(served.fallback.is_none());
+    }
+    let upstream_calls = harness.captured.lock().await.len();
+    for path in ["/v1/chat/completions", "/v1/responses"] {
+        for non_chat in [
+            "text-embedding-3-large",
+            "dall-e-3",
+            "whisper-1",
+            "omni-moderation-latest",
+            "gpt-4o-mini-transcribe",
+            "gpt-realtime",
+        ] {
+            let served = serve(&harness, path, non_chat, json!({})).await;
+            assert_eq!(served.status, StatusCode::BAD_REQUEST, "{non_chat}");
+            assert_eq!(served.body["error"]["code"], "model_not_found");
+            assert!(
+                served.body["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("chat models only")
+            );
+            assert!(served.fallback.is_none());
+        }
+    }
+    assert_eq!(harness.captured.lock().await.len(), upstream_calls);
     let (_, models) = harness
         .json(Method::GET, "/v1/models", None, Some("test-key"))
         .await;
@@ -1235,7 +1317,7 @@ fn disclosures(headers: &axum::http::HeaderMap) -> Vec<(&'static str, Vec<String
 }
 
 #[tokio::test]
-async fn studio_fallback_with_effort_none_forwards_to_openai_and_is_ignored_on_antigravity() {
+async fn studio_fallback_effort_none_follows_the_openai_catalogue_and_is_ignored_on_antigravity() {
     let harness = fallback_harness(|_| {}).await;
     for path in ["/v1/chat/completions", "/v1/responses"] {
         for streaming in [false, true] {
@@ -1246,12 +1328,13 @@ async fn studio_fallback_with_effort_none_forwards_to_openai_and_is_ignored_on_a
                 values(&headers, "x-ai-router-model-fallback"),
                 ["gpt-5.4-nano -> synthetic-openai"]
             );
-            // OpenAI receives none unchanged, so nothing is disclosed.
-            assert!(values(&headers, "x-ai-router-reasoning-effort").is_empty());
+            // The served model's catalogue lists no none, so the upstream
+            // receives its lowest listed level instead of a likely 400.
+            assert_eq!(values(&headers, "x-ai-router-reasoning-effort"), ["mapped=low"]);
             assert_eq!(values(&headers, "x-ai-router-sampling-controls"), ["ignored"]);
             let upstream = harness.captured.lock().await.last().unwrap().clone();
             assert_eq!(upstream["model"], "synthetic-openai");
-            assert_eq!(upstream["reasoning"]["effort"], "none");
+            assert_eq!(upstream["reasoning"]["effort"], "low");
             assert!(upstream.get("temperature").is_none());
             // minimal is outside the fixture catalogue, so it maps to low.
             let body = studio_body(path, "gpt-5.4-nano", "minimal", "title", streaming);
@@ -1319,12 +1402,12 @@ async fn failures_before_stream_commit_carry_retry_fallback_and_disclosure_heade
             StatusCode::TOO_MANY_REQUESTS,
             ("x-should-retry", "false"),
         ),
-        // A transient Antigravity failure is a 502 that SDKs retry by default.
+        // Antigravity overload names a wait, exactly like OpenAI's.
         (
             "gemini-9-ultra",
             "overload-fixture",
-            StatusCode::BAD_GATEWAY,
-            ("x-should-retry", ""),
+            StatusCode::SERVICE_UNAVAILABLE,
+            ("retry-after", "30"),
         ),
     ] {
         for path in ["/v1/chat/completions", "/v1/responses"] {
@@ -1463,4 +1546,282 @@ async fn missing_required_tool_call_is_not_retried_and_follows_stream_commit() {
             assert_eq!(error["error"]["param"], "tool_choice");
         }
     }
+}
+
+// T7 review findings. A known model's outage stays its own error after a
+// restart; the remembered catalogue lives in the telemetry volume.
+#[tokio::test]
+async fn known_models_keep_their_outage_after_a_restart_instead_of_falling_back() {
+    let gemini_target = |config: &mut Config| config.fallback_gemini_model = MODEL.into();
+    let harness = DualHarness::configured(gemini_target).await;
+    harness.model_mode.store(3, Ordering::SeqCst);
+    harness.state.refresh_openai().await;
+    let served = serve(&harness, "/v1/responses", "gpt-6-luna", json!({})).await;
+    assert_eq!(served.status, StatusCode::OK);
+    assert!(served.fallback.is_none());
+    // Restart while the OpenAI catalogue probe fails (models: []).
+    let harness = harness.restart(gemini_target, 1).await;
+    assert!(harness.state.openai_provider.read().await.models.is_empty());
+    for path in ["/v1/chat/completions", "/v1/responses"] {
+        for streaming in [false, true] {
+            for known in ["gpt-6-luna", "synthetic-openai"] {
+                let body = studio_body(path, known, "low", "hello", streaming);
+                let (status, headers, wire) = exchange(&harness, path, body).await;
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{known} {path}: {wire}");
+                assert!(header(&headers, "x-ai-router-model-fallback").is_none());
+                assert_eq!(header(&headers, "retry-after"), Some("30"));
+                assert!(header(&headers, "x-should-retry").is_none());
+                // provider_unavailable, refined to the provider's own latched
+                // reason when it has one: here the failed catalogue probe.
+                let error: Value = serde_json::from_str(&wire).unwrap();
+                assert_eq!(error["error"]["code"], "provider_request_failed", "{wire}");
+                assert!(!wire.contains(MODEL));
+            }
+        }
+    }
+    // IDs never seen still cross to the live Gemini target, disclosed.
+    let served = serve(&harness, "/v1/responses", "gpt-5.4-nano", json!({})).await;
+    assert_eq!(served.status, StatusCode::OK);
+    assert_eq!(served.fallback.as_deref(), Some(format!("gpt-5.4-nano -> {MODEL}").as_str()));
+}
+
+#[tokio::test]
+async fn remembered_fallback_target_reports_its_outage_when_no_target_is_live() {
+    // The Gemini target was never seen and the OpenAI target is down.
+    let harness =
+        fallback_harness(|config| config.fallback_gemini_model = "gemini-absent".into()).await;
+    harness.model_mode.store(1, Ordering::SeqCst);
+    harness.state.refresh_openai().await;
+    for path in ["/v1/chat/completions", "/v1/responses"] {
+        for streaming in [false, true] {
+            for requested in ["gpt-5.4-nano", "gemini-9-ultra"] {
+                let body = studio_body(path, requested, "low", "hello", streaming);
+                let (status, headers, wire) = exchange(&harness, path, body).await;
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{requested}: {wire}");
+                assert_eq!(
+                    values(&headers, "x-ai-router-model-fallback"),
+                    [format!("{requested} -> synthetic-openai")]
+                );
+                assert_eq!(header(&headers, "retry-after"), Some("30"));
+                assert!(header(&headers, "x-should-retry").is_none());
+                assert_ne!(
+                    serde_json::from_str::<Value>(&wire).unwrap()["error"]["code"],
+                    "model_not_found"
+                );
+            }
+        }
+    }
+    let (_, capabilities) = harness
+        .json(Method::GET, "/v1/capabilities", None, Some("test-key"))
+        .await;
+    let policy = &capabilities["profiles"]["model"]["model_fallback"];
+    assert_eq!(policy["neither_available"], "remembered_target_error");
+    assert_eq!(policy["never_seen_targets"], "model_not_found");
+    assert_eq!(policy["remembered_ids"], "persisted_across_restarts");
+}
+
+#[tokio::test]
+async fn crossed_fallback_does_not_move_reasoning_replay_to_another_provider() {
+    let harness = fallback_harness(|_| {}).await;
+    // An OpenAI-served turn stores encrypted reasoning for the client.
+    let (status, first) = harness
+        .post(
+            "/v1/responses",
+            json!({"model":"gpt-5.4-nano","input":"tools-fixture","tools":[lookup_tool(true)]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let reasoning = first["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["type"] == "reasoning")
+        .unwrap()
+        .clone();
+    harness.model_mode.store(1, Ordering::SeqCst);
+    harness.state.refresh_openai().await;
+    let upstream_calls = harness.captured.lock().await.len();
+    for input in [
+        json!([{"type":"item_reference","id":reasoning["id"]},{"role":"user","content":"next"}]),
+        json!([reasoning.clone(),{"role":"user","content":"next"}]),
+    ] {
+        for streaming in [false, true] {
+            let (status, headers, wire) = exchange(
+                &harness,
+                "/v1/responses",
+                json!({"model":"gpt-5.4-nano","input":input,"stream":streaming}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{wire}");
+            assert_eq!(
+                serde_json::from_str::<Value>(&wire).unwrap()["error"]["code"],
+                "provider_unavailable"
+            );
+            assert_eq!(header(&headers, "retry-after"), Some("30"));
+            assert_eq!(
+                values(&headers, "x-ai-router-model-fallback"),
+                [format!("gpt-5.4-nano -> {MODEL}")]
+            );
+        }
+    }
+    assert_eq!(harness.captured.lock().await.len(), upstream_calls);
+    // The same crossed fallback without reasoning state is still served.
+    let served = serve(&harness, "/v1/responses", "gpt-5.4-nano", json!({})).await;
+    assert_eq!(served.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn retry_guidance_for_credentials_latches_and_timeouts() {
+    // Upstream credential rejection is durable, also when replayed locally.
+    let harness = DualHarness::new().await;
+    for _ in 0..2 {
+        let (status, headers, wire) = exchange(
+            &harness,
+            "/v1/responses",
+            json!({"model":"synthetic-openai","input":"upstream-auth-fixture"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{wire}");
+        assert!(wire.contains("invalid_token"));
+        assert_eq!(header(&headers, "x-should-retry"), Some("false"));
+        assert!(header(&headers, "retry-after").is_none());
+    }
+    assert_eq!(harness.captured.lock().await.len(), 1);
+    // A latched mid-stream server failure replays as 503 with its own code.
+    let harness = DualHarness::new().await;
+    let (status, _, wire) = exchange(
+        &harness,
+        "/v1/responses",
+        json!({"model":"synthetic-openai","input":"midstream-fixture","stream":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{wire}");
+    assert!(wire.contains("response.failed"));
+    let (status, headers, wire) = exchange(
+        &harness,
+        "/v1/responses",
+        json!({"model":"synthetic-openai","input":"hello"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{wire}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&wire).unwrap()["error"]["code"],
+        "server_error"
+    );
+    assert_eq!(header(&headers, "retry-after"), Some("30"));
+    assert!(header(&headers, "x-should-retry").is_none());
+    // A deadline is not retried: each retry is another paid generation.
+    let harness = DualHarness::with_timeout(1).await;
+    let first = harness.state.admit_provider(ProviderId::OpenAi).await.unwrap();
+    let second = harness.state.admit_provider(ProviderId::OpenAi).await.unwrap();
+    let request = exchange(
+        &harness,
+        "/v1/chat/completions",
+        json!({"model":"synthetic-openai","messages":[{"role":"user","content":"deadline-fixture"}]}),
+    );
+    let release = async move {
+        tokio::time::sleep(Duration::from_millis(550)).await;
+        drop(first);
+        drop(second);
+    };
+    let ((status, headers, wire), ()) = tokio::join!(request, release);
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{wire}");
+    assert!(wire.contains("provider_timeout"));
+    assert_eq!(header(&headers, "x-should-retry"), Some("false"));
+    assert!(header(&headers, "retry-after").is_none());
+}
+
+#[tokio::test]
+async fn saturation_is_recorded_and_counted_by_its_error_code() {
+    let harness = DualHarness::configured(|config| {
+        config.openai_max_concurrent = 1;
+        config.openai_max_queue = 0;
+    })
+    .await;
+    let held = harness.state.admit_provider(ProviderId::OpenAi).await.unwrap();
+    let served = serve(&harness, "/v1/responses", "synthetic-openai", json!({})).await;
+    assert_eq!(served.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(served.body["error"]["code"], "busy");
+    drop(held);
+    let invalid = serve(&harness, "/v1/responses", "never-seen-model", json!({})).await;
+    assert_eq!(invalid.status, StatusCode::BAD_REQUEST);
+    let snapshot = harness.state.telemetry.snapshot().await;
+    let code = |id: &str| {
+        snapshot
+            .records
+            .iter()
+            .find(|record| record.request_id == id)
+            .and_then(|record| record.error_code.clone())
+    };
+    assert_eq!(code(&served.request_id).as_deref(), Some("busy"));
+    assert_eq!(code(&invalid.request_id).as_deref(), Some("model_not_found"));
+    let counts = &snapshot.counts_since_start;
+    assert_eq!((counts.busy, counts.input, counts.other), (1, 1, 0));
+}
+
+#[tokio::test]
+async fn failed_responses_stream_keeps_partial_output_and_metadata() {
+    let harness = DualHarness::new().await;
+    for model in ["synthetic-openai", MODEL] {
+        let response = harness
+            .send(
+                Method::POST,
+                "/v1/responses",
+                Some(json!({"model":model,"input":"midstream-fixture","stream":true,"metadata":{"thread":"synthetic"}})),
+                Some("test-key"),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let frames = frames(&read_bytes(response).await);
+        let failed = event_json(
+            frames
+                .iter()
+                .find(|frame| frame.event == "response.failed")
+                .unwrap(),
+        );
+        let response = &failed["response"];
+        assert_eq!(response["status"], "failed");
+        assert_eq!(response["metadata"], json!({"thread":"synthetic"}), "{model}");
+        let output = response["output"].as_array().unwrap();
+        assert_eq!(output.len(), 1, "{model}: {response}");
+        assert_eq!(output[0]["type"], "message");
+        assert_eq!(output[0]["status"], "incomplete");
+        assert_eq!(output[0]["content"][0]["text"], "partial ");
+    }
+}
+
+#[tokio::test]
+async fn tool_narrowing_and_metadata_errors_name_their_param() {
+    let harness = DualHarness::new().await;
+    let find = json!({"type":"function","name":"find_records","description":"Find","parameters":{"type":"object","properties":{"q":{"type":"string"}},"required":["q"],"additionalProperties":false}});
+    for streaming in [false, true] {
+        let (status, _, wire) = exchange(
+            &harness,
+            "/v1/responses",
+            json!({"model":"synthetic-openai","input":"tools-fixture","stream":streaming,"tools":[lookup_tool(true),find.clone()],
+                "tool_choice":{"type":"allowed_tools","mode":"auto","tools":[{"type":"function","name":"find_records"}]}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{wire}");
+        let error: Value = serde_json::from_str(&wire).unwrap();
+        assert_eq!(error["error"]["code"], "invalid_provider_tool_call");
+        assert_eq!(error["error"]["param"], "tool_choice");
+    }
+    // Without a narrowed choice the provider's call has no request field.
+    let (status, error) = harness
+        .post(
+            "/v1/responses",
+            json!({"model":"synthetic-openai","input":"malformed-fixture","tools":[lookup_tool(true)]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert!(error["error"].get("param").is_none());
+    let (status, error) = harness
+        .post(
+            "/v1/responses",
+            json!({"model":MODEL,"input":"hello","metadata":{"k":"v".repeat(513)}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error["error"]["param"], "metadata");
 }

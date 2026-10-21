@@ -50,6 +50,10 @@ pub struct ApiError {
     pub status: u16,
     pub code: String,
     pub message: String,
+    /// The failure repeats until an operator acts, whatever its code, such
+    /// as an upstream credential rejection. Never part of the public body.
+    #[serde(skip)]
+    pub(crate) durable: bool,
 }
 
 /// Safe metadata may be logged. Provider bodies are bounded, memory-only, and
@@ -84,6 +88,7 @@ impl ApiError {
             status,
             code: code.into(),
             message: message.into(),
+            durable: false,
         }
     }
     pub fn bad_request(message: impl Into<String>) -> Self {
@@ -164,8 +169,13 @@ impl ApiError {
     /// Retry guidance for SDKs that retry 408/409/429/5xx by default.
     /// Validation errors and deterministic failures say not to retry; other
     /// 503s name a wait. The API layer adds `retry-after` to rate limits.
+    /// A 504 deadline also says not to retry: each retry is another full
+    /// request deadline (up to 120 s) of paid generation that may time out
+    /// the same way.
     pub fn retry_header(&self) -> Option<(&'static str, &'static str)> {
-        if DETERMINISTIC_FAILURES.contains(&self.code.as_str())
+        if self.durable
+            || DETERMINISTIC_FAILURES.contains(&self.code.as_str())
+            || (self.status == 504 && self.code == "provider_timeout")
             || ((400..500).contains(&self.status) && !matches!(self.status, 408 | 409 | 429))
         {
             Some(("x-should-retry", "false"))
@@ -184,11 +194,16 @@ impl ApiError {
     }
 }
 
+/// The public error code of an error response, for monitoring and records.
+#[derive(Clone, Debug)]
+pub struct ErrorCode(pub String);
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = StatusCode::from_u16(self.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let retry = self.retry_header();
         let mut response = (status, Json(self.response_body())).into_response();
+        response.extensions_mut().insert(ErrorCode(self.code));
         if let Some((name, value)) = retry {
             response
                 .headers_mut()
@@ -913,7 +928,7 @@ fn validate_sampling_hint(field: &str, value: &Value) -> Result<(), ApiError> {
 
 /// OpenAI's limits: at most 16 string pairs, 64-byte keys, 512-byte values.
 fn validate_metadata(value: &Value) -> Result<(), ApiError> {
-    let metadata = object(value, "metadata")?;
+    let metadata = object(value, "metadata").map_err(|e| e.with_param("metadata"))?;
     if metadata.len() > 16
         || metadata
             .iter()
@@ -921,7 +936,8 @@ fn validate_metadata(value: &Value) -> Result<(), ApiError> {
     {
         return Err(ApiError::bad_request(
             "metadata must map at most 16 keys of up to 64 bytes to strings of up to 512 bytes",
-        ));
+        )
+        .with_param("metadata"));
     }
     Ok(())
 }
@@ -1733,6 +1749,9 @@ mod tests {
                 input[field] = value;
                 let error = normalize(responses)(input, "req".into()).unwrap_err();
                 assert_eq!(error.code, "invalid_request", "{field}");
+                if field == "metadata" {
+                    assert_eq!(error.param.as_deref(), Some("metadata"));
+                }
             }
         }
         // Truncation is a Responses field; only its no-op values are accepted.
