@@ -12,6 +12,35 @@ implementation baseline. Each 2026-10-21 compatibility section after the
 integration section records the run on that change's own branch, against the
 203-test `main` baseline; the integration section has the combined counts.
 
+## Noncompliant tool-call relay and structured logging (2026-10-24)
+
+Live Twenty agent turns on `gpt-6-luna` failed with `502
+invalid_provider_tool_call` on 2026-10-23, both directly after a
+`Twenty_CRM_learn_tools` result. The router recorded no diagnostics, and the
+monitor kept only the public error, so the failing check could not be proven.
+Twenty (`twenty/v2.50.0`) expects the model to sometimes call a learned tool
+directly and recovers on its side (`guide-uncallable-tool-calls-to-meta-tool.util.ts`,
+`repairToolCall` in `agent-step-loop.service.ts`), which needs the call returned.
+
+Non-strict calls to undeclared tools and non-strict schema mismatches are now
+relayed under `tool_choice` absent or `auto`; everything else still fails
+closed (see [capabilities](capabilities.md)). Every lifecycle step now logs a
+structured event, and adapter failures carry phase and reason diagnostics with
+the offending provider output kept in the monitor capture (see
+[logging](logging.md)).
+
+New fixtures replay the Twenty shape (non-strict `learn_tools`/`execute_tool`,
+a call to an undeclared `find_companies`) through OpenAI, Gemini and Claude on
+both APIs, streamed and not: the call is relayed, and its replay with a tool
+error result continues. Strict tools, a narrowed `allowed_tools` choice and
+`AI_ROUTER_TOOL_CALL_RELAY=false` keep the 502. A rejected call is retrievable
+from the monitor capture while the logged diagnostics stay value-free. The full
+Docker test stage on the rebased branch passed: 249 Rust tests (including the
+official Python SDK, n8n Vercel and LangChain, and Studio contracts over real
+TCP), monitor PTY checks and login checks. Formatting is clean; clippy reports
+only the existing warning categories. Live Twenty and live CCA acceptance of a
+replayed undeclared call were not run.
+
 ## Review fixes (T7, 2026-10-21)
 
 The independent review of `compat-integration` @ 42a9f9e found three majors and

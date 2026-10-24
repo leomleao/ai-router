@@ -218,6 +218,16 @@ impl OpenAi {
         {
             return;
         }
+        if block
+            .as_ref()
+            .is_none_or(|(_, previous)| previous.code != error.code)
+        {
+            crate::log::event(
+                "provider_latched",
+                json!({"provider":"openai","kind":"transient","status":error.status,"code":error.code,
+                    "note":"later requests fail fast until the next successful catalogue probe"}),
+            );
+        }
         *block = Some((generation.to_owned(), error.clone()));
     }
 
@@ -238,6 +248,12 @@ impl OpenAi {
                 | "subscription_sharing_invalid_user"
         ) {
             if let Some(generation) = generation {
+                crate::log::event(
+                    "provider_latched",
+                    json!({"provider":"openai","kind":"durable","status":error.status,"code":error.code,
+                        "explanation":crate::protocol::error_explanation("openai", &error.code),
+                        "note":"requests stay blocked for this account until an operator resumes it"}),
+                );
                 *self.local_block.lock().await = Some((generation.to_owned(), error.clone()));
             }
             #[cfg(test)]
@@ -369,7 +385,7 @@ impl OpenAi {
             .json(&body)
             .send()
             .await
-            .map_err(|_| failure(503, "provider_transport_error"))?;
+            .map_err(|error| transport_failure(503, "provider_transport_error", "send", &error))?;
         let status = response.status().as_u16();
         let request_id = response
             .headers()
@@ -383,7 +399,7 @@ impl OpenAi {
             let body = bounded_body(response, EVENT_LIMIT).await?;
             let mut error = self.http_error(status, &body, Some(&generation)).await;
             error.upstream_request_id = request_id;
-            return Err(error);
+            return Err(upstream_failure(error, "upstream_http", status, &body));
         }
         // The public subscription route can omit Content-Type while returning
         // SSE. Missing metadata is accepted only by the strict event decoder;
@@ -403,9 +419,19 @@ impl OpenAi {
             if serde_json::from_slice::<Value>(&body)
                 .is_ok_and(|value| value.get("error").is_some_and(|error| !error.is_null()))
             {
-                return Err(self.http_error(502, &body, Some(&generation)).await);
+                let error = self.http_error(502, &body, Some(&generation)).await;
+                return Err(upstream_failure(
+                    error,
+                    "upstream_error_body",
+                    status,
+                    &body,
+                ));
             }
-            return Err(failure(502, "invalid_provider_content_type"));
+            return Err(with_diagnostics(
+                failure(502, "invalid_provider_content_type"),
+                json!({"phase":"upstream_http","http_status":status,"body_bytes":body.len()}),
+                None,
+            ));
         }
         send(
             sender,
@@ -421,14 +447,27 @@ impl OpenAi {
         let mut bytes = 0usize;
         let mut text = String::new();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|_| failure(502, "provider_stream_interrupted"))?;
+            let chunk = chunk.map_err(|error| {
+                let mut failure =
+                    transport_failure(502, "provider_stream_interrupted", "stream", &error);
+                if let Some(diagnostics) = failure.diagnostics.as_mut() {
+                    diagnostics.metadata["bytes_received"] = json!(bytes);
+                    diagnostics.metadata["text_bytes"] = json!(text.len());
+                }
+                failure
+            })?;
             bytes = bytes.saturating_add(chunk.len());
             if bytes > self.config.max_output_bytes {
                 return Err(failure(502, "output_limit_exceeded"));
             }
             for data in decoder.push(&chunk)? {
-                let event: Value = serde_json::from_str(&data)
-                    .map_err(|_| failure(502, "invalid_provider_event"))?;
+                let event: Value = serde_json::from_str(&data).map_err(|_| {
+                    with_diagnostics(
+                        failure(502, "invalid_provider_event"),
+                        json!({"phase":"upstream_stream","reason":"event_not_json","event_bytes":data.len()}),
+                        Some(json!(data.chars().take(4096).collect::<String>())),
+                    )
+                })?;
                 match event["type"].as_str() {
                     Some("response.output_item.done") => finished_items.observe(&event)?,
                     Some("response.output_text.delta") => {
@@ -521,16 +560,26 @@ impl OpenAi {
                     }
                     Some("response.failed" | "error") => {
                         let error = event.get("response").unwrap_or(&event);
-                        let mut error = self
-                            .http_error(502, &serde_json::to_vec(error).unwrap(), Some(&generation))
-                            .await;
+                        let body = serde_json::to_vec(error).unwrap();
+                        let mut error = self.http_error(502, &body, Some(&generation)).await;
                         error.upstream_request_id = request_id;
+                        let mut error = upstream_failure(error, "upstream_stream", status, &body);
+                        if let Some(diagnostics) = error.diagnostics.as_mut() {
+                            diagnostics.metadata["event_type"] = event["type"].clone();
+                            diagnostics.metadata["text_bytes"] = json!(text.len());
+                        }
                         return Err(error);
                     }
                     // Partial function-argument events are deliberately withheld until
                     // terminal parsing and schema validation prevent unsafe handoffs.
                     Some(_) => {}
-                    None => return Err(failure(502, "invalid_provider_event")),
+                    None => {
+                        return Err(with_diagnostics(
+                            failure(502, "invalid_provider_event"),
+                            json!({"phase":"upstream_stream","reason":"event_without_type"}),
+                            Some(event),
+                        ));
+                    }
                 }
             }
         }
@@ -875,25 +924,34 @@ fn parse_result(
                     .filter(|s| {
                         !s.is_empty() && s.len() <= 256 && s.bytes().all(|b| b.is_ascii_graphic())
                     })
-                    .ok_or_else(|| failure(502, "invalid_provider_tool_call"))?;
+                    .ok_or_else(|| tool_failure("invalid_call_id", item, None))?;
                 if !ids.insert(id) {
-                    return Err(failure(502, "invalid_provider_tool_call"));
+                    return Err(tool_failure("duplicate_call_id", item, None));
                 }
-                let name = item["name"].as_str().unwrap_or("");
                 if item.get("status").is_some_and(|s| s != "completed") {
-                    return Err(failure(502, "invalid_provider_tool_call"));
-                }
-                if !request.tools.iter().any(|t| t.name == name) {
-                    return Err(failure(502, "invalid_provider_tool_call"));
+                    return Err(tool_failure("call_not_completed", item, None));
                 }
                 let args: Value = serde_json::from_str(item["arguments"].as_str().unwrap_or(""))
-                    .map_err(|_| failure(502, "invalid_provider_tool_call"))?;
-                crate::tool_diagnostics::validate_call(&request.tools, item.get("name"), &args)
-                    .map_err(|_| failure(502, "invalid_provider_tool_call"))?;
+                    .map_err(|_| tool_failure("arguments_not_json", item, None))?;
+                let relayed = crate::tool_diagnostics::admit_call(
+                    &request.tools,
+                    item.get("name"),
+                    &args,
+                    request.tool_relay,
+                )
+                .map_err(|rejection| {
+                    tool_failure(
+                        rejection.reason(),
+                        item,
+                        serde_json::to_value(&rejection).ok(),
+                    )
+                })?;
                 calls.push(ToolCall {
                     id: id.into(),
-                    name: name.into(),
+                    // admit_call only admits identifier-shaped names.
+                    name: item["name"].as_str().unwrap_or_default().into(),
                     arguments: args,
+                    relayed,
                 });
             }
             Some("function_call") => {} // Never hand off incomplete arguments.
@@ -910,11 +968,21 @@ fn parse_result(
         }
     }
     if !request.parallel_tool_calls && calls.len() > 1 {
-        return Err(failure(502, "invalid_provider_tool_call"));
+        return Err(with_diagnostics(
+            failure(502, "invalid_provider_tool_call"),
+            json!({"phase":"tool_validation","reason":"parallel_calls_not_permitted",
+                "call_count":calls.len(),"tool_names":calls.iter().map(|c| c.name.as_str()).collect::<Vec<_>>()}),
+            None,
+        ));
     }
     if request.tool_required && calls.is_empty() {
         // The unmet field, as for tool_choice validation errors.
-        return Err(failure(502, "missing_required_tool_call").with_param("tool_choice"));
+        return Err(with_diagnostics(
+            failure(502, "missing_required_tool_call").with_param("tool_choice"),
+            json!({"phase":"tool_validation","reason":"no_call_returned",
+                "text_bytes":text.len().max(streamed_text.len()),"output_item_types":crate::log::kinds(output, "type", "missing")}),
+            None,
+        ));
     }
     if text.is_empty() && !streamed_text.is_empty() {
         text = streamed_text.into();
@@ -923,15 +991,41 @@ fn parse_result(
         return Err(failure(502, "inconsistent_provider_output"));
     }
     let structured_output = if let Some(schema) = &request.schema {
+        // The withheld text is model output, kept only in the memory-only
+        // monitor capture; logs carry its size and value-free schema errors.
+        let output_failure = |code: &str, reason: &str, extra: Value| {
+            let mut metadata = json!({"phase":"structured_output","reason":reason,
+                "status":status,"text_bytes":text.len()});
+            if let (Some(metadata), Value::Object(extra)) = (metadata.as_object_mut(), extra) {
+                metadata.extend(extra);
+            }
+            with_diagnostics(failure(502, code), metadata, Some(json!(text)))
+        };
         if status != "completed" {
-            return Err(failure(502, "incomplete_structured_output"));
+            return Err(output_failure(
+                "incomplete_structured_output",
+                "provider_incomplete",
+                json!({}),
+            ));
         }
-        let value: Value =
-            serde_json::from_str(&text).map_err(|_| failure(502, "invalid_structured_output"))?;
+        let value: Value = serde_json::from_str(&text).map_err(|error| {
+            output_failure(
+                "invalid_structured_output",
+                "not_json",
+                json!({"json_error_line":error.line(),"json_error_column":error.column(),
+                    "markdown_fenced":text.trim_start().starts_with("```")}),
+            )
+        })?;
         let validator =
             jsonschema::validator_for(schema).map_err(|_| failure(500, "invalid_schema"))?;
-        if !validator.is_valid(&value) {
-            return Err(failure(502, "invalid_structured_output"));
+        let (errors, truncated) =
+            crate::tool_diagnostics::schema_errors(schema, &validator, &value);
+        if !errors.is_empty() {
+            return Err(output_failure(
+                "invalid_structured_output",
+                "schema_mismatch",
+                json!({"validation_errors":errors,"validation_errors_truncated":truncated}),
+            ));
         }
         Some(value)
     } else {
@@ -1049,6 +1143,95 @@ fn transient_availability(error: &ApiError) -> bool {
     ) || (error.code == "provider_request_failed" && matches!(error.status, 401 | 403 | 503))
 }
 
+/// Value-free classification of a reqwest failure for logs.
+fn transport_failure(status: u16, code: &str, stage: &str, error: &reqwest::Error) -> ApiError {
+    let kind = if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else if error.is_body() {
+        "body"
+    } else if error.is_decode() {
+        "decode"
+    } else if error.is_request() {
+        "request"
+    } else {
+        "other"
+    };
+    with_diagnostics(
+        failure(status, code),
+        json!({"phase":"upstream_transport","stage":stage,"kind":kind}),
+        None,
+    )
+}
+
+/// Attach the upstream error's identifiers to logs and its body to the
+/// memory-only monitor capture. The public error body is unchanged.
+fn upstream_failure(mut error: ApiError, phase: &str, http_status: u16, body: &[u8]) -> ApiError {
+    let value = serde_json::from_slice::<Value>(body).unwrap_or(Value::Null);
+    let field = |pointer: &str| {
+        value
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .filter(|s| {
+                s.len() <= 96
+                    && s.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+            })
+            .map(str::to_owned)
+    };
+    let metadata = json!({"phase":phase,"http_status":http_status,"body_bytes":body.len(),
+        "upstream_code":field("/error/code").or_else(|| field("/code")),
+        "upstream_type":field("/error/type").or_else(|| field("/type")),
+        "upstream_param":field("/error/param"),
+        "upstream_status":field("/status")});
+    let private_body = if value.is_null() {
+        json!(String::from_utf8_lossy(&body[..body.len().min(4096)]))
+    } else {
+        value
+    };
+    if error.diagnostics.is_none() {
+        error.diagnostics = Some(crate::protocol::FailureDiagnostics {
+            metadata,
+            private_body: Some(private_body),
+        });
+    }
+    error
+}
+
+fn with_diagnostics(mut error: ApiError, metadata: Value, private_body: Option<Value>) -> ApiError {
+    error.diagnostics = Some(crate::protocol::FailureDiagnostics {
+        metadata,
+        private_body,
+    });
+    error
+}
+
+/// A rejected provider tool call. Logs get the reason and value-free metadata;
+/// the offending item itself is kept only in the memory-only monitor capture,
+/// so the exact model output behind a failure can be inspected there.
+fn tool_failure(reason: &str, item: &Value, validation: Option<Value>) -> ApiError {
+    let name = item["name"].as_str().map(|name| {
+        if crate::config::valid_identifier(name) {
+            name.to_owned()
+        } else {
+            format!("[invalid name, {} bytes]", name.len())
+        }
+    });
+    let mut metadata = json!({"phase":"tool_validation","reason":reason,"provider_item":{
+        "name":name,"status":item["status"].as_str().map(|s| s.chars().take(32).collect::<String>()),
+        "call_id_present":item.get("call_id").is_some_and(|id| !id.is_null()),
+        "arguments_bytes":item["arguments"].as_str().map(str::len)}});
+    if let Some(validation) = validation {
+        metadata["validation"] = validation;
+    }
+    with_diagnostics(
+        failure(502, "invalid_provider_tool_call"),
+        metadata,
+        Some(item.clone()),
+    )
+}
+
 fn failure(status: u16, code: &str) -> ApiError {
     ApiError::new(
         status,
@@ -1111,6 +1294,7 @@ mod tests {
             name: "lookup".into(),
             description: "Find".into(),
             parameters: json!({"type":"object","properties":{"q":{"type":"string"}},"required":["q"],"additionalProperties":false}),
+            strict: false,
         }];
         let body = serialize(&req).unwrap();
         assert_eq!(
@@ -1172,15 +1356,71 @@ mod tests {
             name: "lookup".into(),
             description: String::new(),
             parameters: json!({"type":"object","required":["q"],"properties":{"q":{"type":"string"}}}),
+            strict: false,
         }];
         let mut terminal = json!({"id":"synthetic","status":"completed","output":[{"type":"function_call","call_id":"c1","name":"lookup","arguments":"{\"q\":\"yes\"}"},{"type":"function_call","call_id":"c2","name":"lookup","arguments":"{\"q\":\"two\"}"}],"usage":{"input_tokens":10,"output_tokens":20,"total_tokens":30,"output_tokens_details":{"reasoning_tokens":12}}});
         let result = parse_result(&req, &terminal, "").unwrap();
         assert_eq!(result.tool_calls.len(), 2);
         assert_eq!(result.usage.unwrap().total_tokens, 30);
+        // Non-strict tools under tool_choice auto: noncompliant calls are
+        // relayed with sanitized diagnostics, as OpenAI returns them.
         terminal["output"][0]["arguments"] = json!("{\"q\":12}");
-        assert!(parse_result(&req, &terminal, "").is_err());
+        let relayed = parse_result(&req, &terminal, "").unwrap().tool_calls;
+        assert_eq!(
+            relayed[0].relayed.as_ref().unwrap()["reason"],
+            "schema_mismatch"
+        );
+        assert_eq!(relayed[0].arguments, json!({"q":12}));
+        assert!(relayed[1].relayed.is_none());
         terminal["output"][0]["name"] = json!("undeclared");
+        let relayed = parse_result(&req, &terminal, "").unwrap().tool_calls;
+        assert_eq!(relayed[0].name, "undeclared");
+        assert_eq!(
+            relayed[0].relayed.as_ref().unwrap()["reason"],
+            "unknown_tool"
+        );
+        // Without relay (a constrained tool_choice) both fail closed.
+        req.tool_relay = false;
         assert!(parse_result(&req, &terminal, "").is_err());
+        terminal["output"][0]["name"] = json!("lookup");
+        assert!(parse_result(&req, &terminal, "").is_err());
+        // A strict tool is always validated, and a strict inventory never
+        // relays an undeclared tool.
+        req.tool_relay = true;
+        req.tools[0].strict = true;
+        let error = parse_result(&req, &terminal, "").unwrap_err();
+        let details = error.diagnostics.unwrap();
+        assert_eq!(details.metadata["reason"], "schema_mismatch");
+        assert_eq!(details.metadata["provider_item"]["name"], "lookup");
+        assert_eq!(details.metadata["provider_item"]["arguments_bytes"], 8);
+        assert!(!details.metadata.to_string().contains("12"));
+        assert_eq!(details.private_body.unwrap(), terminal["output"][0]);
+        terminal["output"][0]["name"] = json!("undeclared");
+        assert_eq!(
+            parse_result(&req, &terminal, "")
+                .unwrap_err()
+                .diagnostics
+                .unwrap()
+                .metadata["reason"],
+            "unknown_tool"
+        );
+        // Malformed calls never relay.
+        req.tools[0].strict = false;
+        for (field, value, reason) in [
+            ("arguments", json!("{not json"), "arguments_not_json"),
+            ("arguments", json!("[1]"), "arguments_not_object"),
+            ("name", json!("bad name"), "invalid_tool_name"),
+        ] {
+            let mut item = terminal.clone();
+            item["output"][0]["name"] = json!("lookup");
+            item["output"][0][field] = value;
+            let error = parse_result(&req, &item, "").unwrap_err();
+            assert_eq!(
+                error.diagnostics.unwrap().metadata["reason"],
+                reason,
+                "{field}"
+            );
+        }
     }
     #[test]
     fn required_tool_choice_is_forwarded_and_text_alone_fails_closed() {
@@ -1189,6 +1429,7 @@ mod tests {
             name: "lookup".into(),
             description: String::new(),
             parameters: json!({"type":"object","required":["q"],"properties":{"q":{"type":"string"}}}),
+            strict: false,
         }];
         assert!(serialize(&req).unwrap().get("tool_choice").is_none());
         req.tool_required = true;
@@ -1834,6 +2075,7 @@ mod tests {
             name: "lookup".into(),
             description: String::new(),
             parameters: json!({"type":"object","properties":{"q":{"type":"string"}},"required":["q"],"additionalProperties":false}),
+            strict: false,
         }];
         request
     }
@@ -1903,9 +2145,13 @@ mod tests {
                 json!({"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"missing-id"}}),
             ) + &completed,
         ];
+        // The schema mismatch fails closed only for a strict tool; the
+        // structural conflicts below fail for any tool.
+        let mut strict = tool_request();
+        strict.tools[0].strict = true;
         for data in cases {
             let (_root, provider, _captured, task) = mock_provider(data, 200, 1024 * 1024).await;
-            let events = collect(&provider, tool_request()).await;
+            let events = collect(&provider, strict.clone()).await;
             assert!(
                 events
                     .iter()
@@ -1918,6 +2164,44 @@ mod tests {
             );
             task.abort();
         }
+    }
+    #[tokio::test]
+    async fn mock_http_non_strict_noncompliant_calls_are_relayed_with_diagnostics() {
+        let completed = wire(
+            json!({"type":"response.completed","response":{"status":"completed","output":[]}}),
+        );
+        let mut undeclared = done_tool("{\"query\":\"acme\"}");
+        undeclared["name"] = json!("find_companies");
+        let data = wire(done_item(0, done_tool("{\"q\":12}")))
+            + &wire(done_item(1, {
+                let mut call = undeclared.clone();
+                call["call_id"] = json!("call_undeclared");
+                call["id"] = json!("fc_undeclared");
+                call
+            }))
+            + &completed;
+        let (_root, provider, _captured, task) = mock_provider(data, 200, 1024 * 1024).await;
+        let events = collect(&provider, tool_request()).await;
+        let calls: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                RunEvent::ToolCall(call) => Some(call.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 2, "{events:?}");
+        assert_eq!(
+            calls[0].relayed.as_ref().unwrap()["reason"],
+            "schema_mismatch"
+        );
+        assert_eq!(calls[1].name, "find_companies");
+        assert_eq!(calls[1].relayed.as_ref().unwrap()["reason"], "unknown_tool");
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, RunEvent::Completed(_)))
+        );
+        task.abort();
     }
     #[tokio::test]
     async fn mock_http_partial_or_incomplete_tool_streams_never_handoff() {

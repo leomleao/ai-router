@@ -30,7 +30,10 @@ restarts (in the telemetry volume) and keep returning their own 503 with retry
 guidance. Only a never-served chat model ID's fallback target can change; with
 no target live, a remembered target's 503 is returned, and `model_not_found`
 only when neither target has ever been seen. Client tools are returned to the client after schema validation; the
-client executes them and sends results in later history. Forced (`required`),
+client executes them and sends results in later history. Under `tool_choice`
+`auto`, a call to an undeclared tool or with mismatched arguments is still
+returned when the tools are not `strict`, as OpenAI does, so agent clients can
+recover. Structured logs are described in [logging](docs/logging.md). Forced (`required`),
 named and `allowed_tools` choices narrow the tool inventory and fail closed when
 the model answers without a call. Media input and native execution are not supported.
 

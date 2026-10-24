@@ -38,6 +38,9 @@ pub struct Config {
     pub retention_days: u64,
     pub max_events: usize,
     pub model_fallback: bool,
+    /// Hand noncompliant calls to non-strict tools back to the client
+    /// (AI_ROUTER_TOOL_CALL_RELAY, default true) instead of failing closed.
+    pub tool_call_relay: bool,
     pub fallback_openai_model: String,
     pub fallback_gemini_model: String,
 }
@@ -79,6 +82,11 @@ impl Config {
             "true" => true,
             "false" => false,
             _ => return Err("AI_ROUTER_MODEL_FALLBACK must be true or false".to_owned()),
+        };
+        let tool_call_relay = match value("AI_ROUTER_TOOL_CALL_RELAY", "true")?.as_str() {
+            "true" => true,
+            "false" => false,
+            _ => return Err("AI_ROUTER_TOOL_CALL_RELAY must be true or false".to_owned()),
         };
         let fallback_openai_model = value("AI_ROUTER_FALLBACK_OPENAI_MODEL", "gpt-6-luna")?;
         let fallback_gemini_model =
@@ -135,6 +143,7 @@ impl Config {
             retention_days: number!("AI_ROUTER_RETENTION_DAYS", "30"),
             max_events: number!("AI_ROUTER_MAX_EVENTS", "50000"),
             model_fallback,
+            tool_call_relay,
             fallback_openai_model,
             fallback_gemini_model,
         };
@@ -269,6 +278,7 @@ impl Config {
             retention_days: 30,
             max_events: 50000,
             model_fallback: true,
+            tool_call_relay: true,
             fallback_openai_model: "gpt-6-luna".to_owned(),
             fallback_gemini_model: "gemini-3.8-flash-medium".to_owned(),
         }
@@ -411,6 +421,12 @@ mod tests {
                 .unwrap()
                 .model_fallback
         );
+        assert!(config.tool_call_relay);
+        assert!(
+            !config_with("AI_ROUTER_TOOL_CALL_RELAY", "false")
+                .unwrap()
+                .tool_call_relay
+        );
     }
     #[test]
     fn rejects_invalid_paths_limits_and_public_key_metadata() {
@@ -430,6 +446,7 @@ mod tests {
             ("AI_ROUTER_ANTIGRAVITY_ENABLED", "yes"),
             ("AI_ROUTER_TRUSTED_PROXIES", "10.0.0.0/8"),
             ("AI_ROUTER_MODEL_FALLBACK", "yes"),
+            ("AI_ROUTER_TOOL_CALL_RELAY", "yes"),
             ("AI_ROUTER_FALLBACK_OPENAI_MODEL", ""),
             ("AI_ROUTER_FALLBACK_OPENAI_MODEL", "gpt 6"),
             ("AI_ROUTER_FALLBACK_GEMINI_MODEL", "gemini/../x"),

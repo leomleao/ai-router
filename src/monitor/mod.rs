@@ -811,6 +811,8 @@ pub struct MonitorArgs {
     pub json: bool,
     pub text: bool,
     pub range_seconds: u64,
+    /// Print one retained request/response capture as JSON and exit.
+    pub detail: Option<String>,
 }
 
 async fn get_detail(socket: &Path, id: &str) -> Result<Option<RequestDetail>, String> {
@@ -972,6 +974,16 @@ fn fmt_metric(value: Option<u64>) -> String {
 }
 
 pub async fn client(socket: &Path, args: MonitorArgs) -> Result<(), String> {
+    if let Some(id) = &args.detail {
+        let detail = get_detail(socket, id)
+            .await?
+            .ok_or("No retained capture for that request ID; captures are memory-only and keep the latest 100 requests")?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&detail).map_err(|_| "cannot encode request detail")?
+        );
+        return Ok(());
+    }
     let interactive = !args.json
         && !args.text
         && std::io::stdin().is_terminal()

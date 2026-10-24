@@ -1808,10 +1808,13 @@ async fn tool_narrowing_and_metadata_errors_name_their_param() {
         assert_eq!(error["error"]["param"], "tool_choice");
     }
     // Without a narrowed choice the provider's call has no request field.
+    // (A non-strict tool would relay the call, so the tool is strict here.)
+    let mut strict = lookup_tool(true);
+    strict["strict"] = json!(true);
     let (status, error) = harness
         .post(
             "/v1/responses",
-            json!({"model":"synthetic-openai","input":"malformed-fixture","tools":[lookup_tool(true)]}),
+            json!({"model":"synthetic-openai","input":"malformed-fixture","tools":[strict]}),
         )
         .await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
@@ -1824,4 +1827,188 @@ async fn tool_narrowing_and_metadata_errors_name_their_param() {
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(error["error"]["param"], "metadata");
+}
+
+// Twenty's agent declares non-strict tools plus learn_tools/execute_tool
+// meta-tools. After learn_tools returns another tool's schema, the model may
+// call that tool directly. OpenAI returns such a call for non-strict tools and
+// Twenty answers it with a tool error that steers the model to execute_tool;
+// the router relays it instead of failing the turn with a 502.
+fn twenty_tools(responses: bool, strict: bool) -> Value {
+    let tools = [
+        ("learn_tools", json!({"type":"object","properties":{"toolNames":{"type":"array","items":{"type":"string"}}},"required":["toolNames"]})),
+        ("execute_tool", json!({"type":"object","properties":{"toolName":{"type":"string"},"arguments":{"type":"object"}},"required":["toolName"]})),
+    ];
+    json!(tools
+        .iter()
+        .map(|(name, parameters)| {
+            let function = json!({"name":name,"description":"meta tool","parameters":parameters,"strict":strict});
+            if responses {
+                let mut tool = function;
+                tool["type"] = json!("function");
+                tool
+            } else {
+                json!({"type":"function","function":function})
+            }
+        })
+        .collect::<Vec<_>>())
+}
+
+fn undeclared_call(responses: bool, wire: &str, streaming: bool) -> (String, String) {
+    let calls: Vec<Value> = if streaming {
+        frames(wire.as_bytes())
+            .iter()
+            .filter(|frame| frame.data != "[DONE]")
+            .map(event_json)
+            .flat_map(|event| {
+                if responses {
+                    (event["type"] == "response.output_item.done"
+                        && event["item"]["type"] == "function_call")
+                        .then(|| event["item"].clone())
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                } else {
+                    event["choices"][0]["delta"]["tool_calls"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                }
+            })
+            .collect()
+    } else {
+        let body: Value = serde_json::from_str(wire).unwrap();
+        if responses {
+            body["output"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|item| item["type"] == "function_call")
+                .cloned()
+                .collect()
+        } else {
+            body["choices"][0]["message"]["tool_calls"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        }
+    };
+    assert_eq!(calls.len(), 1, "{wire}");
+    let call = &calls[0];
+    if responses {
+        assert_eq!(call["name"], "find_companies", "{wire}");
+        assert_eq!(serde_json::from_str::<Value>(call["arguments"].as_str().unwrap()).unwrap(), json!({"query":"acme"}));
+        (call["call_id"].as_str().unwrap().into(), call["arguments"].as_str().unwrap().into())
+    } else {
+        assert_eq!(call["function"]["name"], "find_companies", "{wire}");
+        (call["id"].as_str().unwrap().into(), call["function"]["arguments"].as_str().unwrap().into())
+    }
+}
+
+#[tokio::test]
+async fn non_strict_calls_to_undeclared_tools_are_relayed_and_replayable() {
+    let harness = DualHarness::new().await;
+    for model in ["synthetic-openai", MODEL, "claude-sonnet-5-5-high"] {
+        for responses in [false, true] {
+            for streaming in [false, true] {
+                let path = if responses { "/v1/responses" } else { "/v1/chat/completions" };
+                let prompt = "undeclared-tool-fixture";
+                let body = if responses {
+                    json!({"model":model,"input":prompt,"stream":streaming,"tools":twenty_tools(true, false)})
+                } else {
+                    json!({"model":model,"messages":[{"role":"user","content":prompt}],"stream":streaming,"tools":twenty_tools(false, false)})
+                };
+                let (status, _, wire) = exchange(&harness, path, body).await;
+                assert_eq!(status, StatusCode::OK, "{model} {path} {streaming}: {wire}");
+                let (call_id, arguments) = undeclared_call(responses, &wire, streaming);
+                // Twenty answers with a tool error; the history replays the
+                // undeclared call and its result without rejection.
+                let guidance = "\"find_companies\" is not directly callable. Use execute_tool.";
+                let body = if responses {
+                    json!({"model":model,"store":false,"tools":twenty_tools(true, false),"input":[
+                        {"role":"user","content":prompt},
+                        {"type":"function_call","call_id":call_id,"name":"find_companies","arguments":arguments},
+                        {"type":"function_call_output","call_id":call_id,"output":guidance}]})
+                } else {
+                    json!({"model":model,"tools":twenty_tools(false, false),"messages":[
+                        {"role":"user","content":prompt},
+                        {"role":"assistant","content":null,"tool_calls":[{"id":call_id,"type":"function","function":{"name":"find_companies","arguments":arguments}}]},
+                        {"role":"tool","tool_call_id":call_id,"content":guidance}]})
+                };
+                let (status, _, wire) = exchange(&harness, path, body).await;
+                assert_eq!(status, StatusCode::OK, "{model} {path} continuation: {wire}");
+                assert!(wire.contains("tool results accepted"), "{wire}");
+            }
+            // A strict tool or a constrained tool_choice keeps fail-closed
+            // validation, so the same provider call is a 502.
+            let narrowed = if responses {
+                json!({"type":"allowed_tools","mode":"auto","tools":[{"type":"function","name":"learn_tools"}]})
+            } else {
+                json!({"type":"allowed_tools","allowed_tools":{"mode":"auto","tools":[{"type":"function","function":{"name":"learn_tools"}}]}})
+            };
+            for (strict, choice) in [(true, Value::Null), (false, narrowed)] {
+                let path = if responses { "/v1/responses" } else { "/v1/chat/completions" };
+                let mut body = if responses {
+                    json!({"model":model,"input":"undeclared-tool-fixture","tools":twenty_tools(true, strict)})
+                } else {
+                    json!({"model":model,"messages":[{"role":"user","content":"undeclared-tool-fixture"}],"tools":twenty_tools(false, strict)})
+                };
+                if !choice.is_null() {
+                    body["tool_choice"] = choice.clone();
+                }
+                let (status, _, wire) = exchange(&harness, path, body).await;
+                assert_eq!(status, StatusCode::BAD_GATEWAY, "{model} {path} {strict} {choice}: {wire}");
+                assert!(wire.contains("invalid_provider_tool_call"), "{wire}");
+            }
+        }
+    }
+    let (_, capabilities) = harness.json(Method::GET, "/v1/capabilities", None, Some("test-key")).await;
+    let relay = &capabilities["profiles"]["model"]["tool_call_relay"];
+    assert_eq!(relay["enabled"], true);
+    assert_eq!(relay["applies_to"], "tool_choice_absent_or_auto");
+    let disabled = DualHarness::configured(|config| config.tool_call_relay = false).await;
+    let (_, capabilities) = disabled.json(Method::GET, "/v1/capabilities", None, Some("test-key")).await;
+    assert_eq!(capabilities["profiles"]["model"]["tool_call_relay"]["enabled"], false);
+    let (status, _, wire) = exchange(
+        &disabled,
+        "/v1/responses",
+        json!({"model":"synthetic-openai","input":"undeclared-tool-fixture","tools":twenty_tools(true, false)}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{wire}");
+}
+
+// A failed tool call keeps the model's exact call in the memory-only monitor
+// capture, while the logged diagnostics stay value-free.
+#[tokio::test]
+async fn rejected_tool_calls_are_inspectable_in_the_monitor_capture() {
+    let harness = DualHarness::new().await;
+    let response = harness
+        .send(
+            Method::POST,
+            "/v1/responses",
+            Some(json!({"model":"synthetic-openai","input":"undeclared-tool-fixture","tools":twenty_tools(true, true)})),
+            Some("test-key"),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let id = response.headers()["x-request-id"].to_str().unwrap().to_owned();
+    let mut detail = None;
+    for _ in 0..50 {
+        detail = harness
+            .state
+            .telemetry
+            .request_detail(&id)
+            .await
+            .and_then(|detail| detail.response);
+        if detail.as_ref().is_some_and(|d| d.json.contains("diagnostics")) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let captured: Value = serde_json::from_str(&detail.unwrap().json).unwrap();
+    assert_eq!(captured["diagnostics"]["reason"], "unknown_tool");
+    assert_eq!(captured["diagnostics"]["provider_item"]["name"], "find_companies");
+    assert!(!captured["diagnostics"].to_string().contains("acme"));
+    assert_eq!(captured["upstream_response"]["name"], "find_companies");
+    assert!(captured["upstream_response"]["arguments"].as_str().unwrap().contains("acme"));
 }

@@ -109,6 +109,7 @@ fn history_call(value: &Value, responses: bool) -> Result<ToolCall, ApiError> {
         id: id.to_owned(),
         name: name.to_owned(),
         arguments,
+        relayed: None,
     })
 }
 
@@ -899,16 +900,20 @@ impl Decoder {
                 return Err(invalid_tool("unexpected_function_call_fields"));
             }
             let arguments = call.get("args").cloned().unwrap_or_else(|| json!({}));
-            crate::tool_diagnostics::validate_call(
+            let relayed = crate::tool_diagnostics::admit_call(
                 &self.request.tools,
                 call.get("name"),
                 &arguments,
+                self.request.tool_relay,
             )
             .map_err(|rejection| {
                 let mut error = invalid("invalid_provider_tool_call");
-                error.diagnostics = Some(crate::protocol::FailureDiagnostics::metadata(
-                    json!({"phase":"tool_validation","validation":rejection}),
-                ));
+                // The offending call stays in the memory-only monitor capture.
+                error.diagnostics = Some(crate::protocol::FailureDiagnostics {
+                    metadata: json!({"phase":"tool_validation","reason":rejection.reason(),
+                        "validation":rejection}),
+                    private_body: Some(part.clone()),
+                });
                 error
             })?;
             let name = call["name"].as_str().expect("validated client tool name");
@@ -937,6 +942,7 @@ impl Decoder {
                 id,
                 name: name.to_owned(),
                 arguments,
+                relayed,
             });
         } else if let Some(text) = part.get("text") {
             let text = text
@@ -1387,7 +1393,27 @@ mod tests {
 
     #[test]
     fn unknown_disabled_duplicate_and_invalid_tool_calls_fail() {
-        let request = tools_request();
+        let mut request = tools_request();
+        // A non-strict inventory under tool_choice auto relays an undeclared
+        // tool or a schema mismatch, and records why.
+        for (parts, reason) in [
+            (
+                json!([{"functionCall":{"name":"unknown","args":{}}}]),
+                "unknown_tool",
+            ),
+            (
+                json!([{"functionCall":{"name":"weather","args":{"city":1}}}]),
+                "schema_mismatch",
+            ),
+        ] {
+            let decoded = decode(&request, &terminal(parts)).unwrap();
+            assert_eq!(
+                decoded.tool_calls[0].relayed.as_ref().unwrap()["reason"],
+                reason
+            );
+        }
+        // Strict tools are always validated; malformed calls never relay.
+        request.tools[0].strict = true;
         for parts in [
             json!([{"functionCall":{"name":"unknown","args":{}}}]),
             json!([{"functionCall":{"name":"weather","args":{"city":1}}}]),
@@ -1408,6 +1434,7 @@ mod tests {
     #[test]
     fn projected_tool_schema_still_enforces_original_constraints_and_reports_safe_rejections() {
         let mut request = tools_request();
+        request.tools[0].strict = true;
         request.tools[0].parameters = json!({"$schema":"http://json-schema.org/draft-07/schema#","type":"object",
             "$defs":{"City":{"type":"string","const":"London"}},"properties":{"city":{"$ref":"#/$defs/City"}},
             "required":["city"],"additionalProperties":false});
@@ -1450,6 +1477,7 @@ mod tests {
     #[test]
     fn mixed_node_type_items_have_valid_wire_hints_and_keep_both_client_branches() {
         let mut request = tools_request();
+        request.tools[0].strict = true;
         request.tools[0].name = "nodes".into();
         request.tools[0].parameters = json!({"type":"object",
             "properties":{"nodeTypes":{"type":"array","items":{"anyOf":[

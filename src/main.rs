@@ -57,6 +57,7 @@ async fn run() -> Result<(), String> {
                 json: false,
                 text: false,
                 range_seconds: 86400,
+                detail: None,
             };
             let mut i = 1;
             while i < args.len() {
@@ -68,9 +69,13 @@ async fn run() -> Result<(), String> {
                         options.range_seconds =
                             parse_range(args.get(i).ok_or("Missing monitor range")?)?;
                     }
+                    "--detail" => {
+                        i += 1;
+                        options.detail = Some(args.get(i).ok_or("Missing request ID")?.to_owned());
+                    }
                     _ => {
                         return Err(
-                            "Usage: ai-router monitor [--json|--text] [--range 24h|1h|seconds]"
+                            "Usage: ai-router monitor [--json|--text] [--range 24h|1h|seconds] [--detail <request-id>]"
                                 .into(),
                         );
                     }
@@ -90,7 +95,7 @@ async fn run() -> Result<(), String> {
         }
         "--help" | "-h" => {
             println!(
-                "ai-router serve | openai login|logout|status|accounts|select|resume | keygen <id> [model] | monitor [--json|--text] [--range 24h] | antigravity login|status|logout|resume"
+                "ai-router serve | openai login|logout|status|accounts|select|resume | keygen <id> [model] | monitor [--json|--text] [--range 24h] [--detail <request-id>] | antigravity login|status|logout|resume"
             );
             return Ok(());
         }

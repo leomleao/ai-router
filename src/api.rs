@@ -116,6 +116,7 @@ impl AppState {
             .lock()
             .unwrap()
             .remember(ProviderId::Agy, &status);
+        log_status_change("agy", &self.provider.read().await.clone(), &status);
         *self.provider.write().await = status;
         self.publish_agy_monitor_status().await;
     }
@@ -133,6 +134,11 @@ impl AppState {
                 .lock()
                 .unwrap()
                 .remember(ProviderId::OpenAi, &status);
+            log_status_change(
+                "openai",
+                &self.openai_provider.read().await.clone(),
+                &status,
+            );
             *self.openai_provider.write().await = status;
             self.publish_openai_monitor_status().await;
         } else {
@@ -414,6 +420,38 @@ impl Drop for Admission {
     }
 }
 
+/// Probes run every few minutes; only changes in readiness, error or catalogue
+/// are logged, so an outage or a newly listed model appears exactly once.
+fn log_status_change(provider: &str, previous: &ProviderStatus, current: &ProviderStatus) {
+    let ids = |status: &ProviderStatus| {
+        status
+            .models
+            .iter()
+            .map(|m| m.id.clone())
+            .collect::<Vec<_>>()
+    };
+    if previous.authenticated == current.authenticated
+        && previous.error == current.error
+        && ids(previous) == ids(current)
+    {
+        return;
+    }
+    let added: Vec<_> = ids(current)
+        .into_iter()
+        .filter(|id| !ids(previous).contains(id))
+        .collect();
+    let removed: Vec<_> = ids(previous)
+        .into_iter()
+        .filter(|id| !ids(current).contains(id))
+        .collect();
+    crate::log::event(
+        "provider_status_changed",
+        json!({"provider":provider,"authenticated":current.authenticated,"error":current.error,
+            "previous_error":previous.error,"version":current.version,"model_count":current.models.len(),
+            "models_added":added,"models_removed":removed}),
+    );
+}
+
 pub fn error(status: u16, code: &str, message: &str) -> ApiError {
     ApiError::new(status, code, message)
 }
@@ -423,6 +461,10 @@ pub struct RequestContext {
     selection: std::sync::Mutex<Option<(String, String)>>,
     fallback: std::sync::Mutex<Option<ModelFallback>>,
     disclosures: std::sync::Mutex<Vec<(&'static str, String)>>,
+    /// Value-free summary of the client request for logs; see `request_shape`.
+    shape: std::sync::Mutex<Option<Value>>,
+    /// Who sent the request: method, path, client IP and User-Agent.
+    origin: Value,
     pub started: Instant,
     pub recorded: AtomicBool,
 }
@@ -525,6 +567,8 @@ async fn protect(
         .map(|p| p.0.ip())
         .unwrap_or(IpAddr::from([127, 0, 0, 1]));
     let ip = client_ip(request.headers(), peer, &state.config);
+    let origin = json!({"method":request.method().as_str(),"path":request.uri().path().chars().take(128).collect::<String>(),
+        "client_ip":ip.to_string(),"user_agent":crate::log::header(request.headers(), "user-agent", 160)});
     let rejection = if !state.global.check("all") || !state.preauth.check(&ip.to_string()) {
         Some(error(429, "rate_limit_exceeded", "Request limit exceeded"))
     } else if request
@@ -551,7 +595,7 @@ async fn protect(
         None
     };
     if let Some(e) = rejection {
-        return rejection_response(&state, e).await;
+        return rejection_response(&state, &origin, e).await;
     }
     let key = request
         .headers()
@@ -561,11 +605,17 @@ async fn protect(
         .and_then(|s| s.strip_prefix("Bearer "))
         .and_then(|bearer| auth::authenticate(&state.config.keys, bearer));
     let Some(key) = key else {
-        return rejection_response(&state, error(401, "invalid_api_key", "Invalid API key")).await;
+        return rejection_response(
+            &state,
+            &origin,
+            error(401, "invalid_api_key", "Invalid API key"),
+        )
+        .await;
     };
     if !state.clients.check(&key.id) {
         return rejection_response(
             &state,
+            &origin,
             error(429, "rate_limit_exceeded", "Request limit exceeded"),
         )
         .await;
@@ -574,6 +624,7 @@ async fn protect(
     if !key.scopes.iter().any(|s| s == scope) {
         return rejection_response(
             &state,
+            &origin,
             error(
                 403,
                 "insufficient_scope",
@@ -586,6 +637,7 @@ async fn protect(
         let Ok(_permit) = state.body_slots.clone().try_acquire_owned() else {
             return rejection_response(
                 &state,
+                &origin,
                 error(503, "busy", "Too many request bodies in progress"),
             )
             .await;
@@ -600,6 +652,7 @@ async fn protect(
             Err(_) => {
                 return rejection_response(
                     &state,
+                    &origin,
                     error(408, "body_timeout", "Request body deadline exceeded"),
                 )
                 .await;
@@ -607,6 +660,7 @@ async fn protect(
             Ok(Err(_)) => {
                 return rejection_response(
                     &state,
+                    &origin,
                     error(
                         413,
                         "request_too_large",
@@ -623,6 +677,8 @@ async fn protect(
         selection: std::sync::Mutex::new(None),
         fallback: std::sync::Mutex::new(None),
         disclosures: std::sync::Mutex::new(Vec::new()),
+        shape: std::sync::Mutex::new(None),
+        origin: origin.clone(),
         id: Uuid::new_v4().to_string(),
         started: Instant::now(),
         recorded: AtomicBool::new(false),
@@ -649,12 +705,24 @@ async fn protect(
         // The router's own code when it produced the error, so saturation
         // (`busy`) is counted as such rather than as an anonymous 503.
         let status = response.status().as_u16();
-        let code = response
-            .extensions()
-            .get::<ErrorCode>()
-            .map(|code| code.0.clone())
+        let public = response.extensions().get::<ErrorCode>().cloned();
+        let code = public
+            .as_ref()
+            .map(|error| error.code.clone())
             .unwrap_or_else(|| format!("http_{status}"));
         state.telemetry.note_error(&code, status);
+        crate::log::event(
+            "request_rejected",
+            json!({"stage":"request","request_id":context.id,"client_id":client_id,"endpoint":endpoint,
+                "origin":origin,"status":status,"code":code,
+                "param":public.as_ref().and_then(|error| error.param.clone()),
+                "message":public.as_ref().map(|error| error.message.chars().take(300).collect::<String>()),
+                "provider":selection.as_ref().map(|(provider, _)| provider.clone()),
+                "served_model":selection.as_ref().map(|(_, model)| model.clone()),
+                "requested_model":fallback.as_ref().map(|fallback| fallback.requested.clone()),
+                "duration_ms":context.started.elapsed().as_millis() as u64,
+                "request":context.shape.lock().unwrap().clone()}),
+        );
         state
             .telemetry
             .record(RequestRecord {
@@ -696,9 +764,14 @@ async fn protect(
     response
 }
 
-async fn rejection_response(state: &AppState, e: ApiError) -> Response {
+async fn rejection_response(state: &AppState, origin: &Value, e: ApiError) -> Response {
     state.telemetry.note_rejection(&e.code);
+    // Bounded like the telemetry records, so scans cannot flood the log.
     if state.rejection_logs.check("all") {
+        crate::log::event(
+            "request_rejected",
+            json!({"stage":"admission","origin":origin,"status":e.status,"code":e.code,"message":e.message}),
+        );
         state
             .telemetry
             .record(RequestRecord {
@@ -768,6 +841,7 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> Json<Value> {
                 "never_applies_to":["live_model_ids","remembered_model_ids","fallback_targets","invalid_model_ids","non_chat_model_families"],"non_chat_model_families":"model_not_found","remembered_ids":"persisted_across_restarts",
                 "crossed_with_reasoning_replay":"provider_unavailable","unpublished_target_requested":"provider_unavailable",
                 "disclosure_header":"x-ai-router-model-fallback","antigravity_effort":"served_model_tier","effort_disclosure_header":"x-ai-router-reasoning-effort"},
+            "tool_call_relay":{"enabled":state.config.tool_call_relay,"applies_to":"tool_choice_absent_or_auto","relays":["undeclared_tool_when_no_tool_is_strict","schema_mismatch_for_non_strict_tool"],"always_rejected":["strict_tool_mismatch","invalid_tool_name","non_object_arguments","invalid_json_arguments","duplicate_call_id"],"rejection":{"status":502,"code":"invalid_provider_tool_call","retry":false}},
             "tool_choice":{"accepted":["auto","none","required","function","allowed_tools"],"inventory":"narrowed_to_selection","missing_required_call":"error","missing_required_call_error":{"status":502,"code":"missing_required_tool_call","retry":false},"error_param":"tool_choice"},
             "stream_commit":{"after":"first_client_output","max_wait_seconds":STREAM_COMMIT_WAIT.as_secs(),"failure_before_commit":"http_error","failure_after_commit":"error_event","responses_error_event":"error_then_response.failed"},
             "disclosure_headers":{"scope":"every_response_after_validation","model_fallback_scope":"every_response","streaming_and_errors":"same_as_nonstreaming",
@@ -827,6 +901,7 @@ async fn generate(
             &body,
         )
         .await;
+    *context.shape.lock().unwrap() = Some(request_shape(&body, responses));
     let remaining = Duration::from_secs(state.config.request_timeout_secs)
         .checked_sub(context.started.elapsed())
         .unwrap_or_default();
@@ -846,6 +921,67 @@ async fn generate(
             .await;
     }
     result
+}
+
+/// What the client asked for, without content: field names, counts, types
+/// and the values of small enumerated controls. It explains rejections and
+/// lets logs distinguish clients (n8n, Twenty, Studio) by request shape.
+fn request_shape(body: &Value, responses: bool) -> Value {
+    let short = |value: &Value| {
+        value
+            .as_str()
+            .map(|s| s.chars().take(64).collect::<String>())
+    };
+    let tools = body["tools"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let strict = tools
+        .iter()
+        .filter(|tool| {
+            let function = if responses { *tool } else { &tool["function"] };
+            function["strict"] == true
+        })
+        .count();
+    let tool_choice = match &body["tool_choice"] {
+        Value::Null => None,
+        Value::String(choice) => Some(json!(choice.chars().take(32).collect::<String>())),
+        Value::Object(choice) => Some(
+            json!({"type":choice.get("type").and_then(|t| t.as_str()).map(|t| t.chars().take(32).collect::<String>()),
+            "mode":choice.get("mode").or_else(|| choice.get("allowed_tools").and_then(|a| a.get("mode"))).and_then(Value::as_str)}),
+        ),
+        _ => Some(json!("invalid")),
+    };
+    let mut fields: Vec<String> = body
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(_, value)| !value.is_null())
+        .map(|(key, _)| key.chars().take(64).collect())
+        .take(64)
+        .collect();
+    fields.sort();
+    let items = if responses {
+        match &body["input"] {
+            Value::String(_) => json!({"text":1}),
+            Value::Array(items) => crate::log::kinds(items, "type", "message"),
+            _ => Value::Null,
+        }
+    } else {
+        body["messages"].as_array().map_or(Value::Null, |messages| {
+            crate::log::kinds(messages, "role", "missing")
+        })
+    };
+    json!({"requested_model":body["model"].as_str().map(|m| m.chars().take(128).collect::<String>()),
+        "stream":body["stream"].as_bool().unwrap_or(false),"fields":fields,
+        "input_items":items,"tool_count":tools.len(),"strict_tools":strict,
+        "tool_types":crate::log::kinds(tools, "type", "missing"),"tool_choice":tool_choice,
+        "parallel_tool_calls":body["parallel_tool_calls"].as_bool(),
+        "store":body["store"].as_bool(),
+        "include":body["include"].as_array().map(|values| values.iter().take(16).filter_map(&short).collect::<Vec<_>>()),
+        "reasoning_effort":short(&body["reasoning"]["effort"]).or_else(|| short(&body["reasoning_effort"])),
+        "reasoning_summary":short(&body["reasoning"]["summary"]),
+        "output_format":short(&body["text"]["format"]["type"]).or_else(|| short(&body["response_format"]["type"]))})
 }
 
 async fn generate_body(
@@ -962,6 +1098,7 @@ async fn generate_body(
     for (name, value) in disclosures {
         context.disclose(name, value);
     }
+    request.tool_relay &= state.config.tool_call_relay;
     request.owner = key.id.clone();
     request.endpoint = if responses { "responses" } else { "chat" }.into();
     request.provider_generation = pinned_generation.clone();
@@ -987,20 +1124,28 @@ async fn generate_body(
     }
     let cancel = state.shutdown.child_token();
     let model = request.model.clone();
-    eprintln!(
-        "{}",
+    crate::log::event(
+        "model_request",
         json!({
-            "event":"model_request", "request_id":id,
+            "request_id":id, "client_id":key.id, "origin":context.origin,
             "endpoint":if responses { "responses" } else { "chat" }, "model":model,
             "requested_model":fallback.as_ref().map(|f| &f.requested),
             "provider":selected.as_str(),
+            "dispatch_ms":context.started.elapsed().as_millis() as u64,
             "input_item_count":request.input.len(),
             "input_bytes":serde_json::to_vec(&request.input).map_or(0,|v|v.len()),
             "instruction_bytes":serde_json::to_vec(&request.instructions).map_or(0,|v|v.len()),
             "tool_schema_bytes":request.tools.iter().map(|t|t.parameters.to_string().len()).sum::<usize>(),
             "client_tool_count":request.tools.len(),
-            "client_tool_names":request.tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>()
-        })
+            "client_tool_names":request.tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>(),
+            "strict_tool_names":request.tools.iter().filter(|tool| tool.strict).map(|tool| tool.name.as_str()).collect::<Vec<_>>(),
+            "tool_required":request.tool_required, "tool_relay":request.tool_relay,
+            "parallel_tool_calls":request.parallel_tool_calls,
+            "output_schema":request.schema.is_some(), "effort":request.effort,
+            "ignored_fields":request.ignored, "streaming":streaming, "store_items":store_items,
+            "disclosures":context.disclosures.lock().unwrap().iter().map(|(name, value)| json!({"header":name,"value":value})).collect::<Vec<_>>(),
+            "request":context.shape.lock().unwrap().clone()
+        }),
     );
     let remaining = Duration::from_secs(state.config.request_timeout_secs)
         .checked_sub(context.started.elapsed())
@@ -1026,6 +1171,7 @@ async fn generate_body(
     );
     guard.record.provider = selected.as_str().into();
     guard.record.requested_model = fallback.map(|f| f.requested);
+    guard.log_context = json!({"origin":context.origin,"streaming":streaming});
     let completion_id = format!("{}{}", if responses { "resp_" } else { "chatcmpl_" }, id);
     let created = Utc::now().timestamp();
     if !streaming {
@@ -1118,6 +1264,7 @@ async fn generate_body(
         terminal = matches!(&event, RunEvent::Completed(_));
         pending.extend(render.event(event));
     }
+    guard.stream_committed = true;
     let stream = async_stream::stream! {
         let mut guard = guard;
         for item in pending { yield Ok::<Event,Infallible>(item); }
@@ -1354,6 +1501,10 @@ pub struct CompletionGuard {
     cancel: CancellationToken,
     finished: CancellationToken,
     admission: Option<Admission>,
+    /// Request identity and shape repeated on every lifecycle log event.
+    log_context: Value,
+    /// The SSE 200 was sent, so a failure is reported as a stream event.
+    stream_committed: bool,
 }
 impl CompletionGuard {
     pub fn new(
@@ -1391,7 +1542,36 @@ impl CompletionGuard {
             cancel,
             finished,
             admission: Some(admission),
+            log_context: json!({}),
+            stream_committed: false,
         }
+    }
+    /// Shared fields of this request's lifecycle events.
+    fn log_fields(&self, mut fields: Value) -> Value {
+        if let (Some(fields), Value::Object(context)) = (fields.as_object_mut(), &self.log_context)
+        {
+            for (key, value) in context {
+                fields.entry(key.clone()).or_insert_with(|| value.clone());
+            }
+            for (key, value) in [
+                ("request_id", json!(self.record.request_id)),
+                ("client_id", json!(self.record.client_id)),
+                ("model", json!(self.record.model)),
+                ("requested_model", json!(self.record.requested_model)),
+                ("provider", json!(self.record.provider)),
+                ("endpoint", json!(self.record.endpoint)),
+                (
+                    "elapsed_ms",
+                    json!(self.started.elapsed().as_millis() as u64),
+                ),
+                ("startup_ms", json!(self.record.startup_ms)),
+                ("first_output_ms", json!(self.record.first_output_ms)),
+                ("stream_committed", json!(self.stream_committed)),
+            ] {
+                fields.insert(key.into(), value);
+            }
+        }
+        fields
     }
     pub fn capture_response(&mut self, value: &Value) {
         self.response = Some(CapturedPayload::capture(value));
@@ -1406,7 +1586,36 @@ impl CompletionGuard {
             self.record.first_output_ms = Some(self.started.elapsed().as_millis() as u64);
         }
         match event {
+            RunEvent::ToolCall(call) => {
+                if let Some(diagnostics) = &call.relayed {
+                    crate::log::event(
+                        "tool_call_relayed",
+                        self.log_fields(json!({"tool_name":call.name,"call_id":call.id,
+                            "declared":diagnostics["reason"] != "unknown_tool","diagnostics":diagnostics})),
+                    );
+                }
+            }
             RunEvent::Completed(result) => {
+                let relayed: Vec<_> = result
+                    .tool_calls
+                    .iter()
+                    .filter_map(|call| {
+                        call.relayed
+                            .as_ref()
+                            .map(|d| json!({"tool_name":call.name,"reason":d["reason"]}))
+                    })
+                    .collect();
+                crate::log::event(
+                    "model_request_completed",
+                    self.log_fields(json!({"status":result.status,"finish_reason":finish_reason(result),
+                        "text_bytes":result.text.len(),"structured_output":result.structured_output.is_some(),
+                        "tool_call_count":result.tool_calls.len(),
+                        "tool_call_names":result.tool_calls.iter().map(|call| call.name.as_str()).collect::<Vec<_>>(),
+                        "relayed_tool_calls":relayed,
+                        "opaque_output_items":crate::log::kinds(&result.output_items, "type", "missing"),
+                        "usage":result.usage,"usage_partial":result.usage_partial,
+                        "upstream_request_id":result.upstream_request_id})),
+                );
                 self.capture_response(&json!(result));
                 self.record.status = if result.status == "incomplete" {
                     "incomplete"
@@ -1428,14 +1637,14 @@ impl CompletionGuard {
                     }
                 }
                 self.capture_response(&captured);
-                eprintln!(
-                    "{}",
-                    json!({"event":"provider_request_failed",
-                    "request_id":self.record.request_id,"model":self.record.model,"provider":self.record.provider,
-                    "endpoint":self.record.endpoint,"elapsed_ms":self.started.elapsed().as_millis() as u64,
-                    "status":e.status,"code":e.code,"upstream_request_id":e.upstream_request_id,
-                    "explanation":crate::protocol::error_explanation(&self.record.provider, &e.code),
-                    "diagnostics":e.diagnostics.as_ref().map(|d| &d.metadata)})
+                crate::log::event(
+                    "provider_request_failed",
+                    self.log_fields(json!({"status":e.status,"code":e.code,"param":e.param,
+                        "upstream_request_id":e.upstream_request_id,
+                        "explanation":crate::protocol::error_explanation(&self.record.provider, &e.code),
+                        "retry":e.retry_header().map(|(_, value)| value),
+                        "diagnostics":e.diagnostics.as_ref().map(|d| &d.metadata),
+                        "private_capture":e.diagnostics.as_ref().is_some_and(|d| d.private_body.is_some())})),
                 );
                 self.record.status = if e.code == "request_cancelled" {
                     "cancelled"
@@ -1454,13 +1663,21 @@ impl CompletionGuard {
 impl Drop for CompletionGuard {
     fn drop(&mut self) {
         self.cancel.cancel();
-        if self.record.error_code.as_deref() == Some("client_disconnected")
+        // Still the constructor's default: no terminal event was observed.
+        let unfinished = self.record.error_code.as_deref() == Some("client_disconnected");
+        if unfinished
             && self.started.elapsed() >= Duration::from_secs(self.state.config.request_timeout_secs)
         {
             self.record.status = "failed".into();
             self.record.error_code = Some("provider_timeout".into());
         }
         self.record.duration_ms = self.started.elapsed().as_millis() as u64;
+        if unfinished {
+            crate::log::event(
+                "model_request_ended_early",
+                self.log_fields(json!({"status":self.record.status,"code":self.record.error_code})),
+            );
+        }
         let record = self.record.clone();
         let response = self.response.take();
         let state = self.state.clone();
@@ -1918,6 +2135,15 @@ mod tests {
                     json!({"type":"function_call","call_id":"call_bad","name":"lookup","arguments":"{\"q\":12}","status":"completed"}),
                 ],
             )
+        } else if input.contains("undeclared-tool-fixture") && !continuing {
+            // Twenty's learn_tools flow: the model calls a tool it learned
+            // about from a tool result instead of the declared meta-tool.
+            (
+                String::new(),
+                vec![
+                    json!({"type":"function_call","call_id":"call_learned","name":"find_companies","arguments":"{\"query\":\"acme\"}","status":"completed"}),
+                ],
+            )
         } else {
             let text = if input.contains("schema-fixture") {
                 "{\"answer\":\"valid\"}"
@@ -2084,7 +2310,12 @@ mod tests {
                     .iter()
                     .any(|part| part.get("functionResponse").is_some())
             });
-        let parts = if text.contains("tools-fixture")
+        let parts = if text.contains("undeclared-tool-fixture")
+            && !continuing
+            && body.pointer("/request/tools").is_some()
+        {
+            json!([{"functionCall":{"name":"find_companies","args":{"query":"acme"}}}])
+        } else if text.contains("tools-fixture")
             && !continuing
             && body.pointer("/request/tools").is_some()
         {
@@ -2451,9 +2682,15 @@ mod tests {
         let schema = json!({"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false});
         let (status,wire)=h.call("/v1/chat/completions",Some(json!({"model":"synthetic-openai","messages":[{"role":"user","content":"schema-fixture"}],"response_format":{"type":"json_schema","json_schema":{"name":"answer","schema":schema}}}))).await;
         assert_eq!(status, StatusCode::OK, "{wire}");
-        let (status,wire)=h.call("/v1/responses",Some(json!({"model":"synthetic-openai","input":"malformed-fixture","tools":[lookup_tool(true)]}))).await;
+        let mut strict_tool = lookup_tool(true);
+        strict_tool["strict"] = json!(true);
+        let (status,wire)=h.call("/v1/responses",Some(json!({"model":"synthetic-openai","input":"malformed-fixture","tools":[strict_tool]}))).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY, "{wire}");
         assert!(wire.contains("invalid_provider_tool_call"));
+        // The same noncompliant call to a non-strict tool is relayed.
+        let (status,wire)=h.call("/v1/responses",Some(json!({"model":"synthetic-openai","input":"malformed-fixture","tools":[lookup_tool(true)]}))).await;
+        assert_eq!(status, StatusCode::OK, "{wire}");
+        assert!(wire.contains("\"call_id\":\"call_bad\""), "{wire}");
         let (status, wire) = h
             .call(
                 "/v1/responses",

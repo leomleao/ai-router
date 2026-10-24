@@ -194,16 +194,24 @@ impl ApiError {
     }
 }
 
-/// The public error code of an error response, for monitoring and records.
+/// The public error of an error response, for monitoring, records and logs.
 #[derive(Clone, Debug)]
-pub struct ErrorCode(pub String);
+pub struct ErrorCode {
+    pub code: String,
+    pub param: Option<String>,
+    pub message: String,
+}
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = StatusCode::from_u16(self.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let retry = self.retry_header();
         let mut response = (status, Json(self.response_body())).into_response();
-        response.extensions_mut().insert(ErrorCode(self.code));
+        response.extensions_mut().insert(ErrorCode {
+            code: self.code,
+            param: self.param,
+            message: self.message,
+        });
         if let Some((name, value)) = retry {
             response
                 .headers_mut()
@@ -225,12 +233,20 @@ pub struct ToolDefinition {
     pub name: String,
     pub description: String,
     pub parameters: Value,
+    /// The client sent `strict: true`. Calls to a strict tool are always
+    /// validated before handoff; non-strict calls may be relayed.
+    #[serde(default)]
+    pub strict: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: Value,
+    /// Sanitized validation diagnostics when a non-strict call was handed to
+    /// the client without passing local validation. Never sent to a client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relayed: Option<Value>,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Usage {
@@ -269,6 +285,11 @@ pub struct RunRequest {
     /// result is known and fail closed when no call is returned.
     #[serde(default)]
     pub tool_required: bool,
+    /// tool_choice is absent or auto, so a call that fails validation against
+    /// non-strict tools is relayed to the client, as OpenAI does, instead of
+    /// failing the request. See `tool_diagnostics::admit_call`.
+    #[serde(default)]
+    pub tool_relay: bool,
 }
 impl RunRequest {
     pub fn withholds_text(&self) -> bool {
@@ -354,6 +375,7 @@ pub fn normalize_chat(value: Value, request_id: String) -> Result<RunRequest, Ap
     let mut ignored = validate_common(root, false)?;
     let model = model(root)?;
     let mut tools = parse_tools(root.get("tools"), false)?;
+    let tool_relay = unconstrained_tool_choice(root.get("tool_choice"));
     let tool_required = apply_tool_choice(root.get("tool_choice"), &mut tools, false)?;
     let schema = chat_schema(root.get("response_format"))?;
     required_tool_without_schema(tool_required, &schema)?;
@@ -520,6 +542,7 @@ pub fn normalize_chat(value: Value, request_id: String) -> Result<RunRequest, Ap
     request.endpoint = "chat".into();
     request.ignored = ignored;
     request.tool_required = tool_required;
+    request.tool_relay = tool_relay;
     request.parallel_tool_calls = root
         .get("parallel_tool_calls")
         .and_then(Value::as_bool)
@@ -532,6 +555,7 @@ pub fn normalize_response(value: Value, request_id: String) -> Result<RunRequest
     let mut ignored = validate_common(root, true)?;
     let model = model(root)?;
     let mut tools = parse_tools(root.get("tools"), true)?;
+    let tool_relay = unconstrained_tool_choice(root.get("tool_choice"));
     let tool_required = apply_tool_choice(root.get("tool_choice"), &mut tools, true)?;
     let schema = response_schema(root.get("text"))?;
     required_tool_without_schema(tool_required, &schema)?;
@@ -694,6 +718,7 @@ pub fn normalize_response(value: Value, request_id: String) -> Result<RunRequest
     request.endpoint = "responses".into();
     request.ignored = ignored;
     request.tool_required = tool_required;
+    request.tool_relay = tool_relay;
     request.parallel_tool_calls = root
         .get("parallel_tool_calls")
         .and_then(Value::as_bool)
@@ -759,6 +784,7 @@ fn make_request(
         effort,
         ignored: Vec::new(),
         tool_required: false,
+        tool_relay: false,
     })
 }
 
@@ -1039,9 +1065,16 @@ fn parse_tools(value: Option<&Value>, responses: bool) -> Result<Vec<ToolDefinit
             name: name.to_owned(),
             description,
             parameters,
+            strict: function.get("strict") == Some(&Value::Bool(true)),
         });
     }
     Ok(tools)
+}
+
+/// Only an absent or `auto` tool_choice leaves the model free to call any
+/// tool, so only then can a noncompliant non-strict call be relayed.
+fn unconstrained_tool_choice(value: Option<&Value>) -> bool {
+    nonnull(value).is_none_or(|choice| choice == "auto")
 }
 
 /// Forced choices are enforced here and by the adapters rather than assumed

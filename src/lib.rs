@@ -2,6 +2,7 @@ pub mod api;
 pub mod auth;
 pub mod config;
 pub mod items;
+mod log;
 pub mod monitor;
 pub mod protocol;
 mod tool_diagnostics;

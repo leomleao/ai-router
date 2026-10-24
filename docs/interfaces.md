@@ -28,6 +28,7 @@ Main configuration fields and defaults:
 | request deadline | 120 seconds |
 | telemetry retention | 30 days / 50,000 events |
 | `model_fallback` | `true` (`AI_ROUTER_MODEL_FALLBACK`) |
+| `tool_call_relay` | `true` (`AI_ROUTER_TOOL_CALL_RELAY`) |
 | `fallback_openai_model` | `gpt-6-luna` (`AI_ROUTER_FALLBACK_OPENAI_MODEL`) |
 | `fallback_gemini_model` | `gemini-3.8-flash-medium` (`AI_ROUTER_FALLBACK_GEMINI_MODEL`) |
 
@@ -61,7 +62,13 @@ tools: Vec<ToolDefinition>
 schema: Option<Value>
 effort: Option<String>
 ignored: Vec<String>              accepted no-op fields, for disclosure only (not serialized)
+tool_required: bool               tool_choice demands a call
+tool_relay: bool                  tool_choice absent or auto; noncompliant non-strict calls may be relayed
 ```
+
+`ToolDefinition.strict` records a client `strict: true`. `ToolCall.relayed`
+holds the sanitized validation rejection when a call was handed to the client
+without passing validation; it is never part of a public response.
 
 Both provider serializers consume `instructions` and typed `input`; no
 rendered transcript or CLI-era profile is carried in `RunRequest`. Normalization
@@ -130,8 +137,21 @@ Chat and Responses output continue to expose both `agy_usage_partial` and
 validity, compilation, and local-only references. `tool_diagnostics::validate_call`
 is shared by the direct provider, OpenAI adapter, and client-facing API. It
 validates the declared tool, object arguments, and caller schema while producing
-bounded diagnostics without logging raw argument values. Keep these helpers
-even though the MCP relay was removed.
+bounded diagnostics without logging raw argument values. Both adapters call it
+through `tool_diagnostics::admit_call`, which applies the relay policy: with
+`RunRequest.tool_relay` (cleared by `AI_ROUTER_TOOL_CALL_RELAY=false`), an
+`unknown_tool` rejection while no declared tool is strict, or a
+`schema_mismatch` against a non-strict tool, is admitted and returned as
+`ToolCall.relayed`; every other rejection fails with `invalid_provider_tool_call`.
+`tool_diagnostics::schema_errors` produces the same value-free error summaries
+for structured-output failures. Keep these helpers even though the MCP relay was
+removed.
+
+Adapter failures carry `FailureDiagnostics`: `metadata` (phase, reason and
+value-free details) is logged, and `private_body` (the offending provider item,
+withheld output or upstream error body) goes only to the memory-only monitor
+capture. `crate::log` writes the structured log events described in
+[logging](logging.md).
 
 ## Provider ownership and dispatch
 
@@ -245,6 +265,12 @@ accepted upstream streaming response headers for either provider; `first_output_
 measures the first text delta or validated tool call. Private reasoning is not
 counted as first output. The six rejection counters count all attempts since
 process start; retained rejection records are sampled to 30 per minute.
+Each captured request or response is bounded to 128 KiB: long strings are
+shortened first (8 KiB, then 2 KiB, 512 and 128 bytes, each marked with the
+omitted size) so the capture stays valid JSON with its tool list and item order,
+and only then is the text cut. `ai-router monitor --detail <request-id>` prints
+one retained capture, including a failure's `diagnostics` and private
+`upstream_response`.
 
 The Compose gateway runs nonroot with a read-only root filesystem, dropped
 capabilities, and tmpfs `/run/ai-router` and `/tmp`. It mounts

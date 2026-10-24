@@ -84,10 +84,29 @@ pub(crate) fn validate_call(
         return Err(rejection);
     };
     rejection.reason = "schema_mismatch";
-    for error in validator.iter_errors(arguments).take(MAX_ERRORS + 1) {
-        if rejection.validation_errors.len() == MAX_ERRORS {
-            rejection.validation_errors_truncated = true;
-            break;
+    (
+        rejection.validation_errors,
+        rejection.validation_errors_truncated,
+    ) = schema_errors(&tool.parameters, &validator, arguments);
+    if rejection.validation_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(rejection)
+    }
+}
+
+/// Bounded, value-free descriptions of why `instance` fails `schema`: schema
+/// keyword paths, depth and JSON types only. Shared by tool-call and
+/// structured-output diagnostics.
+pub(crate) fn schema_errors(
+    schema: &Value,
+    validator: &jsonschema::Validator,
+    instance: &Value,
+) -> (Vec<Value>, bool) {
+    let mut errors = Vec::new();
+    for error in validator.iter_errors(instance).take(MAX_ERRORS + 1) {
+        if errors.len() == MAX_ERRORS {
+            return (errors, true);
         }
         // The schema path contains schema keywords, while instance paths and
         // validator formatting can expose caller-provided keys or values.
@@ -100,7 +119,7 @@ pub(crate) fn validate_call(
             "actual_type":value_type(&error.instance),
         });
         if keyword == "type" {
-            let expected = tool.parameters.pointer(&path);
+            let expected = schema.pointer(&path);
             let types: Vec<_> = expected
                 .into_iter()
                 .flat_map(|value| {
@@ -120,8 +139,7 @@ pub(crate) fn validate_call(
             detail["expected_types"] = json!(types);
         }
         if keyword == "required" {
-            let fields: Vec<_> = tool
-                .parameters
+            let fields: Vec<_> = schema
                 .pointer(&path)
                 .and_then(Value::as_array)
                 .into_iter()
@@ -133,12 +151,50 @@ pub(crate) fn validate_call(
                 .collect();
             detail["missing_required_fields"] = json!(fields);
         }
-        rejection.validation_errors.push(detail);
+        errors.push(detail);
     }
-    if rejection.validation_errors.is_empty() {
-        Ok(())
-    } else {
-        Err(rejection)
+    (errors, false)
+}
+
+/// Decide whether a provider call may be handed to the client.
+///
+/// A call that passes validation is always admitted. When `relay` is set
+/// (tool_choice absent or auto), a call that fails only because it names an
+/// undeclared tool, while no declared tool is strict, or because its object
+/// arguments mismatch a non-strict tool's schema, is admitted too: OpenAI
+/// returns such calls for non-strict tools, and clients such as Twenty repair
+/// them or answer with a tool error. `Ok(Some(_))` carries the sanitized
+/// rejection for logs. Malformed names and non-object arguments always fail.
+pub(crate) fn admit_call(
+    tools: &[ToolDefinition],
+    name: Option<&Value>,
+    arguments: &Value,
+    relay: bool,
+) -> Result<Option<Value>, Rejection> {
+    let Err(rejection) = validate_call(tools, name, arguments) else {
+        return Ok(None);
+    };
+    let relayable = relay
+        && match rejection.reason {
+            "unknown_tool" => {
+                arguments.is_object() && !tools.is_empty() && tools.iter().all(|tool| !tool.strict)
+            }
+            "schema_mismatch" => tools.iter().any(|tool| {
+                Some(tool.name.as_str()) == rejection.selected_tool.as_deref() && !tool.strict
+            }),
+            _ => false,
+        };
+    if !relayable {
+        return Err(rejection);
+    }
+    let mut diagnostics = serde_json::to_value(&rejection).unwrap_or(Value::Null);
+    diagnostics["policy"] = json!("relayed_non_strict");
+    Ok(Some(diagnostics))
+}
+
+impl Rejection {
+    pub(crate) fn reason(&self) -> &'static str {
+        self.reason
     }
 }
 
@@ -151,6 +207,7 @@ mod tests {
             name: "weather".into(),
             description: "private description".into(),
             parameters: schema,
+            strict: false,
         }
     }
 

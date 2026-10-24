@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub const MAX_DETAILS: usize = 100;
-pub const MAX_PAYLOAD_BYTES: usize = 64 * 1024;
+pub const MAX_PAYLOAD_BYTES: usize = 128 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CapturedPayload {
@@ -23,9 +23,22 @@ impl CapturedPayload {
     pub fn capture(value: &Value) -> Self {
         let mut value = value.clone();
         redact(&mut value, 0);
-        let mut json = serde_json::to_string_pretty(&value).unwrap_or_else(|_| "null".into());
-        let truncated = json.len() > MAX_PAYLOAD_BYTES;
-        if truncated {
+        let pretty =
+            |value: &Value| serde_json::to_string_pretty(value).unwrap_or_else(|_| "null".into());
+        let mut json = pretty(&value);
+        let mut truncated = false;
+        // Shorten long strings before cutting bytes, so a large conversation
+        // stays valid JSON with its tool list, item types and order intact.
+        for limit in [8192, 2048, 512, 128] {
+            if json.len() <= MAX_PAYLOAD_BYTES {
+                break;
+            }
+            shorten_strings(&mut value, limit, 0);
+            json = pretty(&value);
+            truncated = true;
+        }
+        if json.len() > MAX_PAYLOAD_BYTES {
+            truncated = true;
             let mut end = MAX_PAYLOAD_BYTES;
             while !json.is_char_boundary(end) {
                 end -= 1;
@@ -33,6 +46,31 @@ impl CapturedPayload {
             json.truncate(end);
         }
         Self { json, truncated }
+    }
+}
+
+/// Keep the first `limit` bytes of each longer string and note what was cut.
+fn shorten_strings(value: &mut Value, limit: usize, depth: usize) {
+    if depth > 64 {
+        return;
+    }
+    match value {
+        Value::String(text) if text.len() > limit => {
+            let mut end = limit;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            let omitted = text.len() - end;
+            text.truncate(end);
+            text.push_str(&format!("…[{omitted} bytes omitted]"));
+        }
+        Value::Array(items) => items
+            .iter_mut()
+            .for_each(|item| shorten_strings(item, limit, depth + 1)),
+        Value::Object(map) => map
+            .values_mut()
+            .for_each(|item| shorten_strings(item, limit, depth + 1)),
+        _ => {}
     }
 }
 
@@ -171,6 +209,27 @@ mod tests {
                 .await
                 .is_none()
         );
+    }
+
+    #[test]
+    fn oversized_payloads_keep_valid_json_structure_before_byte_truncation() {
+        let tools: Vec<_> = (0..40)
+            .map(|i| json!({"type":"function","name":format!("tool_{i}"),"parameters":{"description":"d".repeat(4000)}}))
+            .collect();
+        let request = json!({"model":"gpt-6-luna","input":[{"role":"user","content":"x".repeat(200_000)}],"tools":tools});
+        let payload = CapturedPayload::capture(&request);
+        assert!(payload.truncated && payload.json.len() <= MAX_PAYLOAD_BYTES);
+        let parsed: Value = serde_json::from_str(&payload.json).unwrap();
+        assert_eq!(parsed["tools"].as_array().unwrap().len(), 40);
+        assert_eq!(parsed["tools"][39]["name"], "tool_39");
+        assert!(
+            parsed["input"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("bytes omitted]")
+        );
+        let small = CapturedPayload::capture(&json!({"input":"short"}));
+        assert!(!small.truncated);
     }
 
     #[test]
