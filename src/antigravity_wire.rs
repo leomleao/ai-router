@@ -1,7 +1,7 @@
 //! Pinned Cloud Code Assist wire conversion. No transport, credentials, or logging.
 //!
 //! Protocol provenance: oh-my-pi, MIT, commit
-//! d5cd750e41fede277f9eb933455da92a0738915e, packages/ai/src/providers/
+//! 0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0, packages/ai/src/providers/
 //! google-gemini-cli.ts and google-shared.ts, plus packages/catalog/src/wire/
 //! gemini-headers.ts. See THIRD_PARTY_NOTICES.md for the upstream notice.
 //! Visible text is preserved. Tool schemas use CCA-compatible provider hints;

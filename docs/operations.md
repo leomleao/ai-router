@@ -120,7 +120,8 @@ renewal; they do not publish callback ports. Other non-login one-offs are offlin
 
 ### Adopting a newly reviewed baseline
 
-The 2026-10-21 release adopts `omp-d5cd750e-antigravity-v2` / Hub 2.24.0.
+The 2026-10-24 release adopts `omp-0b5c27ab-antigravity-v3` / Hub 2.26.0,
+including OMP's five-minute token-renewal window.
 The OAuth registration is unchanged, so an existing matching Google sign-in can
 be retained. Build the new image, stop the gateway, inspect
 `./scripts/login.sh agy status`, then run `./scripts/login.sh agy resume` before
@@ -130,11 +131,15 @@ until this explicit step; the status includes `saved_baseline` and
 `baseline_update_required`. Review any existing account/protocol restrictions
 before resuming. Do not log in again or delete state just to update the baseline.
 
-See [the upstream review](upstream-review-2026-10-21.md) for evidence, exact
+See [the upstream review](upstream-review-2026-10-24.md) for evidence, exact
 operator commands and the live-validation boundary. None of these changes
 requires an additional environment variable.
 
 ### Upstream release advisory and manual updates
+
+Follow [the OMP alignment policy](omp-alignment.md) when this advisory changes.
+Keeping OAuth and authenticated AGY request behavior aligned with reviewed OMP
+changes is an ongoing maintenance requirement.
 
 At startup the router checks the public Antigravity Hub version manifest and
 the OMP `main` revision; it repeats both checks hourly. The bounded check uses

@@ -4,7 +4,7 @@
 
 The Antigravity adapter translates selected protocol behaviour from
 [oh-my-pi](https://github.com/can1357/oh-my-pi), revision
-`d5cd750e41fede277f9eb933455da92a0738915e` (reviewed 2026-10-21). Source provenance:
+`0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0` (reviewed 2026-10-24). Source provenance:
 
 - `packages/ai/src/providers/google-gemini-cli.ts`
 - `packages/ai/src/providers/google-shared.ts`
@@ -13,6 +13,8 @@ The Antigravity adapter translates selected protocol behaviour from
 - `packages/catalog/src/wire/gemini-headers.ts`
 - `packages/catalog/src/compat/rules/auth/google-antigravity.kdl`
 - `packages/ai/src/registry/oauth/google-antigravity.ts`
+- `packages/ai/src/registry/engine/common.ts`
+- `packages/ai/src/registry/engine/refresh.ts`
 - `packages/catalog/src/discovery/antigravity.ts`
 
 Visible-content rewriting, dynamic client identity, endpoint failover, automatic

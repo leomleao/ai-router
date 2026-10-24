@@ -1,12 +1,12 @@
 {
   "schema_version": 1,
-  "adapter_revision": "omp-d5cd750e-antigravity-v2",
-  "review_date": "2026-10-21",
+  "adapter_revision": "omp-0b5c27ab-antigravity-v3",
+  "review_date": "2026-10-24",
   "provider_id": "agy",
   "provider_label": "Antigravity",
   "source": {
     "repository": "https://github.com/can1357/oh-my-pi",
-    "commit": "d5cd750e41fede277f9eb933455da92a0738915e",
+    "commit": "0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0",
     "license": "MIT",
     "files": [
       "packages/ai/src/providers/google-gemini-cli.ts",
@@ -20,15 +20,62 @@
       "packages/catalog/src/compat/rules/taxonomy/_collapse.kdl",
       "packages/catalog/src/compat/rules/classes/anthropic.kdl",
       "packages/ai/src/utils/schema/normalize.ts",
-      "packages/ai/src/utils/schema/fields.ts"
+      "packages/ai/src/utils/schema/fields.ts",
+      "packages/ai/src/registry/oauth/google-oauth-shared.ts",
+      "packages/ai/src/registry/oauth/google-gemini-cli.ts",
+      "packages/ai/src/registry/oauth/pkce.ts",
+      "packages/ai/src/registry/oauth/callback-server.ts",
+      "packages/ai/src/registry/oauth/index.ts",
+      "packages/ai/src/registry/engine/oauth-code.ts",
+      "packages/ai/src/registry/engine/refresh.ts",
+      "packages/ai/src/registry/hooks/oauth-code.ts",
+      "packages/ai/src/registry/hooks/types.ts",
+      "packages/ai/src/registry/hooks/index.ts",
+      "packages/ai/src/utils/abort.ts",
+      "packages/ai/src/utils/google-validation.ts",
+      "packages/ai/src/providers/transform-messages.ts",
+      "packages/ai/src/providers/google-types.ts",
+      "packages/ai/src/providers/google-antigravity-forced-tool.md",
+      "packages/ai/src/providers/vision-guard.ts",
+      "packages/ai/src/utils/idle-iterator.ts",
+      "packages/ai/src/utils/event-stream.ts",
+      "packages/ai/src/utils/schema/index.ts",
+      "packages/ai/src/utils/schema/dereference.ts",
+      "packages/ai/src/utils/schema/draft.ts",
+      "packages/ai/src/utils/schema/wire.ts",
+      "packages/ai/src/utils/schema/spill.ts",
+      "packages/ai/src/utils/schema/compatibility.ts",
+      "packages/catalog/src/compat/collapse.ts",
+      "packages/catalog/src/utils.ts",
+      "packages/ai/src/utils/schema/adapt.ts",
+      "packages/ai/src/utils/schema/allowlist.ts",
+      "packages/ai/src/utils/schema/equality.ts",
+      "packages/ai/src/utils/schema/strict-tool-validation.ts",
+      "packages/ai/src/utils/schema/types.ts",
+      "packages/ai/src/utils/schema/stamps.ts",
+      "packages/ai/src/utils/schema/json-schema-validator.ts",
+      "packages/ai/src/utils/schema/meta-validator.ts",
+      "packages/ai/src/utils/schema/typescript.ts",
+      "packages/ai/src/utils.ts",
+      "packages/ai/src/registry/engine/common.ts",
+      "packages/utils/src/abortable.ts",
+      "packages/utils/src/fetch-retry.ts",
+      "packages/utils/src/tls-fetch.ts",
+      "packages/ai/src/auth-retry.ts",
+      "packages/ai/src/auth-gateway/server.ts",
+      "packages/ai/package.json",
+      "packages/catalog/package.json",
+      "packages/utils/package.json",
+      "packages/catalog/src/compat/axes.ts",
+      "packages/catalog/src/compat/anthropic.ts"
     ],
     "evidence_kind": "Pinned public OMP source and its recorded Antigravity Hub observations; not an independently documented official CLI protocol or proof of account compatibility.",
     "notice": "THIRD_PARTY_NOTICES.md",
-    "review": "docs/upstream-review-2026-10-21.md",
-    "previous_commit": "2220e58146ebe31508e7a216242840d373e082d0",
+    "review": "docs/upstream-review-2026-10-24.md",
+    "previous_commit": "d5cd750e41fede277f9eb933455da92a0738915e",
     "file_sha256": {
       "packages/ai/src/providers/google-gemini-cli.ts": {
-        "previous": "f5d59b6639dcf0153dbdd1f977deb08e352d5c9d3f9a996146979762373a6476",
+        "previous": "6f65dc1870d83407ec02a5f38d92c48982c3f210a4c25e2a1ce9f397f6fd0913",
         "reviewed": "6f65dc1870d83407ec02a5f38d92c48982c3f210a4c25e2a1ce9f397f6fd0913"
       },
       "packages/ai/src/providers/google-shared.ts": {
@@ -64,7 +111,7 @@
         "reviewed": "e2bbb3a97be5c7e6f1062f425629c71a2563afe376f58f5d566172c66b85b307"
       },
       "packages/catalog/src/compat/rules/classes/anthropic.kdl": {
-        "previous": "44f95848f146a2fed268771e5754fc3706ad6a864c43a36a97d31f40ab24385f",
+        "previous": "a1bac4e5c926bab68b22580192a864e9f890def407ec9a1e966fc6197de53718",
         "reviewed": "a1bac4e5c926bab68b22580192a864e9f890def407ec9a1e966fc6197de53718"
       },
       "packages/ai/src/utils/schema/normalize.ts": {
@@ -74,16 +121,204 @@
       "packages/ai/src/utils/schema/fields.ts": {
         "previous": "7bb5634a92529c195dc695be09344168821c8f3e532bfb041107573f0a858595",
         "reviewed": "7bb5634a92529c195dc695be09344168821c8f3e532bfb041107573f0a858595"
+      },
+      "packages/ai/src/registry/oauth/google-oauth-shared.ts": {
+        "previous": "3ae69bb87ebb52c63ac49f4638f6e765f47a18c93441c5c42bf010c4fc3c8249",
+        "reviewed": "3ae69bb87ebb52c63ac49f4638f6e765f47a18c93441c5c42bf010c4fc3c8249"
+      },
+      "packages/ai/src/registry/oauth/google-gemini-cli.ts": {
+        "previous": "81496804aefac30b37a40edfd9903937be1f80f3f3b2ea6e8eb496c7fb14e810",
+        "reviewed": "81496804aefac30b37a40edfd9903937be1f80f3f3b2ea6e8eb496c7fb14e810"
+      },
+      "packages/ai/src/registry/oauth/pkce.ts": {
+        "previous": "07fac71be1131222735e672bc19aab02ab7a67caf19e9b0f6fe404c8dce18cee",
+        "reviewed": "07fac71be1131222735e672bc19aab02ab7a67caf19e9b0f6fe404c8dce18cee"
+      },
+      "packages/ai/src/registry/oauth/callback-server.ts": {
+        "previous": "ada74119229d4b29249f304b0ae0742292e7ba4e1266da4380a722310d9b0026",
+        "reviewed": "ada74119229d4b29249f304b0ae0742292e7ba4e1266da4380a722310d9b0026"
+      },
+      "packages/ai/src/registry/oauth/index.ts": {
+        "previous": "04fdd210bd8ff2573cfdce20861b9436f402bcb87fe1e2de6721d620aecca25d",
+        "reviewed": "04fdd210bd8ff2573cfdce20861b9436f402bcb87fe1e2de6721d620aecca25d"
+      },
+      "packages/ai/src/registry/engine/oauth-code.ts": {
+        "previous": "77b35218e2cc73b73b6b8b307aeff26cda143336d174580d3541d115a9f88d61",
+        "reviewed": "77b35218e2cc73b73b6b8b307aeff26cda143336d174580d3541d115a9f88d61"
+      },
+      "packages/ai/src/registry/engine/refresh.ts": {
+        "previous": "d31d620d9dd817e6900525a7ddbf6bc79779167f33ca94d62548fc0e3a262e4c",
+        "reviewed": "d31d620d9dd817e6900525a7ddbf6bc79779167f33ca94d62548fc0e3a262e4c"
+      },
+      "packages/ai/src/registry/hooks/oauth-code.ts": {
+        "previous": "de5e378f6bcdbd83d0ea297c75fadad769916b550cb351f67e8a18db6557229d",
+        "reviewed": "de5e378f6bcdbd83d0ea297c75fadad769916b550cb351f67e8a18db6557229d"
+      },
+      "packages/ai/src/registry/hooks/types.ts": {
+        "previous": "8214fefabf52d6d0533a9a9ac56f729682bb4d5bd67bb49cc5d10faedb33d169",
+        "reviewed": "8214fefabf52d6d0533a9a9ac56f729682bb4d5bd67bb49cc5d10faedb33d169"
+      },
+      "packages/ai/src/registry/hooks/index.ts": {
+        "previous": "6f1ca7c5d82770d74774d281f2fe417c9d3d46528d161baba8e03ac4e9962988",
+        "reviewed": "6f1ca7c5d82770d74774d281f2fe417c9d3d46528d161baba8e03ac4e9962988"
+      },
+      "packages/ai/src/utils/abort.ts": {
+        "previous": "220ba6455345c7ce7456da41bf2c479ea0367c4607b7479fed3aa5019580d094",
+        "reviewed": "220ba6455345c7ce7456da41bf2c479ea0367c4607b7479fed3aa5019580d094"
+      },
+      "packages/ai/src/utils/google-validation.ts": {
+        "previous": "dc390959b8e5577c6e13bc528b8b4885459ee329d16b197a36f933f2fa6bd67a",
+        "reviewed": "dc390959b8e5577c6e13bc528b8b4885459ee329d16b197a36f933f2fa6bd67a"
+      },
+      "packages/ai/src/providers/transform-messages.ts": {
+        "previous": "38453e9564200331cdf4ac5860103d826287ebd345d9dfc5f459abd04768d608",
+        "reviewed": "38453e9564200331cdf4ac5860103d826287ebd345d9dfc5f459abd04768d608"
+      },
+      "packages/ai/src/providers/google-types.ts": {
+        "previous": "817303f60b6ae82a5cffcd31db3d422d647ba65cde3eeea458f1e9b20a42b9d3",
+        "reviewed": "817303f60b6ae82a5cffcd31db3d422d647ba65cde3eeea458f1e9b20a42b9d3"
+      },
+      "packages/ai/src/providers/google-antigravity-forced-tool.md": {
+        "previous": "691abb7311ca83162b7457f28e5d6cf120d2108b309337809b42dc31eed548c7",
+        "reviewed": "691abb7311ca83162b7457f28e5d6cf120d2108b309337809b42dc31eed548c7"
+      },
+      "packages/ai/src/providers/vision-guard.ts": {
+        "previous": "c39c6c136430701cc8e051bb51307d0fe7451afe1428501077be498db622869a",
+        "reviewed": "c39c6c136430701cc8e051bb51307d0fe7451afe1428501077be498db622869a"
+      },
+      "packages/ai/src/utils/idle-iterator.ts": {
+        "previous": "cf36434482733c0f2dca17ed37bf69e13a79a1b4328c5ac4a962deca1d941a6d",
+        "reviewed": "cf36434482733c0f2dca17ed37bf69e13a79a1b4328c5ac4a962deca1d941a6d"
+      },
+      "packages/ai/src/utils/event-stream.ts": {
+        "previous": "ca48025e83e6d213df0d5353cedc33cf731d51622229c0186a9bed1c83f5d13d",
+        "reviewed": "ca48025e83e6d213df0d5353cedc33cf731d51622229c0186a9bed1c83f5d13d"
+      },
+      "packages/ai/src/utils/schema/index.ts": {
+        "previous": "ad0e2fd43bf74c0bc3abb753b106e99cd13d7993d2d550b5c4fe50b4d0925a0c",
+        "reviewed": "ad0e2fd43bf74c0bc3abb753b106e99cd13d7993d2d550b5c4fe50b4d0925a0c"
+      },
+      "packages/ai/src/utils/schema/dereference.ts": {
+        "previous": "35bb9ae33291c2f363a85e858b69720c15e35c3065c3e4f4afabcab185b8e657",
+        "reviewed": "35bb9ae33291c2f363a85e858b69720c15e35c3065c3e4f4afabcab185b8e657"
+      },
+      "packages/ai/src/utils/schema/draft.ts": {
+        "previous": "df587a604fee6106312d3161e7da281b058afa9d00e40dd7f263dd55992fe86d",
+        "reviewed": "df587a604fee6106312d3161e7da281b058afa9d00e40dd7f263dd55992fe86d"
+      },
+      "packages/ai/src/utils/schema/wire.ts": {
+        "previous": "139d589619a13e3ba00040e9e673ba2b856ddf917de9dcc6c94f368a7f3a68b5",
+        "reviewed": "139d589619a13e3ba00040e9e673ba2b856ddf917de9dcc6c94f368a7f3a68b5"
+      },
+      "packages/ai/src/utils/schema/spill.ts": {
+        "previous": "e3c0bd717c0df056daed1b60147dd2ffe6bd0c1996a0d2f6d0cc89f796a12a10",
+        "reviewed": "e3c0bd717c0df056daed1b60147dd2ffe6bd0c1996a0d2f6d0cc89f796a12a10"
+      },
+      "packages/ai/src/utils/schema/compatibility.ts": {
+        "previous": "9b3c2aad4974b8c42528055fd04aadda167c99922b3f70e7bce1fa6b5b7f9400",
+        "reviewed": "9b3c2aad4974b8c42528055fd04aadda167c99922b3f70e7bce1fa6b5b7f9400"
+      },
+      "packages/catalog/src/compat/collapse.ts": {
+        "previous": "ff797b40a5f2ed100c5191b8f1f01403dc5ad7e303767d2400771c3148bb99ef",
+        "reviewed": "ff797b40a5f2ed100c5191b8f1f01403dc5ad7e303767d2400771c3148bb99ef"
+      },
+      "packages/catalog/src/utils.ts": {
+        "previous": "69b1283c8adec45eb16e97911d47b0f97f3bfec50b0a015956462f872ad88050",
+        "reviewed": "69b1283c8adec45eb16e97911d47b0f97f3bfec50b0a015956462f872ad88050"
+      },
+      "packages/ai/src/utils/schema/adapt.ts": {
+        "previous": "ab1b5c98cc001d0f92a18f3fbb66ec030cd3ca673366e781995ebc3acedf967c",
+        "reviewed": "ab1b5c98cc001d0f92a18f3fbb66ec030cd3ca673366e781995ebc3acedf967c"
+      },
+      "packages/ai/src/utils/schema/allowlist.ts": {
+        "previous": "f0c42aaead1f536d1d12dfc303d4e9fe431451b9bd0bb31f47d04486c195407a",
+        "reviewed": "f0c42aaead1f536d1d12dfc303d4e9fe431451b9bd0bb31f47d04486c195407a"
+      },
+      "packages/ai/src/utils/schema/equality.ts": {
+        "previous": "e82829d6a592b4acaee73af6b71e2c9f0fcbe6f546f5f7639d0101efc02554c8",
+        "reviewed": "e82829d6a592b4acaee73af6b71e2c9f0fcbe6f546f5f7639d0101efc02554c8"
+      },
+      "packages/ai/src/utils/schema/strict-tool-validation.ts": {
+        "previous": "edd32e2cfa4ea2b68cd1666ff49d27c272ef82f5a7d43f1b7e25e2518979fc63",
+        "reviewed": "edd32e2cfa4ea2b68cd1666ff49d27c272ef82f5a7d43f1b7e25e2518979fc63"
+      },
+      "packages/ai/src/utils/schema/types.ts": {
+        "previous": "8e6f8d41e7a370337d96fbb152219001090f61898af6a20efafdbd586160c01d",
+        "reviewed": "8e6f8d41e7a370337d96fbb152219001090f61898af6a20efafdbd586160c01d"
+      },
+      "packages/ai/src/utils/schema/stamps.ts": {
+        "previous": "96348540f3a1ebb2df9c009ca7592782d8824ad4e2456f2aaece63bd98c93d1e",
+        "reviewed": "96348540f3a1ebb2df9c009ca7592782d8824ad4e2456f2aaece63bd98c93d1e"
+      },
+      "packages/ai/src/utils/schema/json-schema-validator.ts": {
+        "previous": "8b04d94128301eabc32cbcda1d17aa02c76c3e8279e2ff90c62dfa251a4ecf39",
+        "reviewed": "8b04d94128301eabc32cbcda1d17aa02c76c3e8279e2ff90c62dfa251a4ecf39"
+      },
+      "packages/ai/src/utils/schema/meta-validator.ts": {
+        "previous": "a1ee5fcba606d8ecdd67693044df7be2a4b7ae3d0f5104dd5b399a801b2d0192",
+        "reviewed": "a1ee5fcba606d8ecdd67693044df7be2a4b7ae3d0f5104dd5b399a801b2d0192"
+      },
+      "packages/ai/src/utils/schema/typescript.ts": {
+        "previous": "6e4f6d750ffcdc495f0d10149cbfc42fd01fb26b8280e68db65b0fc5d9a12bfe",
+        "reviewed": "6e4f6d750ffcdc495f0d10149cbfc42fd01fb26b8280e68db65b0fc5d9a12bfe"
+      },
+      "packages/ai/src/utils.ts": {
+        "previous": "864673f56623ca4520f21a3da303dfa5cf17e4dca54a30e86813740e36cb686a",
+        "reviewed": "864673f56623ca4520f21a3da303dfa5cf17e4dca54a30e86813740e36cb686a"
+      },
+      "packages/ai/src/registry/engine/common.ts": {
+        "previous": "3e127fa16b70260c69e92970ee1a449bdc98ba71fd56036bfea1aa1437c8af2f",
+        "reviewed": "3e127fa16b70260c69e92970ee1a449bdc98ba71fd56036bfea1aa1437c8af2f"
+      },
+      "packages/utils/src/abortable.ts": {
+        "previous": "d57f211accb863e33a2efee693e93819ddc21b3aa2f40e7c5cb8961fd7922007",
+        "reviewed": "d57f211accb863e33a2efee693e93819ddc21b3aa2f40e7c5cb8961fd7922007"
+      },
+      "packages/utils/src/fetch-retry.ts": {
+        "previous": "2d211b23db03a8fcb4a3732b987207a0716b765609aa36273a45fd2656001ca6",
+        "reviewed": "2d211b23db03a8fcb4a3732b987207a0716b765609aa36273a45fd2656001ca6"
+      },
+      "packages/utils/src/tls-fetch.ts": {
+        "previous": "84277bcde761a23ec53589773c723f4d057747d6d549b52440dc82071b773761",
+        "reviewed": "84277bcde761a23ec53589773c723f4d057747d6d549b52440dc82071b773761"
+      },
+      "packages/ai/src/auth-retry.ts": {
+        "previous": "2fe9793344bf83b898531c1302ffb6eff7fe43d96aee0cc0286b3e96d7c6a98f",
+        "reviewed": "fd67e9e5017a852d40ce9a6c9a20c4ad47221d16b4d77ef17347c53e89647fdf"
+      },
+      "packages/ai/src/auth-gateway/server.ts": {
+        "previous": "4539db81e651303e0279582d255eef7418ed81f0bab3e61a413d6962498fb935",
+        "reviewed": "0ff0d6a0674728365d6edec9816236a7addb3dfd1d24eaade380dff7b65f65da"
+      },
+      "packages/ai/package.json": {
+        "previous": "43058efe0da6cfc210a9e078947f68ae8bd9c98b8aec1c4e6a89afc7fb41133c",
+        "reviewed": "e00021db3c1e615235c5e356f7f912b1eec534d7eeb5f87aaed1a7cfafe32762"
+      },
+      "packages/catalog/package.json": {
+        "previous": "5fb375e7b6e929b4771ebfa1f55d432ac42ccff1e4c1e3e5a2f352e1abbbe8f1",
+        "reviewed": "4700f9652f97890a312413a5ca1e2755d03998451940fe48404a9df93d544eff"
+      },
+      "packages/utils/package.json": {
+        "previous": "b747f9546cb4d169da7c144dd6bd512707b6d224719c753db3c866e4afe9aee4",
+        "reviewed": "0fba6cd4bf46ae494b2e061975080677f04844d16c1f80ecbc637fe41be2df1b"
+      },
+      "packages/catalog/src/compat/axes.ts": {
+        "previous": "428ec5e7f2cbb8580bbf29b3d879806fcf820eae464a278cb9abf99c69a0b736",
+        "reviewed": "4ad9c0df7014578f8b3eee5391ef428c6fd8a3b3f5dfb6e1fd23fe929579e70a"
+      },
+      "packages/catalog/src/compat/anthropic.ts": {
+        "previous": "56678e294f96fc8c646d8af16897a056eebf7464cc1773f7f3626f59724976c3",
+        "reviewed": "6d683aa6ab8149d79b07d42145cee077db7780412238f6306ad60d9f5e9f1589"
       }
     }
   },
   "identity": {
-    "user_agent": "antigravity/hub/2.24.0 (aidev_client; os_type=darwin; arch=arm64; cl=963137146)",
-    "version": "2.24.0",
+    "user_agent": "antigravity/hub/2.26.0 (aidev_client; os_type=darwin; arch=arm64; cl=963137146)",
+    "version": "2.26.0",
     "automatic_identity_updates": false,
     "caller_identity_overrides": false,
     "request_user_agent": "antigravity",
-    "evidence": "Version pinned from the official 2026-10-21 Hub manifest using the unchanged reviewed OMP constructor. The darwin/arm64 identity and cl=963137146 remain the constructor constants, not a new native-client traffic capture; the artifact build locator is not treated as a changelist."
+    "evidence": "Version pinned from the official 2026-10-24 Hub manifest using the unchanged reviewed OMP constructor. OMP resolves this version from the same manifest at runtime; the router adopts it through reviewed builds. The darwin/arm64 identity and cl=963137146 remain constructor constants, not a new native 2.26.0 traffic capture."
   },
   "destinations": {
     "inference_origin": "https://daily-cloudcode-pa.googleapis.com",
@@ -116,7 +351,9 @@
       "client_secret_sha256": "1d2f041093fd95aa8995a038c711d50a7960da09a505381c09a745d6ad0ecc60",
       "runtime_verification": "Compiled baseline checks decoded registration fingerprints; saved session client ID must match configuration before authenticated traffic, including unexpired tokens. Metadata drift never auto-updates registration."
     },
-    "baseline_upgrade": "A stored prior baseline remains blocked until the operator explicitly runs agy resume with the gateway stopped. Resume preserves the matching OAuth session and rotates its generation; no automatic state migration or new consent is performed."
+    "baseline_upgrade": "A stored prior baseline remains blocked until the operator explicitly runs agy resume with the gateway stopped. Resume preserves the matching OAuth session and rotates its generation; no automatic state migration or new consent is performed.",
+    "refresh_skew_seconds": 300,
+    "refresh_expiry_storage": "Actual provider expiry is retained; token dispatch renews within OMP's five-minute skew window, equivalent to its expires_in minus 300000ms credential mapping."
   },
   "request_contract": {
     "envelope_fields": [

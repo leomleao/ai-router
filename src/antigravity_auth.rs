@@ -1,6 +1,6 @@
 //! Router-owned Google authorization. Never imports AGY/OMP token files.
 //! All authenticated operations share this gate and fixed, reviewed origins.
-//! OAuth registration provenance: OMP d5cd750e, catalog auth/google-antigravity.kdl.
+//! OAuth registration provenance: OMP 0b5c27ab, catalog auth/google-antigravity.kdl.
 //! This bundled installed-app registration was explicitly selected by the operator.
 //! Login is an explicit account recovery exception; protocol restrictions still apply.
 use crate::protocol::ApiError;
@@ -33,8 +33,11 @@ use tokio_util::sync::CancellationToken;
 
 pub const CCA_ORIGIN: &str = "https://daily-cloudcode-pa.googleapis.com";
 pub const PINNED_USER_AGENT: &str =
-    "antigravity/hub/2.24.0 (aidev_client; os_type=darwin; arch=arm64; cl=963137146)";
-pub const BASELINE_REVISION: &str = "omp-d5cd750e-antigravity-v2";
+    "antigravity/hub/2.26.0 (aidev_client; os_type=darwin; arch=arm64; cl=963137146)";
+pub const BASELINE_REVISION: &str = "omp-0b5c27ab-antigravity-v3";
+// Match OMP's google-antigravity credential expires.skew-ms=300000.
+// Store actual expiry; renew before dispatch inside the same five-minute window.
+const TOKEN_REFRESH_SKEW_SECS: u64 = 300;
 /// The reviewed baseline is compiled into the binary, never loaded from a
 /// runtime path or changed by release metadata or environment variables.
 pub fn baseline_valid() -> bool {
@@ -49,6 +52,7 @@ fn baseline_document_valid(document: &str) -> bool {
     bundled_registration_valid(&v)
         && v["schema_version"] == 1
         && v["adapter_revision"] == BASELINE_REVISION
+        && v["authentication"]["refresh_skew_seconds"] == TOKEN_REFRESH_SKEW_SECS
         && v.pointer("/identity/user_agent").and_then(Value::as_str) == Some(PINNED_USER_AGENT)
         && v.pointer("/identity/version").and_then(Value::as_str)
             == Some(crate::antigravity_release::PINNED_VERSION)
@@ -442,7 +446,7 @@ impl AntigravityAuth {
         }
         self.ensure_registration(&state)?;
         let mut session = state.session.clone().ok_or_else(auth_required)?;
-        if session.expires_at <= now().saturating_add(90) {
+        if session.expires_at <= now().saturating_add(TOKEN_REFRESH_SKEW_SECS) {
             let mut form = vec![
                 ("grant_type", "refresh_token"),
                 ("client_id", session.client_id.as_str()),
@@ -1388,70 +1392,72 @@ mod tests {
 
     #[tokio::test]
     async fn reviewed_upgrade_requires_explicit_resume_and_preserves_the_matching_session() {
-        let (_root, auth) = store();
-        let generation = seed(&auth).await;
-        let lock = auth
-            .lock(Instant::now() + Duration::from_secs(1))
-            .await
-            .unwrap();
-        let mut state = lock.read().unwrap();
-        state.baseline = "omp-2220e581-antigravity-v1".into();
-        let session_before = serde_json::to_value(&state.session).unwrap();
-        lock.write(&state).unwrap();
-        drop(lock);
-        let status = auth.status().await.unwrap();
-        assert_eq!(status["baseline_update_required"], true);
-        assert_eq!(status["protocol_blocked"], false);
-        assert_eq!(status["authenticated"], true);
-        assert_eq!(status["available"], false);
-        assert_eq!(
-            auth.token(Instant::now() + Duration::from_secs(1))
+        for previous in ["omp-2220e581-antigravity-v1", "omp-d5cd750e-antigravity-v2"] {
+            let (_root, auth) = store();
+            let generation = seed(&auth).await;
+            let lock = auth
+                .lock(Instant::now() + Duration::from_secs(1))
                 .await
-                .err()
-                .unwrap()
-                .code,
-            "agy_baseline_update_required"
-        );
-        assert_eq!(
-            auth.dispatch_guard(&generation, Instant::now() + Duration::from_secs(1))
-                .await
-                .err()
-                .unwrap()
-                .code,
-            "agy_baseline_update_required"
-        );
+                .unwrap();
+            let mut state = lock.read().unwrap();
+            state.baseline = previous.into();
+            let session_before = serde_json::to_value(&state.session).unwrap();
+            lock.write(&state).unwrap();
+            drop(lock);
+            let status = auth.status().await.unwrap();
+            assert_eq!(status["baseline_update_required"], true);
+            assert_eq!(status["protocol_blocked"], false);
+            assert_eq!(status["authenticated"], true);
+            assert_eq!(status["available"], false);
+            assert_eq!(
+                auth.token(Instant::now() + Duration::from_secs(1))
+                    .await
+                    .err()
+                    .unwrap()
+                    .code,
+                "agy_baseline_update_required"
+            );
+            assert_eq!(
+                auth.dispatch_guard(&generation, Instant::now() + Duration::from_secs(1))
+                    .await
+                    .err()
+                    .unwrap()
+                    .code,
+                "agy_baseline_update_required"
+            );
 
-        auth.resume(&generation).await.unwrap();
-        let lock = auth
-            .lock(Instant::now() + Duration::from_secs(1))
-            .await
-            .unwrap();
-        let after = lock.read().unwrap();
-        assert_eq!(
-            serde_json::to_value(&after.session).unwrap(),
-            session_before
-        );
-        assert_eq!(after.baseline, BASELINE_REVISION);
-        assert_ne!(after.generation, generation);
-        let current = after.generation;
-        drop(lock);
-        assert_eq!(
-            auth.status().await.unwrap()["baseline_update_required"],
-            false
-        );
-        assert!(auth.availability_error().await.is_none());
-        assert_eq!(
-            auth.try_validate_generation(&generation, Instant::now() + Duration::from_secs(1))
-                .err()
-                .unwrap()
-                .code,
-            "agy_session_changed"
-        );
-        assert!(
-            auth.dispatch_guard(&current, Instant::now() + Duration::from_secs(1))
+            auth.resume(&generation).await.unwrap();
+            let lock = auth
+                .lock(Instant::now() + Duration::from_secs(1))
                 .await
-                .is_ok()
-        );
+                .unwrap();
+            let after = lock.read().unwrap();
+            assert_eq!(
+                serde_json::to_value(&after.session).unwrap(),
+                session_before
+            );
+            assert_eq!(after.baseline, BASELINE_REVISION);
+            assert_ne!(after.generation, generation);
+            let current = after.generation;
+            drop(lock);
+            assert_eq!(
+                auth.status().await.unwrap()["baseline_update_required"],
+                false
+            );
+            assert!(auth.availability_error().await.is_none());
+            assert_eq!(
+                auth.try_validate_generation(&generation, Instant::now() + Duration::from_secs(1))
+                    .err()
+                    .unwrap()
+                    .code,
+                "agy_session_changed"
+            );
+            assert!(
+                auth.dispatch_guard(&current, Instant::now() + Duration::from_secs(1))
+                    .await
+                    .is_ok()
+            );
+        }
     }
 
     #[tokio::test]
@@ -1568,6 +1574,56 @@ mod tests {
         assert_eq!(s["protocol_blocked"], true);
         assert_eq!(s["authenticated"], false);
     }
+    #[tokio::test]
+    async fn omp_refresh_window_renews_a_still_valid_token_before_dispatch() {
+        use axum::{Json, Router, routing::post};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let requests = Arc::new(AtomicUsize::new(0));
+        let count = requests.clone();
+        let app=Router::new().route("/token",post(move || {
+            let count=count.clone();
+            async move {
+                count.fetch_add(1,Ordering::SeqCst);
+                Json(json!({"access_token":"synthetic-renewed-access","token_type":"Bearer","expires_in":3600}))
+            }
+        }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let root = tempfile::tempdir().unwrap();
+        let auth = AntigravityAuth::synthetic(root.path().join("state"), origin).await;
+        for (remaining, expected, calls) in [
+            (360, "synthetic-access", 0),
+            (240, "synthetic-renewed-access", 1),
+        ] {
+            let lock = auth
+                .lock(Instant::now() + Duration::from_secs(1))
+                .await
+                .unwrap();
+            let mut state = lock.read().unwrap();
+            state.session.as_mut().unwrap().expires_at = now() + remaining;
+            let before = state.session.as_ref().unwrap().clone();
+            lock.write(&state).unwrap();
+            drop(lock);
+            let token = auth
+                .token(Instant::now() + Duration::from_secs(2))
+                .await
+                .unwrap();
+            assert_eq!(token.access_token, expected);
+            assert_eq!(requests.load(Ordering::SeqCst), calls);
+            let state = auth
+                .lock(Instant::now() + Duration::from_secs(1))
+                .await
+                .unwrap()
+                .read()
+                .unwrap();
+            let after = state.session.unwrap();
+            assert_eq!(after.project, before.project);
+            assert_eq!(after.refresh_token, before.refresh_token);
+        }
+        server.abort();
+    }
+
     #[tokio::test]
     async fn refresh_is_serialized_and_survives_caller_cancellation() {
         use axum::{Json, Router, routing::post};
@@ -1999,6 +2055,7 @@ mod tests {
             "/adapter_revision",
             "/identity/user_agent",
             "/identity/version",
+            "/authentication/refresh_skew_seconds",
             "/source/commit",
             "/destinations/inference_origin",
             "/destinations/inference_path",

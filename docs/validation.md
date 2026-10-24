@@ -1,5 +1,10 @@
 # Local validation
 
+The [2026-10-24 OMP alignment review](upstream-review-2026-10-24.md) records
+the Hub 2.26.0 / OMP 0b5c27ab baseline, five-minute OAuth refresh alignment,
+243 passing Rust tests and the explicit session-preserving adoption procedure.
+Live acceptance for that baseline remains a separate operator check.
+
 The subsequent [n8n compatibility regression review](n8n-compatibility.md) records
 the schema fix, diagnostic privacy checks, restored CLI coverage, and separate
 Vercel/LangChain client matrices. Historical counts below describe the earlier

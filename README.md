@@ -113,7 +113,9 @@ fails with a real HTTP error until its first output. See
 
 ## Operations and design notes
 
-[The latest upstream review](docs/upstream-review-2026-10-21.md) records the Hub 2.24.0 baseline and explicit session-preserving upgrade.
+[The latest upstream review](docs/upstream-review-2026-10-24.md) records the Hub 2.26.0 baseline, OMP-aligned token renewal, and explicit session-preserving upgrade.
+[The OMP alignment policy](docs/omp-alignment.md) explains why upstream OAuth and
+AGY protocol changes must be reviewed and carried into the router.
 [Local operations](docs/operations.md) covers login, volumes, OpenAI opt-in,
 and monitoring. [Capabilities](docs/capabilities.md) describes the current
 model-only surface and validation limits. [Interfaces](docs/interfaces.md)
