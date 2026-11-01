@@ -108,3 +108,12 @@ The subsequent [completed review](upstream-review-2026-10-24.md) expanded the
 comparison to 59 source files and adopted Hub 2.26.0 / OMP 0b5c27ab. It also
 aligned the router's token-renewal margin with OMP's five-minute window. The
 [preceding review](upstream-review-2026-10-21.md) remains historical evidence.
+
+## Observation on 2026-11-01
+
+The [completed review](upstream-review-2026-11-01.md) compares 65 public source
+and test files and adopts Hub **2.28.2** / OMP **686b5e2f**. Relevant changes
+include the additional `aicode` OAuth scope, native-build identity and headers,
+request labels and discovery-provided generation settings. Fresh Google consent
+is required for existing sessions; resume adopts the baseline but cannot add
+the scope. Live acceptance remains an operator check after adoption.

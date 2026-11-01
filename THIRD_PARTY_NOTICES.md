@@ -4,7 +4,7 @@
 
 The Antigravity adapter translates selected protocol behaviour from
 [oh-my-pi](https://github.com/can1357/oh-my-pi), revision
-`0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0` (reviewed 2026-10-24). Source provenance:
+`686b5e2fb542848dc3ff1a9e36a42a8fefdd2278` (reviewed 2026-11-01). Source provenance:
 
 - `packages/ai/src/providers/google-gemini-cli.ts`
 - `packages/ai/src/providers/google-shared.ts`
@@ -16,6 +16,7 @@ The Antigravity adapter translates selected protocol behaviour from
 - `packages/ai/src/registry/engine/common.ts`
 - `packages/ai/src/registry/engine/refresh.ts`
 - `packages/catalog/src/discovery/antigravity.ts`
+- `packages/catalog/src/types.ts`
 
 Visible-content rewriting, dynamic client identity, endpoint failover, automatic
 onboarding and agent-side tool execution are not incorporated.

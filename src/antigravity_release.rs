@@ -9,8 +9,8 @@ use std::{
 };
 use tokio::sync::Mutex;
 
-pub const PINNED_VERSION: &str = "2.26.0";
-pub const PINNED_REVISION: &str = "0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0";
+pub const PINNED_VERSION: &str = "2.28.2";
+pub const PINNED_REVISION: &str = "686b5e2fb542848dc3ff1a9e36a42a8fefdd2278";
 pub const MANIFEST_URL: &str = "https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest/latest-arm64-mac.yml";
 pub const REVISION_URL: &str = "https://api.github.com/repos/can1357/oh-my-pi/commits/main";
 const MAX_BYTES: usize = 64 * 1024;

@@ -1,7 +1,7 @@
 //! Pinned Cloud Code Assist wire conversion. No transport, credentials, or logging.
 //!
 //! Protocol provenance: oh-my-pi, MIT, commit
-//! 0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0, packages/ai/src/providers/
+//! 686b5e2fb542848dc3ff1a9e36a42a8fefdd2278, packages/ai/src/providers/
 //! google-gemini-cli.ts and google-shared.ts, plus packages/catalog/src/wire/
 //! gemini-headers.ts. See THIRD_PARTY_NOTICES.md for the upstream notice.
 //! Visible text is preserved. Tool schemas use CCA-compatible provider hints;
@@ -259,6 +259,14 @@ fn session_id(request: &RunRequest) -> Result<String, ApiError> {
 /// while a conflict is rejected rather than silently selecting another tier.
 /// OpenAI's `none`/`minimal` are not tiers here: the API clears and discloses them.
 pub fn serialize(request: &RunRequest, project: &str, replay: &[Value]) -> Result<Value, ApiError> {
+    serialize_with_profile(request, project, replay, None)
+}
+pub(crate) fn serialize_with_profile(
+    request: &RunRequest,
+    project: &str,
+    replay: &[Value],
+    profile: Option<&crate::antigravity_profile::WireProfile>,
+) -> Result<Value, ApiError> {
     if project.is_empty()
         || project.len() > 256
         || !project
@@ -504,8 +512,8 @@ pub fn serialize(request: &RunRequest, project: &str, replay: &[Value]) -> Resul
             ));
         }
     }
-    // All current IDs are absent from OMP's observed fixed-profile table. In
-    // particular, do not guess a numeric thinking budget or output ceiling.
+    // Current IDs use the serving account's discovered profile when available;
+    // do not guess a numeric thinking budget or output ceiling when absent.
     // Pinned CCA model compat differs by family: Claude supports function-part
     // IDs, while Gemini uses ordered groups without wire IDs. Claude also
     // rejects unsigned thinking on replay. Preserve client IDs internally.
@@ -555,8 +563,25 @@ pub fn serialize(request: &RunRequest, project: &str, replay: &[Value]) -> Resul
     let agent = uuid::Uuid::new_v4().to_string();
     let session = session_id(request)?;
     let claude = request.model.starts_with("claude-").to_string();
+    // Match OMP's direct/stateless envelope. Each model/user turn and each
+    // separate tool result is a trajectory step; IDs remain ephemeral per call.
+    let step = contents
+        .iter()
+        .map(|turn| {
+            turn["parts"].as_array().map_or(1, |parts| {
+                let results = parts
+                    .iter()
+                    .filter(|p| p.get("functionResponse").is_some())
+                    .count();
+                results.max(1)
+            })
+        })
+        .sum::<usize>()
+        .max(1);
     let mut body = json!({"contents":contents,"sessionId":session,"labels":{
-        "last_step_index":"1","trajectory_id":trajectory,"used_claude":claude,"used_claude_conservative":claude
+        "cascade_id":agent,"last_step_index":(step-1).to_string(),"request_id":format!("{trajectory}-0"),
+        "root_cascade_id":agent,"trajectory_id":trajectory,"used_claude":claude,"used_claude_conservative":claude,
+        "used_non_gemini_model":(!request.model.starts_with("gemini-")).to_string()
     }});
     if !system.is_empty() {
         body["systemInstruction"] = json!({"role":"user","parts":system});
@@ -603,8 +628,11 @@ pub fn serialize(request: &RunRequest, project: &str, replay: &[Value]) -> Resul
     } else if request.model.starts_with("claude-") {
         body["toolConfig"] = json!({"functionCallingConfig":{"mode":"VALIDATED"}});
     }
+    if let Some(profile) = profile {
+        profile.apply(&mut body);
+    }
     let envelope = json!({"project":project,"model":request.model,"request":body,
-        "requestId":format!("agent/{agent}/{}/{trajectory}/2",chrono::Utc::now().timestamp_millis()),
+        "requestId":format!("agent/{agent}/{}/{trajectory}/{step}",chrono::Utc::now().timestamp_millis()),
         "userAgent":"antigravity"});
     if serde_json::to_vec(&envelope).map_or(true, |v| v.len() > MAX_OUTPUT_BYTES) {
         return Err(ApiError::bad_request(
@@ -1093,8 +1121,22 @@ fn stream_error(value: &Value) -> ApiError {
         ),
         _ => invalid("provider_stream_error"),
     };
+    let details = value.get("details").and_then(Value::as_array);
+    let detail_types: Vec<_> = details
+        .into_iter()
+        .flatten()
+        .filter_map(|detail| match detail["@type"].as_str()? {
+            "type.googleapis.com/google.rpc.RetryInfo" => Some("RetryInfo"),
+            "type.googleapis.com/google.rpc.QuotaFailure" => Some("QuotaFailure"),
+            "type.googleapis.com/google.rpc.ErrorInfo" => Some("ErrorInfo"),
+            "type.googleapis.com/google.rpc.BadRequest" => Some("BadRequest"),
+            _ => None,
+        })
+        .take(8)
+        .collect();
     error.diagnostics = Some(crate::protocol::FailureDiagnostics::metadata(json!({
         "phase":"sse_error","provider_code":status,
+        "provider_detail_count":details.map_or(0,Vec::len),"provider_detail_types":detail_types,
     })));
     error
 }
@@ -1173,6 +1215,21 @@ mod tests {
     }
 
     #[test]
+    fn stream_error_details_record_only_allowlisted_type_metadata() {
+        let error = stream_error(
+            &json!({"code":429,"status":"RESOURCE_EXHAUSTED","message":"private provider message",
+            "details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"description":"private prompt"}]},
+                       {"@type":"private arbitrary type","private":"private argument"}]}),
+        );
+        assert_eq!(error.status, 429);
+        let metadata = &error.diagnostics.as_ref().unwrap().metadata;
+        assert_eq!(metadata["provider_detail_count"], 2);
+        assert_eq!(metadata["provider_detail_types"], json!(["QuotaFailure"]));
+        assert!(!metadata.to_string().contains("private"));
+        assert!(!error.response_body().to_string().contains("private"));
+    }
+
+    #[test]
     fn exact_model_effort_and_typed_history_preserve_json() {
         let mut request = request();
         request.effort = Some("medium".into());
@@ -1217,6 +1274,35 @@ mod tests {
     }
 
     #[test]
+    fn native_envelope_labels_and_discovered_profile_follow_the_current_contract() {
+        let request = request();
+        let profile=crate::antigravity_profile::WireProfile::from_row(&json!({"model":"MODEL_PLACEHOLDER_TEST","maxOutputTokens":8192,"supportsThinking":true,"thinkingLevel":2,"thinkingBudget":-1})).unwrap();
+        let body = serialize_with_profile(&request, "synthetic", &[], Some(&profile)).unwrap();
+        let id = body["requestId"]
+            .as_str()
+            .unwrap()
+            .split('/')
+            .collect::<Vec<_>>();
+        assert_eq!(id.last(), Some(&"1"));
+        let labels = &body["request"]["labels"];
+        assert_eq!(labels["cascade_id"], id[1]);
+        assert_eq!(labels["root_cascade_id"], id[1]);
+        assert_eq!(labels["request_id"], format!("{}-0", id[3]));
+        assert_eq!(labels["last_step_index"], "0");
+        assert_eq!(labels["used_non_gemini_model"], "false");
+        assert_eq!(body["request"]["generationConfig"]["maxOutputTokens"], 8192);
+        assert_eq!(
+            body["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "MEDIUM"
+        );
+        assert!(
+            body["request"]["generationConfig"]["thinkingConfig"]
+                .get("thinkingBudget")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn tool_schema_projection_keeps_the_original_contract_for_local_validation() {
         let mut request = tools_request();
         request.tools[0].parameters = json!({"type":"object","$defs":{"City":{"type":"string","const":"London"}},"properties":{"city":{"$ref":"#/$defs/City"}},"required":["city"],"additionalProperties":false});
@@ -1241,6 +1327,8 @@ mod tests {
             {"role":"tool","tool_call_id":"call_b","content":"second result"},
             {"role":"tool","tool_call_id":"call_a","content":"first result"}]}), "test".into()).unwrap();
         let body = serialize(&request, "project-test", &[]).unwrap();
+        assert!(body["requestId"].as_str().unwrap().ends_with("/4"));
+        assert_eq!(body["request"]["labels"]["last_step_index"], "3");
         let contents = &body["request"]["contents"];
         assert_eq!(contents[2]["parts"][0]["functionResponse"]["name"], "first");
         assert_eq!(

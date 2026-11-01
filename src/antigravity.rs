@@ -30,6 +30,25 @@ pub struct Antigravity {
     transport: AntigravityTransport,
     replay: Arc<Mutex<VecDeque<Replay>>>,
     cooldowns: Arc<Mutex<HashMap<String, Instant>>>,
+    profiles: Arc<Mutex<ProfileCatalogue>>,
+}
+#[derive(Default)]
+struct ProfileCatalogue {
+    generation: String,
+    models: HashMap<String, crate::antigravity_profile::WireProfile>,
+}
+impl ProfileCatalogue {
+    fn get(
+        &self,
+        generation: &str,
+        model: &str,
+    ) -> Option<crate::antigravity_profile::WireProfile> {
+        if self.generation == generation {
+            self.models.get(model).cloned()
+        } else {
+            None
+        }
+    }
 }
 struct Replay {
     owner: String,
@@ -54,6 +73,7 @@ impl Antigravity {
             release: ReleaseMonitor::new(),
             replay: Default::default(),
             cooldowns: Default::default(),
+            profiles: Default::default(),
         }
     }
     #[cfg(test)]
@@ -112,6 +132,18 @@ impl Antigravity {
                         .await?;
                     return Err(error);
                 }
+            };
+            *self.profiles.lock().await = ProfileCatalogue {
+                generation: token.generation.clone(),
+                models: models
+                    .iter()
+                    .filter_map(|model| {
+                        crate::antigravity_profile::WireProfile::from_row(
+                            &value["models"][&model.id],
+                        )
+                        .map(|profile| (model.id.clone(), profile))
+                    })
+                    .collect(),
             };
             status.models = models;
             status.registration_generation = Some(token.generation);
@@ -192,7 +224,17 @@ impl Antigravity {
                 .map(|e| e.value.clone())
                 .collect::<Vec<_>>()
         };
-        let body = antigravity_wire::serialize(request, &token.project, &replay)?;
+        let profile = self
+            .profiles
+            .lock()
+            .await
+            .get(&token.generation, &request.model);
+        let body = antigravity_wire::serialize_with_profile(
+            request,
+            &token.project,
+            &replay,
+            profile.as_ref(),
+        )?;
         let anchor = antigravity_wire::request_anchor(&body);
         let mut response = match self
             .transport
@@ -515,6 +557,102 @@ mod tests {
         assert!(models.iter().any(|m| m.id == "gemini-3.8-flash-high"));
         assert!(models.iter().any(|m| m.id == "claude-opus-5-5-medium"));
     }
+    #[tokio::test]
+    async fn discovery_profiles_reach_dispatch_and_expire_with_the_account_generation() {
+        use axum::{Json, Router, routing::post};
+        let observed = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let capture = observed.clone();
+        let mock=Router::new()
+            .route("/v1internal:fetchAvailableModels",post(|Json(body):Json<Value>| async move {
+                assert_eq!(body["project"],"synthetic-project");
+                Json(json!({"models":{"gemini-4-argon-medium":{"displayName":"Fixture","model":"MODEL_PLACEHOLDER_FIXTURE","maxOutputTokens":8192,"thinkingLevel":2,"thinkingBudget":-1,"supportsThinking":true}}}))
+            }))
+            .route("/v1internal:streamGenerateContent",post(move |Json(body):Json<Value>| {
+                let capture=capture.clone();async move {
+                    capture.lock().await.push(body);
+                    ([("content-type","text/event-stream")],format!("data: {}\n\n",json!({"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"done"}]},"finishReason":"STOP"}]}})))
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+        let root = tempfile::tempdir().unwrap();
+        let provider =
+            Antigravity::synthetic(Arc::new(Config::for_test(root.path())), origin).await;
+        assert!(provider.probe().await.authenticated);
+        for expected_cap in [Some(8192), None] {
+            if expected_cap.is_none() {
+                let generation = provider.generation().await.unwrap();
+                provider.auth.resume(&generation).await.unwrap();
+            }
+            let request=normalize_chat(json!({"model":"gemini-4-argon-medium","messages":[{"role":"user","content":"hello"}]}),"profile-fixture".into()).unwrap();
+            let mut run = provider
+                .start(request, CancellationToken::new())
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    match run.events.recv().await.unwrap() {
+                        RunEvent::Completed(result) => {
+                            assert_eq!(result.text, "done");
+                            break;
+                        }
+                        RunEvent::Error(error) => panic!("{error}"),
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            let bodies = observed.lock().await;
+            let body = bodies.last().unwrap();
+            assert_eq!(
+                body["request"]["generationConfig"]["maxOutputTokens"].as_u64(),
+                expected_cap
+            );
+            if expected_cap.is_some() {
+                assert_eq!(
+                    body["request"]["labels"]["model_enum"],
+                    "MODEL_PLACEHOLDER_FIXTURE"
+                );
+                assert_eq!(
+                    body["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+                    "MEDIUM"
+                );
+            } else {
+                assert!(body["request"]["labels"].get("model_enum").is_none());
+            }
+        }
+        server.abort();
+    }
+
+    #[test]
+    fn discovered_profiles_cannot_cross_model_or_account_generations() {
+        let catalogue = ProfileCatalogue {
+            generation: "account-a".into(),
+            models: HashMap::from([(
+                "gemini-4-argon-medium".into(),
+                crate::antigravity_profile::WireProfile::from_row(&json!({"maxOutputTokens":8192}))
+                    .unwrap(),
+            )]),
+        };
+        assert!(
+            catalogue
+                .get("account-a", "gemini-4-argon-medium")
+                .is_some()
+        );
+        assert!(
+            catalogue
+                .get("account-b", "gemini-4-argon-medium")
+                .is_none()
+        );
+        assert!(
+            catalogue
+                .get("account-a", "claude-sonnet-5-5-high")
+                .is_none()
+        );
+    }
+
     #[test]
     fn quota_cooldowns_are_explicit_family_scoped() {
         assert_eq!(family("gemini-4-argon-low"), family("gemini-4-argon-high"));

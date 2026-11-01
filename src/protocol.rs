@@ -15,6 +15,9 @@ pub(crate) fn error_explanation(provider: &str, code: &str) -> Option<&'static s
         ("agy", "agy_baseline_update_required") => Some(
             "Antigravity needs explicit adoption of its reviewed baseline. Stop the gateway, inspect login.sh agy status, then run login.sh agy resume to keep the existing sign-in.",
         ),
+        ("agy", "agy_scope_update_required") => Some(
+            "Antigravity requires fresh Google consent for the added aicode scope. Stop the gateway, adopt the reviewed baseline if required, then run login.sh agy login.",
+        ),
         ("openai", "server_is_overloaded") => Some(
             "OpenAI is temporarily overloaded. Try again shortly. The router did not retry automatically.",
         ),
@@ -160,6 +163,7 @@ const DETERMINISTIC_FAILURES: &[&str] = &[
     "agy_oauth_configuration_required",
     "agy_onboarding_required",
     "agy_scope_required",
+    "agy_scope_update_required",
     "provider_authentication_failed",
     "provider_account_restricted",
     "provider_disabled",

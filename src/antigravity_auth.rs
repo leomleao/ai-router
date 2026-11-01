@@ -1,6 +1,6 @@
 //! Router-owned Google authorization. Never imports AGY/OMP token files.
 //! All authenticated operations share this gate and fixed, reviewed origins.
-//! OAuth registration provenance: OMP 0b5c27ab, catalog auth/google-antigravity.kdl.
+//! OAuth registration provenance: OMP 686b5e2f, catalog auth/google-antigravity.kdl.
 //! This bundled installed-app registration was explicitly selected by the operator.
 //! Login is an explicit account recovery exception; protocol restrictions still apply.
 use crate::protocol::ApiError;
@@ -32,9 +32,26 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 pub const CCA_ORIGIN: &str = "https://daily-cloudcode-pa.googleapis.com";
+const LINUX_USER_AGENT: &str =
+    "antigravity/hub/2.28.2 (aidev_client; os_type=linux; arch=amd64; cl=1005016104)";
+#[cfg(target_os = "macos")]
 pub const PINNED_USER_AGENT: &str =
-    "antigravity/hub/2.26.0 (aidev_client; os_type=darwin; arch=arm64; cl=963137146)";
-pub const BASELINE_REVISION: &str = "omp-0b5c27ab-antigravity-v3";
+    "antigravity/hub/2.28.2 (aidev_client; os_type=darwin; arch=arm64; cl=1005016104)";
+#[cfg(target_os = "windows")]
+pub const PINNED_USER_AGENT: &str =
+    "antigravity/hub/2.28.2 (aidev_client; os_type=windows; arch=amd64; cl=1005016104)";
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub const PINNED_USER_AGENT: &str = LINUX_USER_AGENT;
+fn native_build() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "darwin"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else {
+        "linux"
+    }
+}
+pub const BASELINE_REVISION: &str = "omp-686b5e2f-antigravity-v4";
 // Match OMP's google-antigravity credential expires.skew-ms=300000.
 // Store actual expiry; renew before dispatch inside the same five-minute window.
 const TOKEN_REFRESH_SKEW_SECS: u64 = 300;
@@ -53,7 +70,10 @@ fn baseline_document_valid(document: &str) -> bool {
         && v["schema_version"] == 1
         && v["adapter_revision"] == BASELINE_REVISION
         && v["authentication"]["refresh_skew_seconds"] == TOKEN_REFRESH_SKEW_SECS
-        && v.pointer("/identity/user_agent").and_then(Value::as_str) == Some(PINNED_USER_AGENT)
+        && v["authentication"]["required_scopes"]
+            == json!(SCOPES.split_whitespace().collect::<Vec<_>>())
+        && v.pointer("/identity/user_agent").and_then(Value::as_str) == Some(LINUX_USER_AGENT)
+        && v["identity"]["user_agents"][native_build()].as_str() == Some(PINNED_USER_AGENT)
         && v.pointer("/identity/version").and_then(Value::as_str)
             == Some(crate::antigravity_release::PINNED_VERSION)
         && PINNED_USER_AGENT.starts_with(&format!(
@@ -87,7 +107,7 @@ fn baseline_document_valid(document: &str) -> bool {
 const AUTHORIZE: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN: &str = "https://oauth2.googleapis.com/token";
 const USERINFO: &str = "https://www.googleapis.com/oauth2/v1/userinfo?alt=json";
-const SCOPES: &str = "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/cclog https://www.googleapis.com/auth/experimentsandconfigs";
+const SCOPES: &str = "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/cclog https://www.googleapis.com/auth/experimentsandconfigs https://www.googleapis.com/auth/aicode";
 const MAX_STATE: usize = 128 * 1024;
 const MAX_HTTP: usize = 1024 * 1024;
 
@@ -222,6 +242,8 @@ struct Session {
     expires_at: u64,
     subject: String,
     project: String,
+    #[serde(default)]
+    scopes: Vec<String>,
 }
 impl Default for State {
     fn default() -> Self {
@@ -281,6 +303,7 @@ impl AntigravityAuth {
             expires_at: now() + 3600,
             subject: "synthetic-user".into(),
             project: "synthetic-project".into(),
+            scopes: SCOPES.split_whitespace().map(str::to_owned).collect(),
         });
         lock.write(&s).unwrap();
         drop(lock);
@@ -369,7 +392,7 @@ impl AntigravityAuth {
         let s = lock.read()?;
         self.observe_state(&s, &lock);
         Ok(
-            json!({"provider":"agy","adapter":BASELINE_REVISION,"authenticated":s.session.is_some(),"available":allowed(&s,None).is_ok() && self.ensure_registration(&s).is_ok(),"baseline_valid":baseline_valid(),"saved_baseline":s.baseline,"baseline_update_required":s.baseline != BASELINE_REVISION,"bundled_registration_valid":bundled_registration_valid(&compiled_baseline()),"registration_source":if self.config.validate().is_err(){"unconfigured"}else if registration_matches_baseline(&self.config,&compiled_baseline()){"reviewed_omp"}else{"operator_configured"},"session_registration_matches":s.session.as_ref().map(|session|session.client_id == self.config.client_id),"generation":s.generation,"protocol_blocked":s.protocol_block,"account_restriction":s.account_block,"project_resolved":s.session.as_ref().is_some_and(|s|!s.project.is_empty()),"registration_configured":self.config.validate().is_ok(),"legacy_auth_import":"unsupported_no_documented_handoff"}),
+            json!({"provider":"agy","adapter":BASELINE_REVISION,"authenticated":s.session.is_some(),"available":allowed(&s,None).is_ok() && self.ensure_registration(&s).is_ok(),"baseline_valid":baseline_valid(),"saved_baseline":s.baseline,"baseline_update_required":s.baseline != BASELINE_REVISION,"bundled_registration_valid":bundled_registration_valid(&compiled_baseline()),"registration_source":if self.config.validate().is_err(){"unconfigured"}else if registration_matches_baseline(&self.config,&compiled_baseline()){"reviewed_omp"}else{"operator_configured"},"session_registration_matches":s.session.as_ref().map(|session|session.client_id == self.config.client_id),"scope_update_required":s.session.as_ref().is_some_and(|session| !has_required_scopes(session)),"generation":s.generation,"protocol_blocked":s.protocol_block,"account_restriction":s.account_block,"project_resolved":s.session.as_ref().is_some_and(|s|!s.project.is_empty()),"registration_configured":self.config.validate().is_ok(),"legacy_auth_import":"unsupported_no_documented_handoff"}),
         )
     }
     pub async fn availability_error(&self) -> Option<ApiError> {
@@ -398,6 +421,13 @@ impl AntigravityAuth {
                 "agy_oauth_registration_changed",
                 "Saved session belongs to a different Google OAuth registration; sign in explicitly",
             ));
+        }
+        if state
+            .session
+            .as_ref()
+            .is_some_and(|session| !has_required_scopes(session))
+        {
+            return Err(scope_update_required());
         }
         Ok(())
     }
@@ -683,6 +713,7 @@ impl AntigravityAuth {
             expires_at: 0,
             subject: String::new(),
             project: String::new(),
+            scopes: Vec::new(),
         };
         update_tokens(&mut session, &reply, true)?;
         let (status, identity) = self
@@ -709,6 +740,7 @@ impl AntigravityAuth {
                     .post(self.endpoint(&format!("{CCA_ORIGIN}/v1internal:loadCodeAssist")))
                     .bearer_auth(&session.access_token)
                     .header("User-Agent", PINNED_USER_AGENT)
+                    .header("Accept-Encoding", "gzip")
                     .json(&json!({"metadata":{"ideType":"ANTIGRAVITY"}})),
                 deadline,
                 &initial_generation,
@@ -926,8 +958,14 @@ fn update_tokens(s: &mut Session, v: &Value, initial: bool) -> Result<(), ApiErr
             "Google did not grant renewable access; repeat explicit consent",
         ));
     }
+    if v.get("scope").is_some_and(|scope| !scope.is_string()) {
+        return Err(auth_required());
+    }
     if let Some(scope) = v.get("scope").and_then(Value::as_str) {
         let scopes: Vec<_> = scope.split_whitespace().collect();
+        if scopes.len() > 32 || scopes.iter().any(|s| s.len() > 256) {
+            return Err(auth_required());
+        }
         if !SCOPES.split_whitespace().all(|s| scopes.contains(&s)) {
             return Err(ApiError::new(
                 503,
@@ -935,6 +973,11 @@ fn update_tokens(s: &mut Session, v: &Value, initial: bool) -> Result<(), ApiErr
                 "Google did not grant all required Antigravity scopes",
             ));
         }
+        s.scopes = scopes.into_iter().map(str::to_owned).collect();
+    } else if initial {
+        // OAuth 2.0 token responses may omit scope when it is unchanged from
+        // the requested authorization grant. Refresh omission preserves it.
+        s.scopes = SCOPES.split_whitespace().map(str::to_owned).collect();
     }
     s.access_token = token.into();
     if let Some(refresh) = refresh {
@@ -942,6 +985,18 @@ fn update_tokens(s: &mut Session, v: &Value, initial: bool) -> Result<(), ApiErr
     }
     s.expires_at = now().saturating_add(expires);
     Ok(())
+}
+fn has_required_scopes(session: &Session) -> bool {
+    SCOPES
+        .split_whitespace()
+        .all(|scope| session.scopes.iter().any(|granted| granted == scope))
+}
+fn scope_update_required() -> ApiError {
+    ApiError::new(
+        503,
+        "agy_scope_update_required",
+        "Antigravity needs fresh Google consent for the reviewed aicode scope; stop the gateway, adopt the baseline if required, then run login.sh agy login",
+    )
 }
 fn existing_project(v: &Value) -> Result<String, ApiError> {
     let enrolled = v.get("currentTier").is_some_and(Value::is_object)
@@ -1324,6 +1379,10 @@ fn validate_state(s: &State) -> Result<(), ApiError> {
                 || s.client_id.len() > 1024
                 || s.project.len() > 1024
                 || s.subject.len() > 1024
+                || s.scopes.len() > 32
+                || s.scopes
+                    .iter()
+                    .any(|scope| scope.len() > 256 || scope.chars().any(char::is_whitespace))
         })
     {
         return Err(storage_error());
@@ -1358,6 +1417,7 @@ mod tests {
             expires_at: now() + 3600,
             subject: "synthetic-user".into(),
             project: "synthetic-project".into(),
+            scopes: SCOPES.split_whitespace().map(str::to_owned).collect(),
         });
         l.write(&s).unwrap();
         s.generation
@@ -1392,7 +1452,11 @@ mod tests {
 
     #[tokio::test]
     async fn reviewed_upgrade_requires_explicit_resume_and_preserves_the_matching_session() {
-        for previous in ["omp-2220e581-antigravity-v1", "omp-d5cd750e-antigravity-v2"] {
+        for previous in [
+            "omp-2220e581-antigravity-v1",
+            "omp-d5cd750e-antigravity-v2",
+            "omp-0b5c27ab-antigravity-v3",
+        ] {
             let (_root, auth) = store();
             let generation = seed(&auth).await;
             let lock = auth
@@ -1574,6 +1638,92 @@ mod tests {
         assert_eq!(s["protocol_blocked"], true);
         assert_eq!(s["authenticated"], false);
     }
+    #[tokio::test]
+    async fn old_scope_grants_require_fresh_consent_and_resume_does_not_escalate_them() {
+        let (_root, auth) = store();
+        let generation = seed(&auth).await;
+        let lock = auth
+            .lock(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        let mut state = lock.read().unwrap();
+        state.baseline = "omp-0b5c27ab-antigravity-v3".into();
+        state
+            .session
+            .as_mut()
+            .unwrap()
+            .scopes
+            .retain(|s| !s.ends_with("/aicode"));
+        let session_before = serde_json::to_value(&state.session).unwrap();
+        lock.write(&state).unwrap();
+        drop(lock);
+        assert_eq!(auth.status().await.unwrap()["scope_update_required"], true);
+        auth.resume(&generation).await.unwrap();
+        let status = auth.status().await.unwrap();
+        assert_eq!(status["authenticated"], true);
+        assert_eq!(status["available"], false);
+        assert_eq!(status["baseline_update_required"], false);
+        assert_eq!(status["protocol_blocked"], false);
+        assert_eq!(
+            auth.token(Instant::now() + Duration::from_secs(1))
+                .await
+                .err()
+                .unwrap()
+                .code,
+            "agy_scope_update_required"
+        );
+        let current = auth.generation().await.unwrap();
+        assert_eq!(
+            auth.dispatch_guard(&current, Instant::now() + Duration::from_secs(1))
+                .await
+                .err()
+                .unwrap()
+                .code,
+            "agy_scope_update_required"
+        );
+        let lock = auth
+            .lock(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        let mut state = lock.read().unwrap();
+        assert_eq!(
+            serde_json::to_value(&state.session).unwrap(),
+            session_before
+        );
+        // Omitted scope in a refresh response must never manufacture the new grant.
+        update_tokens(
+            state.session.as_mut().unwrap(),
+            &json!({"access_token":"synthetic-refreshed","token_type":"Bearer","expires_in":3600}),
+            false,
+        )
+        .unwrap();
+        assert!(!has_required_scopes(state.session.as_ref().unwrap()));
+        // A successful explicit authorization exchange supplies the reviewed grant.
+        update_tokens(state.session.as_mut().unwrap(),&json!({"access_token":"synthetic-new-consent","refresh_token":"synthetic-new-refresh","token_type":"Bearer","expires_in":3600,"scope":SCOPES}),true).unwrap();
+        lock.write(&state).unwrap();
+        drop(lock);
+        assert_eq!(auth.status().await.unwrap()["scope_update_required"], false);
+        assert!(auth.availability_error().await.is_none());
+    }
+    #[test]
+    fn legacy_session_json_without_scope_evidence_is_readable_but_not_dispatchable() {
+        let mut session = Session {
+            client_id: "synthetic-client".into(),
+            access_token: "synthetic-access".into(),
+            refresh_token: "synthetic-refresh".into(),
+            expires_at: now() + 3600,
+            subject: "synthetic-user".into(),
+            project: "synthetic-project".into(),
+            scopes: Vec::new(),
+        };
+        let mut value = serde_json::to_value(&session).unwrap();
+        value.as_object_mut().unwrap().remove("scopes");
+        session = serde_json::from_value(value).unwrap();
+        assert!(!has_required_scopes(&session));
+        update_tokens(&mut session,&json!({"access_token":"synthetic-new","refresh_token":"synthetic-renewable","token_type":"Bearer","expires_in":3600}),true).unwrap();
+        assert!(has_required_scopes(&session));
+    }
+
     #[tokio::test]
     async fn omp_refresh_window_renews_a_still_valid_token_before_dispatch() {
         use axum::{Json, Router, routing::post};
@@ -2056,6 +2206,8 @@ mod tests {
             "/identity/user_agent",
             "/identity/version",
             "/authentication/refresh_skew_seconds",
+            "/authentication/required_scopes",
+            "/identity/user_agents",
             "/source/commit",
             "/destinations/inference_origin",
             "/destinations/inference_path",
@@ -2096,6 +2248,7 @@ mod tests {
             expires_at: 0,
             subject: "u".into(),
             project: "p".into(),
+            scopes: SCOPES.split_whitespace().map(str::to_owned).collect(),
         };
         update_tokens(
             &mut s,

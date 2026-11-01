@@ -1,9 +1,21 @@
 # Local validation
 
-The [2026-10-24 OMP alignment review](upstream-review-2026-10-24.md) records
-the Hub 2.26.0 / OMP 0b5c27ab baseline, five-minute OAuth refresh alignment,
-243 passing Rust tests and the explicit session-preserving adoption procedure.
-Live acceptance for that baseline remains a separate operator check.
+The [2026-11-01 OMP alignment review](upstream-review-2026-11-01.md) records
+the Hub 2.28.2 / OMP 686b5e2f baseline. All **258 Rust tests** passed in the
+isolated Docker test environment with external networking disabled, including
+the real-TCP Python, Vercel, LangChain and Studio contracts. New fixtures cover
+native gzip headers/decompression, request labels, discovered profile dispatch
+and account-generation isolation, legacy scope evidence and fresh-consent
+gating, plus privacy of structured SSE detail metadata. The existing non-strict
+tool relay and strict enforcement regressions remain green.
+
+The updated binary built; monitor PTY, five login-helper tests, Docker policy,
+protected-context checks and formatting passed. Independent checks matched 65
+paired source hashes, six scopes and the unchanged public registration
+fingerprints. No live Google consent, token-expiry cycle, provider generation or
+server deployment was performed for this baseline. See the review for adoption
+and rollback requirements. The [October review](upstream-review-2026-10-24.md)
+is historical evidence.
 
 The subsequent [n8n compatibility regression review](n8n-compatibility.md) records
 the schema fix, diagnostic privacy checks, restored CLI coverage, and separate

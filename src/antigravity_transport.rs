@@ -60,37 +60,15 @@ impl AntigravityTransport {
             .dispatch_guard(&token.generation, deadline)
             .await?;
         let cancellation = self.auth.cancellation();
-        let mut outbound = self
+        let outbound = self
             .auth
             .client()
             .post(self.auth.endpoint(&format!("{CCA_ORIGIN}{}", op.path())))
             .bearer_auth(&token.access_token)
             .header("User-Agent", PINNED_USER_AGENT)
             .header("Content-Type", "application/json")
-            .header(
-                "Accept",
-                if op == Operation::Generate {
-                    "text/event-stream"
-                } else {
-                    "application/json"
-                },
-            )
+            .header("Accept-Encoding", "gzip")
             .body(bytes);
-        if op == Operation::Generate
-            && matches!(
-                body["model"].as_str(),
-                Some(
-                    "claude-opus-5-5-low"
-                        | "claude-opus-5-5-medium"
-                        | "claude-opus-5-5-high"
-                        | "claude-sonnet-5-5-low"
-                        | "claude-sonnet-5-5-medium"
-                        | "claude-sonnet-5-5-high"
-                )
-            )
-        {
-            outbound = outbound.header("anthropic-beta", "interleaved-thinking-2025-05-14");
-        }
         let send = outbound.send();
         tokio::pin!(send);
         let mut checks = tokio::time::interval(Duration::from_millis(100));
@@ -807,7 +785,7 @@ mod tests {
         server.abort();
     }
     #[tokio::test]
-    async fn claude_beta_header_is_fixed_and_family_scoped() {
+    async fn reviewed_native_headers_omit_the_claude_5_beta() {
         use std::sync::{Arc, Mutex};
         let seen = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
         let captured = seen.clone();
@@ -853,17 +831,53 @@ mod tests {
                 .await
                 .unwrap();
         }
-        assert_eq!(
-            *seen.lock().unwrap(),
-            vec![
-                Some("interleaved-thinking-2025-05-14".into()),
-                Some("interleaved-thinking-2025-05-14".into()),
-                None,
-                None
-            ]
-        );
+        assert_eq!(*seen.lock().unwrap(), vec![None, None, None, None]);
         server.abort();
     }
+    #[tokio::test]
+    async fn native_gzip_headers_and_decompression_are_used_for_cca() {
+        use base64::Engine;
+        let (origin, server) = mock(Router::new().route(
+            "/v1internal:streamGenerateContent",
+            post(|headers: axum::http::HeaderMap| async move {
+                assert_eq!(headers["user-agent"], PINNED_USER_AGENT);
+                assert_eq!(headers["accept-encoding"], "gzip");
+                assert!(headers.get("accept").is_none_or(|v| v == "*/*"));
+                assert!(headers.get("anthropic-beta").is_none());
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode("H4sIAAAAAAAC/0tJLEm0UiiuzCvJSC3JTObiAgD3VV7NEQAAAA==")
+                    .unwrap();
+                (
+                    [
+                        ("content-type", "text/event-stream"),
+                        ("content-encoding", "gzip"),
+                    ],
+                    bytes,
+                )
+            }),
+        ))
+        .await;
+        let root = tempfile::tempdir().unwrap();
+        let auth = AntigravityAuth::synthetic(root.path().join("state"), origin).await;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let token = auth.token(deadline).await.unwrap();
+        let mut response = AntigravityTransport::new(auth)
+            .post_json(
+                Operation::Generate,
+                &serde_json::json!({"model":"claude-opus-5-5-medium"}),
+                &token,
+                deadline,
+            )
+            .await
+            .unwrap();
+        let mut decoded = Vec::new();
+        while let Some(chunk) = response.chunk().await.unwrap() {
+            decoded.extend(chunk);
+        }
+        assert_eq!(decoded, b"data: synthetic\n\n");
+        server.abort();
+    }
+
     #[tokio::test]
     async fn expired_deadline_prevents_dispatch() {
         let d = tempfile::tempdir().unwrap();

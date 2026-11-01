@@ -120,20 +120,29 @@ renewal; they do not publish callback ports. Other non-login one-offs are offlin
 
 ### Adopting a newly reviewed baseline
 
-The 2026-10-24 release adopts `omp-0b5c27ab-antigravity-v3` / Hub 2.26.0,
-including OMP's five-minute token-renewal window.
-The OAuth registration is unchanged, so an existing matching Google sign-in can
-be retained. Build the new image, stop the gateway, inspect
-`./scripts/login.sh agy status`, then run `./scripts/login.sh agy resume` before
-starting it again. Use the actual image/container/volume overrides for a custom
-local deployment. An old saved baseline returns `agy_baseline_update_required`
-until this explicit step; the status includes `saved_baseline` and
-`baseline_update_required`. Review any existing account/protocol restrictions
-before resuming. Do not log in again or delete state just to update the baseline.
+The 2026-11-01 release adopts `omp-686b5e2f-antigravity-v4` / Hub 2.28.2.
+The public OAuth registration is unchanged, but OMP adds the `aicode` scope.
+Existing sessions need fresh Google consent; baseline adoption cannot grant a
+new permission. Sessions without recorded complete grants remain saved but
+unavailable and report `scope_update_required: true` / `agy_scope_update_required`.
 
-See [the upstream review](upstream-review-2026-10-24.md) for evidence, exact
-operator commands and the live-validation boundary. None of these changes
-requires an additional environment variable.
+Build the new image, finish active flows, stop the gateway and retain a private
+backup of the stopped auth volume for rollback. Inspect
+`./scripts/login.sh agy status`, review existing account/protocol restrictions,
+then run `./scripts/login.sh agy resume` to adopt an older saved baseline.
+Resume also clears restrictions and rotates the generation. Next run
+`./scripts/login.sh agy login` and complete Google consent before starting the
+gateway. A remote deployment needs loopback callback forwarding on port 1456.
+Use the actual image/container/volume overrides for a custom deployment, or
+`./login.sh` in the home-server deployment directory.
+
+Older binaries cannot read the new saved scope field. Rollback therefore needs
+the stopped-state backup, rather than pointing the old image at newly written
+state. Do not delete auth volumes or manually edit their contents.
+
+See [the upstream review](upstream-review-2026-11-01.md) for exact operator
+commands, evidence and the live-validation boundary. No additional environment
+variable or deployment configuration change is required.
 
 ### Upstream release advisory and manual updates
 
