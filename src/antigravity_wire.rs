@@ -197,6 +197,11 @@ fn anchor(contents: &[Value], system: &[Value]) -> Value {
             if let Some(response) = part.get("functionResponse") {
                 canonical.push(json!({"functionResponse":{"name":response["name"],"response":response["response"]}}));
             }
+            // Media changes the model's prompt just as text does. Bind replay
+            // state to these typed parts inside this in-memory hash only.
+            if part.get("inlineData").is_some() || part.get("fileData").is_some() {
+                canonical.push(json!({"media":part}));
+            }
         }
         json!({"role":content["role"],"parts":canonical})
     }).collect();
@@ -223,7 +228,7 @@ pub fn request_anchor(body: &Value) -> Value {
 
 fn session_id(request: &RunRequest) -> Result<String, ApiError> {
     if let Some(first_user) = request.input.iter().find(|item| item["role"] == "user") {
-        let text = text_content(&first_user["content"])?;
+        let text = session_text(&first_user["content"])?;
         if !text.trim().is_empty() {
             // OMP's stateless fallback derives a stable negative decimal from
             // the first user's text. Scope that derivation to this router's
@@ -254,6 +259,29 @@ fn session_id(request: &RunRequest) -> Result<String, ApiError> {
     }
 }
 
+fn session_text(value: &Value) -> Result<String, ApiError> {
+    if value.is_null() {
+        return Ok(String::new());
+    }
+    if let Some(text) = value.as_str() {
+        return Ok(text.to_owned());
+    }
+    let parts = value
+        .as_array()
+        .ok_or_else(|| ApiError::unsupported("session input content"))?;
+    let mut text = String::new();
+    for part in parts {
+        match part["type"].as_str() {
+            Some("input_text" | "output_text") => {
+                text.push_str(part["text"].as_str().unwrap_or_default())
+            }
+            Some("input_image" | "input_file") => {}
+            _ => return Err(ApiError::unsupported("session input content")),
+        }
+    }
+    Ok(text)
+}
+
 /// Serialize normalized typed history, never the CLI's rendered transcript.
 /// Current exact wire IDs encode effort; matching explicit effort is redundant,
 /// while a conflict is rejected rather than silently selecting another tier.
@@ -267,6 +295,9 @@ pub(crate) fn serialize_with_profile(
     replay: &[Value],
     profile: Option<&crate::antigravity_profile::WireProfile>,
 ) -> Result<Value, ApiError> {
+    if request.has_hosted_search() {
+        return Err(ApiError::unsupported("hosted web search for Antigravity"));
+    }
     if project.is_empty()
         || project.len() > 256
         || !project
@@ -353,11 +384,7 @@ pub(crate) fn serialize_with_profile(
                 if !matches!(role, "user" | "assistant") {
                     return Err(ApiError::unsupported("history role"));
                 }
-                let text = text_content(&item["content"])?;
-                let mut parts = Vec::new();
-                if !text.is_empty() {
-                    parts.push(json!({"text":text}));
-                }
+                let mut parts = crate::media::agy_parts(&item["content"])?;
                 if let Some(history_calls) = item.get("tool_calls").filter(|v| !v.is_null()) {
                     if role != "assistant" {
                         return Err(ApiError::bad_request("Invalid tool-call history"));
@@ -1270,6 +1297,54 @@ mod tests {
                 .unwrap()
                 .status,
             400
+        );
+    }
+
+    #[test]
+    fn inline_image_serializes_as_cca_inline_data_and_unsupported_media_fails_closed() {
+        use base64::Engine as _;
+        let data = format!(
+            "data:image/png;base64,{}",
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/T9sAAAAASUVORK5CYII="
+        );
+        let request = normalize_chat(json!({"model":"gemini-4-argon-medium","messages":[
+            {"role":"user","content":[{"type":"text","text":"inspect"},{"type":"image_url","image_url":{"url":data,"detail":"low"}}]}
+        ]}), "synthetic".into()).unwrap();
+        assert!(request.has_media() && request.has_images() && !request.has_files());
+        let body = serialize(&request, "project-test", &[]).unwrap();
+        let parts = body.pointer("/request/contents/0/parts").unwrap();
+        assert_eq!(parts[0]["text"], "inspect");
+        assert_eq!(parts[1]["inlineData"]["mimeType"], "image/png");
+        assert_eq!(
+            parts[1]["inlineData"]["data"],
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/T9sAAAAASUVORK5CYII="
+        );
+
+        let remote = normalize_chat(json!({"model":"gemini-4-argon-medium","messages":[
+            {"role":"user","content":[{"type":"image_url","image_url":{"url":"https://images.example.test/a.png"}}]}
+        ]}), "synthetic".into()).unwrap();
+        assert_eq!(
+            serialize(&remote, "project-test", &[]).unwrap_err().code,
+            "unsupported_parameter"
+        );
+
+        let pdf = format!(
+            "data:application/pdf;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(b"%PDF-1.7\nsynthetic\n%%EOF")
+        );
+        let file_request = normalize_response(
+            json!({"model":"gemini-4-argon-medium","input":[
+                {"role":"user","content":[{"type":"input_file","file_data":pdf,"filename":"a.pdf"}]}
+            ]}),
+            "synthetic".into(),
+        )
+        .unwrap();
+        assert!(file_request.has_files());
+        assert_eq!(
+            serialize(&file_request, "project-test", &[])
+                .unwrap_err()
+                .code,
+            "unsupported_parameter"
         );
     }
 

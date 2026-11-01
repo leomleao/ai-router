@@ -35,7 +35,7 @@ client executes them and sends results in later history. Under `tool_choice`
 returned when the tools are not `strict`, as OpenAI does, so agent clients can
 recover. Structured logs are described in [logging](docs/logging.md). Forced (`required`),
 named and `allowed_tools` choices narrow the tool inventory and fail closed when
-the model answers without a call. Media input and native execution are not supported.
+the model answers without a call. Image inputs, OpenAI document inputs and web search, and AGY image generation/editing are described in [the media guide](docs/media-search.md). Native execution remains unsupported.
 
 ## Local Docker quick start
 

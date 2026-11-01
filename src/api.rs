@@ -34,6 +34,8 @@ use std::{
 use tokio::sync::{Notify, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+#[path = "image_api.rs"]
+mod image_api;
 
 pub struct AppState {
     pub config: Arc<Config>,
@@ -521,6 +523,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/capabilities", get(capabilities))
         .route("/v1/chat/completions", post(chat))
         .route("/v1/responses", post(responses))
+        .route("/v1/images/generations", post(image_api::generations))
+        .route("/v1/images/edits", post(image_api::edits))
         .fallback(unsupported)
         .layer(middleware::from_fn_with_state(state.clone(), protect));
     Router::new()
@@ -688,6 +692,8 @@ async fn protect(
         "chat"
     } else if request.uri().path() == "/v1/responses" {
         "responses"
+    } else if request.uri().path().starts_with("/v1/images/") {
+        "images"
     } else {
         "api"
     };
@@ -813,9 +819,13 @@ async fn unsupported() -> ApiError {
 
 async fn models(State(state): State<Arc<AppState>>) -> Json<Value> {
     let snapshot = state.snapshot().await;
-    Json(
-        json!({"object":"list", "data":snapshot.entries.iter().map(|entry| json!({"id":entry.model.id,"object":"model","created":0,"owned_by":entry.provider.owned_by()})).collect::<Vec<_>>()}),
-    )
+    let mut data: Vec<Value> = snapshot.entries.iter().map(|entry| json!({"id":entry.model.id,"object":"model","created":0,"owned_by":entry.provider.owned_by()})).collect();
+    for id in state.antigravity.image_models().await {
+        if !snapshot.entries.iter().any(|entry| entry.model.id == id) {
+            data.push(json!({"id":id,"object":"model","created":0,"owned_by":"agy","capabilities":{"image_generation":true,"chat_completions":false,"responses":false}}));
+        }
+    }
+    Json(json!({"object":"list","data":data}))
 }
 
 async fn capabilities(State(state): State<Arc<AppState>>) -> Json<Value> {
@@ -823,9 +833,18 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> Json<Value> {
     let agy = state.effective_agy_status().await;
     let openai = state.effective_openai_status().await;
     let release = state.antigravity.release.snapshot().await;
-    Json(json!({
+    let image_models = state.antigravity.image_models().await;
+    let vision_models = state.antigravity.vision_models().await;
+    let mut per_model = Vec::new();
+    for entry in &snapshot.entries {
+        let vision =
+            entry.provider == ProviderId::OpenAi || vision_models.contains(&entry.model.id);
+        per_model.push(json!({"id":entry.model.id,"provider":entry.provider.as_str(),"chat_completions":true,"responses":true,"streaming":true,"client_tools":true,"native":false,"media_input":vision,"image_input":vision,"file_input":entry.provider==ProviderId::OpenAi,"media_acceptance":"model_dependent","output_token_budget":{"mode":"prompt_guidance","hard_limit":false}}));
+    }
+    let media_limits = json!({"body_bytes":state.config.max_body_bytes,"per_item_bytes":crate::media::MAX_MEDIA_BYTES,"max_images":crate::media::MAX_IMAGES,"max_files":crate::media::MAX_FILES,"url_fetching":"upstream_only","agy_image_urls":"inline_only"});
+    let mut result = json!({
         "schema_version":3,"provider":"model-router","native":false,
-        "profiles":{"model":{"chat_completions":true,"responses":true,"streaming":true,"text":true,"json_schema":true,"client_tools":true,"parallel_tool_execution":false,"media_input":false,
+        "profiles":{"model":{"chat_completions":true,"responses":true,"streaming":true,"text":true,"json_schema":true,"client_tools":true,"parallel_tool_execution":false,"media_input":true,
             "output_token_budget":{"mode":"prompt_guidance","hard_limit":false,"limits_reasoning_tokens":false,"parameters":["max_output_tokens","max_tokens","max_completion_tokens"]},
             "prompt_cache_controls":{"mode":"ignored","retention_guarantee":false},
             "sampling_controls":{"mode":"ignored","accepted":SAMPLING_HINTS,"rejected":["n>1","logit_bias","logprobs","top_logprobs>0","stop"]},
@@ -834,7 +853,7 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> Json<Value> {
                 "disclosure_header":"x-ai-router-reasoning-effort","header_values":["ignored","mapped=<level>"],"values_per_request":1},
             "reasoning_replay":{"unencrypted":"dropped"},
             "retry_hints":{"deterministic":"x-should-retry:false","transient_503":"retry-after","local_saturation":{"status":503,"code":"busy"},"rate_limit":{"status":429},"provider_timeout":"x-should-retry:false","upstream_credentials":"x-should-retry:false","latched_transient":{"status":503,"header":"retry-after"}},
-            "responses_include":["reasoning.encrypted_content"],
+            "responses_include":["reasoning.encrypted_content","web_search_call.action.sources"],
             "reasoning_summary":{"mode":"unavailable","accepted":["auto","concise","detailed"]},
             "model_fallback":{"enabled":state.config.model_fallback,"applies_to":"model_ids_never_served","exact_ids_win":true,"listed_in_models":false,
                 "gemini_prefix_target":state.config.fallback_gemini_model,"default_target":state.config.fallback_openai_model,"unavailable_target":"other_target","neither_available":"remembered_target_error","never_seen_targets":"model_not_found",
@@ -849,13 +868,26 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> Json<Value> {
             "item_references":{"enabled":true,"storage":"memory","default_store":true,"ttl_seconds":items::TTL_SECONDS,"max_items":items::MAX_ITEMS,"max_bytes":items::MAX_BYTES,"per_client_items":items::CLIENT_ITEMS,"per_client_bytes":items::CLIENT_BYTES,"cleared_on_restart":true}}},
         "providers":{
             "agy":{"enabled":state.config.antigravity_enabled,"ready":snapshot.entries.iter().any(|e|e.provider==ProviderId::Agy),"adapter":agy.version,"baseline":crate::antigravity_auth::BASELINE_REVISION,"checked_at":agy.checked_at,"error":agy.error,"quota":agy.quota,"transport":"direct","fallback":false,"release_advisory":release,"tool_choice_forcing":"prompt_instruction"},
-            "openai":{"enabled":state.config.openai_enabled,"ready":snapshot.entries.iter().any(|e|e.provider==ProviderId::OpenAi),"version":openai.version,"checked_at":openai.checked_at,"error":openai.error,"quota":openai.quota,"usage_url":"https://chatgpt.com/settings/usage","upstream":"responses","upstream_store":false,"upstream_stream":true,"client_tools":true,"media_input":false,"output_token_budget":{"mode":"prompt_guidance","hard_limit":false},"unsupported":["active_sampling_controls","hosted_tools","native"],"reasoning_effort":"model_dependent","tool_choice_forcing":"upstream_required"}},
+            "openai":{"enabled":state.config.openai_enabled,"ready":snapshot.entries.iter().any(|e|e.provider==ProviderId::OpenAi),"version":openai.version,"checked_at":openai.checked_at,"error":openai.error,"quota":openai.quota,"usage_url":"https://chatgpt.com/settings/usage","upstream":"responses","upstream_store":false,"upstream_stream":true,"client_tools":true,"media_input":true,"output_token_budget":{"mode":"prompt_guidance","hard_limit":false},"unsupported":["active_sampling_controls","hosted_tools_except_web_search","native"],"reasoning_effort":"model_dependent","tool_choice_forcing":"upstream_required"}},
         "admission":{"total_max_concurrent":state.config.max_concurrent+if state.config.openai_enabled {state.config.openai_max_concurrent}else{0},"providers":{"agy":{"max_concurrent":state.config.max_concurrent,"max_queue":state.config.max_queue},"openai":{"enabled":state.config.openai_enabled,"max_concurrent":state.config.openai_max_concurrent,"max_queue":state.config.openai_max_queue}}},
-        "unsupported":["native","media_input","active_sampling_controls","embeddings","audio","image_generation_api","realtime","batches","fine_tuning","provider_management"],
+        "unsupported":["native","active_sampling_controls","embeddings","audio","realtime","batches","fine_tuning","provider_management"],
         "verification":{"adapter_contract":"automated_fixtures","live_direct_provider":"operator_validation_required"},
         "model_conflicts":snapshot.conflicts,
-        "per_model":snapshot.entries.iter().map(|e|json!({"id":e.model.id,"provider":e.provider.as_str(),"chat_completions":true,"responses":true,"streaming":true,"client_tools":true,"native":false,"media_input":false,"output_token_budget":{"mode":"prompt_guidance","hard_limit":false}})).collect::<Vec<_>>()
-    }))
+        "per_model":per_model
+    });
+    result["profiles"]["model"]["media_limits"] = media_limits;
+    result["providers"]["agy"]["image_input"] = json!("advertised_models_inline_only");
+    result["providers"]["agy"]["file_input"] = json!(false);
+    result["providers"]["agy"]["image_generation"] = json!({"models":image_models,"generations":true,"edits":true,"response_format":"b64_json","mask":false,"exact_pixel_size":false});
+    result["providers"]["openai"]["image_input"] = json!("model_dependent");
+    result["providers"]["openai"]["file_input"] = json!("model_dependent");
+    result["providers"]["openai"]["inline_file_formats"] =
+        json!(["pdf", "txt", "csv", "json", "docx", "pptx", "xlsx"]);
+    result["providers"]["openai"]["file_validation"] =
+        json!("mime_extension_signature_hints_upstream_decodes");
+    result["providers"]["openai"]["web_search"] = json!({"supported":true,"availability":"model_and_account_policy","citations":true,"sources":true,"upstream":"responses"});
+    result["profiles"]["model"]["hosted_web_search"] = json!({"providers":["openai"],"chat_extension":true,"responses":true,"citations_at_completion":true});
+    Json(result)
 }
 
 async fn chat(
@@ -972,9 +1004,25 @@ fn request_shape(body: &Value, responses: bool) -> Value {
             crate::log::kinds(messages, "role", "missing")
         })
     };
+    let mut image_parts = 0usize;
+    let mut file_parts = 0usize;
+    for item in body[if responses { "input" } else { "messages" }]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        for part in item["content"].as_array().into_iter().flatten() {
+            match part["type"].as_str() {
+                Some("input_image" | "image_url") => image_parts += 1,
+                Some("input_file" | "file") => file_parts += 1,
+                _ => {}
+            }
+        }
+    }
     json!({"requested_model":body["model"].as_str().map(|m| m.chars().take(128).collect::<String>()),
         "stream":body["stream"].as_bool().unwrap_or(false),"fields":fields,
         "input_items":items,"tool_count":tools.len(),"strict_tools":strict,
+        "image_parts":image_parts,"file_parts":file_parts,
         "tool_types":crate::log::kinds(tools, "type", "missing"),"tool_choice":tool_choice,
         "parallel_tool_calls":body["parallel_tool_calls"].as_bool(),
         "store":body["store"].as_bool(),
@@ -996,6 +1044,14 @@ async fn generate_body(
         .and_then(Value::as_str)
         .ok_or_else(|| ApiError::bad_request("model must be a string"))?
         .to_owned();
+    if state.antigravity.image_models().await.contains(&requested) {
+        return Err(error(
+            400,
+            "model_not_found",
+            "This model is served through the images endpoints, not chat generation",
+        )
+        .with_param("model"));
+    }
     let fallback_choice = state.fallback_model(&requested).await?;
     let crossed = fallback_choice
         .as_ref()
@@ -1074,6 +1130,46 @@ async fn generate_body(
     } else {
         normalize_chat(body, id.clone())?
     };
+    if crossed && request.has_media() {
+        return Err(error(
+            503,
+            "provider_unavailable",
+            "Media input cannot cross provider fallback; choose an available model explicitly",
+        ));
+    }
+    if selected == ProviderId::Agy {
+        if !request.hosted_tools.is_empty()
+            || !request.hosted_include.is_empty()
+            || request
+                .input
+                .iter()
+                .any(|item| item["type"] == "web_search_call")
+        {
+            return Err(ApiError::unsupported("hosted web search for Antigravity"));
+        }
+        if request.has_files() {
+            return Err(ApiError::unsupported("document input for Antigravity"));
+        }
+        if request
+            .input
+            .iter()
+            .filter_map(|item| item["content"].as_array())
+            .flatten()
+            .any(|part| {
+                part["type"] == "input_image"
+                    && part["image_url"]
+                        .as_str()
+                        .is_some_and(|url| !url.starts_with("data:"))
+            })
+        {
+            return Err(ApiError::unsupported("remote image URLs for Antigravity"));
+        }
+        if request.has_images() && !state.antigravity.supports_images(&request.model).await {
+            return Err(ApiError::unsupported(
+                "image input for the selected AGY model",
+            ));
+        }
+    }
     // From here the request is valid, so its disclosures describe every
     // response, including provider failures before or after a stream commits.
     let mut disclosures = disclosure_headers(&request.ignored);
@@ -1469,10 +1565,24 @@ fn tool_json(tool: &ToolCall) -> Value {
 }
 pub fn chat_object(id: &str, created: i64, model: &str, result: &RunResult) -> Value {
     let mut message = json!({"role":"assistant","content":if result.text.is_empty() && !result.tool_calls.is_empty() {Value::Null} else {Value::String(result.text.clone())}});
+    if !result.annotations.is_empty() {
+        message["annotations"] = chat_annotations(&result.annotations);
+    }
     if !result.tool_calls.is_empty() {
         message["tool_calls"] = json!(result.tool_calls.iter().map(tool_json).collect::<Vec<_>>());
     }
     json!({"id":id,"object":"chat.completion","created":created,"model":model,"choices":[{"index":0,"message":message,"finish_reason":finish_reason(result)}],"usage":chat_usage(&result.usage),"agy_usage_partial":result.usage_partial,"ai_router_usage_partial":result.usage_partial})
+}
+fn chat_annotations(annotations: &[Value]) -> Value {
+    json!(
+        annotations
+            .iter()
+            .map(|annotation| json!({"type":"url_citation","url_citation":{
+                "start_index":annotation["start_index"],"end_index":annotation["end_index"],
+                "title":annotation["title"],"url":annotation["url"]
+            }}))
+            .collect::<Vec<_>>()
+    )
 }
 fn response_tool(tool: &ToolCall) -> Value {
     json!({"id":format!("fc_{}",tool.id),"type":"function_call","status":"completed","call_id":tool.id,"name":tool.name,"arguments":tool.arguments.to_string()})
@@ -1486,7 +1596,7 @@ pub fn response_object(
 ) -> Value {
     let mut output = Vec::new();
     if !result.text.is_empty() || (result.tool_calls.is_empty() && result.output_items.is_empty()) {
-        output.push(json!({"id":format!("msg_{id}"),"type":"message","status":if result.status=="incomplete" {"incomplete"} else {"completed"},"role":"assistant","content":[{"type":"output_text","text":result.text,"annotations":[]}]}));
+        output.push(json!({"id":format!("msg_{id}"),"type":"message","status":if result.status=="incomplete" {"incomplete"} else {"completed"},"role":"assistant","content":[{"type":"output_text","text":result.text,"annotations":result.annotations}]}));
     }
     output.extend(result.tool_calls.iter().map(response_tool));
     output.extend(result.output_items.clone());
@@ -1810,9 +1920,12 @@ impl StreamRenderer {
                 }
                 if self.responses {
                     if self.text_started {
+                        for (index, annotation) in result.annotations.iter().enumerate() {
+                            events.push(self.emit("response.output_text.annotation.added",json!({"output_index":0,"item_id":format!("msg_{}",self.id),"content_index":0,"annotation_index":index,"annotation":annotation})));
+                        }
                         events.push(self.emit("response.output_text.done",json!({"output_index":0,"item_id":format!("msg_{}",self.id),"content_index":0,"text":self.text})));
-                        events.push(self.emit("response.content_part.done",json!({"output_index":0,"item_id":format!("msg_{}",self.id),"content_index":0,"part":{"type":"output_text","text":self.text,"annotations":[]}})));
-                        let item = json!({"id":format!("msg_{}",self.id),"type":"message","status":if result.status=="incomplete" {"incomplete"} else {"completed"},"role":"assistant","content":[{"type":"output_text","text":self.text,"annotations":[]}]});
+                        events.push(self.emit("response.content_part.done",json!({"output_index":0,"item_id":format!("msg_{}",self.id),"content_index":0,"part":{"type":"output_text","text":self.text,"annotations":result.annotations}})));
+                        let item = json!({"id":format!("msg_{}",self.id),"type":"message","status":if result.status=="incomplete" {"incomplete"} else {"completed"},"role":"assistant","content":[{"type":"output_text","text":self.text,"annotations":result.annotations}]});
                         events.push(self.emit(
                             "response.output_item.done",
                             json!({"output_index":0,"item":item}),
@@ -1846,6 +1959,12 @@ impl StreamRenderer {
                     );
                     events.push(self.emit(kind, json!({"response":response})));
                 } else {
+                    if !result.annotations.is_empty() {
+                        events.push(self.chunk(
+                            json!({"annotations":chat_annotations(&result.annotations)}),
+                            Value::Null,
+                        ));
+                    }
                     events.push(self.chunk(json!({}), json!(finish_reason(&result))));
                     if self.include_usage {
                         events.push(self.emit("",json!({"id":self.id,"object":"chat.completion.chunk","created":self.created,"model":self.model,"choices":[],"usage":chat_usage(&result.usage),"agy_usage_partial":result.usage_partial,"ai_router_usage_partial":result.usage_partial})));
@@ -2091,6 +2210,32 @@ mod tests {
             .iter()
             .map(|event| format!("data: {event}\n\n"))
             .collect::<String>();
+            return ([("content-type", "text/event-stream")], wire).into_response();
+        }
+        if body["tools"].as_array().is_some_and(|tools| {
+            tools.iter().any(|tool| {
+                tool["type"]
+                    .as_str()
+                    .is_some_and(|kind| kind.starts_with("web_search"))
+            })
+        }) {
+            let id = format!("ws_{}", Uuid::new_v4().simple());
+            let annotation = json!({"type":"url_citation","start_index":0,"end_index":6,"url":"https://example.test/source","title":"Fixture source"});
+            let search = json!({"id":id,"type":"web_search_call","status":"completed","action":{"type":"search","query":"fixture","sources":[{"type":"url","url":"https://example.test/source"}]}});
+            let text = "Search fixture answer";
+            let terminal = json!({"id":"resp_search_fixture","status":"completed","output":[search,{"id":"msg_search_fixture","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":text,"annotations":[annotation]}]}],"usage":{"input_tokens":4,"output_tokens":6,"total_tokens":10}});
+            let events = vec![
+                json!({"type":"response.web_search_call.in_progress","output_index":0,"item_id":id,"sequence_number":0}),
+                json!({"type":"response.web_search_call.searching","output_index":0,"item_id":id,"sequence_number":1}),
+                json!({"type":"response.web_search_call.completed","output_index":0,"item_id":id,"sequence_number":2}),
+                json!({"type":"response.output_text.delta","delta":text}),
+                json!({"type":"response.output_text.annotation.added","output_index":1,"content_index":0,"item_id":"msg_search_fixture","annotation_index":0,"annotation":annotation,"sequence_number":4}),
+                json!({"type":"response.completed","response":terminal}),
+            ];
+            let wire = events
+                .iter()
+                .map(|event| format!("data: {event}\n\n"))
+                .collect::<String>();
             return ([("content-type", "text/event-stream")], wire).into_response();
         }
         let continuing = body["input"]
@@ -2856,6 +3001,7 @@ mod tests {
         );
         // Preserve the existing AGY empty-output response shape.
         let empty = RunResult {
+            annotations: vec![],
             text: String::new(),
             structured_output: None,
             conversation_id: String::new(),
@@ -2870,6 +3016,55 @@ mod tests {
             response_object("synthetic", 0, "agy-synthetic", &empty, false)["output"][0]["type"],
             "message"
         );
+    }
+    #[tokio::test]
+    async fn official_and_n8n_sdks_cover_media_and_hosted_search_over_real_tcp() {
+        use tokio::io::AsyncWriteExt;
+        let h = DualHarness::new().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = h.app.clone();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        for (program, path) in [
+            ("python3", "tests/media_search_contract.py"),
+            ("node", "tests/n8n_media_search_contract.mjs"),
+        ] {
+            let mut child = tokio::process::Command::new(program)
+                .arg(path)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(
+                    json!({"base_url":format!("http://{address}/v1"),"model":"synthetic-openai"})
+                        .to_string()
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let output = tokio::time::timeout(Duration::from_secs(45), child.wait_with_output())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{program}: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        assert!(h.captured.lock().await.iter().any(|body| {
+            body["tools"]
+                .as_array()
+                .is_some_and(|tools| !tools.is_empty())
+        }));
+        server.abort();
     }
     #[tokio::test]
     async fn official_sdks_cover_direct_gateway_over_real_tcp() {

@@ -257,9 +257,12 @@ fn non_chat_model(model: &str) -> bool {
     ]
     .iter()
     .any(|prefix| model.starts_with(prefix))
-        || model
-            .split('-')
-            .any(|part| matches!(part, "transcribe" | "realtime" | "audio" | "tts"))
+        || model.split('-').any(|part| {
+            matches!(
+                part,
+                "transcribe" | "realtime" | "audio" | "tts" | "image" | "imagegen"
+            )
+        })
 }
 
 impl Snapshot {
@@ -556,6 +559,8 @@ mod tests {
             "text-embedding-3-large",
             "dall-e-3",
             "gpt-image-1",
+            "gemini-3-pro-image",
+            "provider-imagegen-latest",
             "whisper-1",
             "tts-1-hd",
             "gpt-4o-mini-tts",

@@ -73,7 +73,10 @@
       "packages/utils/src/stream.ts",
       "packages/ai/test/google-gemini-cli-alignment.test.ts",
       "packages/ai/test/google-antigravity-oauth.test.ts",
-      "packages/catalog/test/antigravity-version-lookup.test.ts"
+      "packages/catalog/test/antigravity-version-lookup.test.ts",
+      "packages/ai/src/images/google-antigravity.ts",
+      "packages/ai/src/images/shared.ts",
+      "packages/ai/src/images/types.ts"
     ],
     "evidence_kind": "Pinned public OMP source and its recorded Antigravity Hub observations; not an independently documented official CLI protocol or proof of account compatibility.",
     "notice": "THIRD_PARTY_NOTICES.md",
@@ -339,8 +342,21 @@
       "packages/catalog/test/antigravity-version-lookup.test.ts": {
         "previous": "3b0db373d4a65d84732c62de2ac9470784dd3a673ea31dec15fbf979af9da47f",
         "reviewed": "dadfc5722851da98ffe940fc69590c868cd9c4249984fee3e8dca377e4640217"
+      },
+      "packages/ai/src/images/google-antigravity.ts": {
+        "previous": "8d5089cc401c3d6f00f9b603ee0e96553710c238e50806fd5d4b249bedd156bc",
+        "reviewed": "540073f04c9b738fe6a0d45c0ad6cef6401142ef62d53c01558fb95a1afee632"
+      },
+      "packages/ai/src/images/shared.ts": {
+        "previous": "3f034249f744d27654192f8f36dec6c016a26bddc705a9762840a221d4e33b3b",
+        "reviewed": "da039e4477930512ac3f6860cf3574ded6539b6c66cf44b1c43975961582fa6a"
+      },
+      "packages/ai/src/images/types.ts": {
+        "previous": "45ec04bcf73127954204ab1f73cd55fbead10d9092bca3f3b57255350902061f",
+        "reviewed": "45ec04bcf73127954204ab1f73cd55fbead10d9092bca3f3b57255350902061f"
       }
-    }
+    },
+    "feature_review": "docs/media-search.md"
   },
   "identity": {
     "user_agent": "antigravity/hub/2.28.2 (aidev_client; os_type=linux; arch=amd64; cl=1005016104)",
@@ -421,7 +437,7 @@
       "used_non_gemini_model"
     ],
     "history": "Typed chronological user/model parts; leading system/developer instructions become systemInstruction parts. Mid-conversation system/developer changes are rejected rather than reordered.",
-    "text_only": true,
+    "text_only": false,
     "tool_schema": "CCA-compatible legacy parameters hints; original client schemas remain in descriptions. Existing strict enforcement and non-strict warning/relay behavior are retained.",
     "tool_mode": "VALIDATED when tools are supplied, and for Claude even without tools",
     "tool_results": "Complete contiguous groups matched by original client ID and reordered to original call order. Claude retains function-part IDs; Gemini omits them according to its CCA contract.",
@@ -440,7 +456,8 @@
     "http_headers": "Native-build User-Agent; Accept-Encoding gzip with transparent bounded decompression; no explicit SSE/JSON Accept header.",
     "model_profile": "Serving-account/generation-scoped discovery supplies optional model_enum, maxOutputTokens, thinkingLevel (1 LOW, 2 MEDIUM, 3 HIGH) or thinkingBudget (-1 dynamic). Only bounded valid fields from reviewed available IDs are used; no borrowed model/account or guessed fallback profile.",
     "provider_output_token_cap": "Optional serving-account discovered fixed cap; caller max token values remain visible-answer prompt guidance.",
-    "client_output_token_cap": "Not enforced as a wire cap; caller values remain prompt guidance. A discovered provider fixed cap may be sent separately."
+    "client_output_token_cap": "Not enforced as a wire cap; caller values remain prompt guidance. A discovered provider fixed cap may be sent separately.",
+    "media": "Bounded inline images for exact supportsImages-advertised chat IDs; no remote URL fetching, native file parsing or non-text output on chat endpoints."
   },
   "model_ids_when_present_in_usable_raw_roster": [
     "gemini-4-argon-low",
@@ -521,5 +538,14 @@
     "chat_20706",
     "chat_23310",
     "gemini-2.5-pro"
-  ]
+  ],
+  "image_contract": {
+    "source": "packages/ai/src/images/google-antigravity.ts",
+    "discovery": "Exact serving-account imageGenerationModelIds; separate from 13 reviewed chat IDs",
+    "generation": "One fixed-origin authenticated streamGenerateContent dispatch after pinned-generation/model revalidation",
+    "inputs": "Prompt and bounded validated reference images; no safety override",
+    "outputs": "Complete STOP candidates and bounded MIME/base64/container-checked inline images; optional DONE",
+    "differences": "No guessed image model, endpoint failover or automatic generation retries; public b64_json JSON/multipart routes",
+    "live_acceptance": "operator_validation_required"
+  }
 }

@@ -118,8 +118,18 @@ fn redact(value: &mut Value, depth: usize) {
                     || key.ends_with("secret")
                 {
                     *value = Value::String("[redacted]".into());
-                } else if key == "database64" {
+                } else if matches!(key.as_str(), "database64" | "filedata" | "b64json") {
                     *value = Value::String("[file bytes omitted]".into());
+                } else if key == "inlinedata" {
+                    if let Some(part) = value.as_object_mut() {
+                        if part.contains_key("data") {
+                            part.insert(
+                                "data".into(),
+                                Value::String("[file bytes omitted]".into()),
+                            );
+                        }
+                    }
+                    redact(value, depth + 1);
                 } else {
                     redact(value, depth + 1);
                 }
@@ -129,6 +139,9 @@ fn redact(value: &mut Value, depth: usize) {
             for value in items {
                 redact(value, depth + 1);
             }
+        }
+        Value::String(text) if text.trim_start().to_ascii_lowercase().starts_with("data:") => {
+            *text = "[inline media omitted]".into();
         }
         Value::String(text)
             if text
@@ -255,5 +268,22 @@ mod tests {
         }
         assert!(payload.json.contains("[redacted OAuth URL]"));
         assert!(payload.json.contains("Keep this ordinary prompt intact."));
+    }
+
+    #[test]
+    fn media_bytes_are_removed_before_capture_truncation_including_embedded_json() {
+        let value = json!({"input":[{"type":"input_image","image_url":"data:image/png;base64,c3ludGhldGljLWltYWdl"},
+            {"type":"input_file","filename":"fixture.pdf","file_data":"c3ludGhldGljLXBkZg=="}],
+            "provider":{"inlineData":{"mimeType":"image/png","data":"c3ludGhldGljLXByb3ZpZGVy"}},
+            "data":[{"b64_json":"c3ludGhldGljLW91dHB1dA=="}],
+            "arguments":"{\"image\":\"data:image/png;base64,c3ludGhldGljLW5lc3RlZA==\"}",
+            "prompt":"Describe this picture."});
+        let captured = CapturedPayload::capture(&value);
+        assert!(!captured.truncated);
+        assert!(!captured.json.contains("c3ludGhldGlj"));
+        let parsed: Value = serde_json::from_str(&captured.json).unwrap();
+        assert_eq!(parsed["provider"]["inlineData"]["mimeType"], "image/png");
+        assert_eq!(parsed["input"][1]["filename"], "fixture.pdf");
+        assert_eq!(parsed["prompt"], "Describe this picture.");
     }
 }

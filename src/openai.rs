@@ -444,6 +444,7 @@ impl OpenAi {
         let mut stream = response.bytes_stream();
         let mut decoder = SseDecoder::default();
         let mut finished_items = FinishedItems::new(self.config.max_output_bytes);
+        let mut stream_annotations = StreamAnnotations::default();
         let mut bytes = 0usize;
         let mut text = String::new();
         while let Some(chunk) = stream.next().await {
@@ -470,6 +471,22 @@ impl OpenAi {
                 })?;
                 match event["type"].as_str() {
                     Some("response.output_item.done") => finished_items.observe(&event)?,
+                    Some(
+                        "response.web_search_call.in_progress"
+                        | "response.web_search_call.searching"
+                        | "response.web_search_call.completed",
+                    ) => {
+                        if request.hosted_tools.is_empty() {
+                            return Err(failure(502, "unexpected_provider_search_event"));
+                        }
+                        validate_search_progress_event(&event)?;
+                    }
+                    Some("response.output_text.annotation.added") => {
+                        if request.hosted_tools.is_empty() {
+                            return Err(failure(502, "unexpected_provider_search_event"));
+                        }
+                        stream_annotations.observe(&event)?;
+                    }
                     Some("response.output_text.delta") => {
                         let delta = event["delta"]
                             .as_str()
@@ -496,8 +513,14 @@ impl OpenAi {
                         {
                             return Err(failure(502, "invalid_provider_terminal"));
                         }
-                        let terminal = finished_items.reconstruct(terminal)?;
-                        let mut result = parse_result(request, &terminal, &text)?;
+                        let mut result = (|| {
+                            let reconstructed = finished_items.reconstruct(terminal)?;
+                            let reconstructed = stream_annotations.apply(&reconstructed)?;
+                            parse_result(request, &reconstructed, &text)
+                        })()
+                        .map_err(|error| {
+                            response_validation_failure(error, terminal, text.len())
+                        })?;
                         result.upstream_request_id = request_id;
                         if request.endpoint == "chat"
                             && !result.output_items.is_empty()
@@ -572,6 +595,9 @@ impl OpenAi {
                     }
                     // Partial function-argument events are deliberately withheld until
                     // terminal parsing and schema validation prevent unsafe handoffs.
+                    Some(kind) if kind.starts_with("response.web_search_call.") => {
+                        return Err(failure(502, "unsupported_provider_search_event"));
+                    }
                     Some(_) => {}
                     None => {
                         return Err(with_diagnostics(
@@ -584,6 +610,149 @@ impl OpenAi {
             }
         }
         Err(failure(502, "incomplete_provider_output"))
+    }
+}
+
+fn validate_search_progress_event(event: &Value) -> Result<(), ApiError> {
+    let object = event
+        .as_object()
+        .ok_or_else(|| failure(502, "invalid_provider_event"))?;
+    if object
+        .keys()
+        .any(|key| !["type", "output_index", "item_id", "sequence_number"].contains(&key.as_str()))
+    {
+        return Err(failure(502, "invalid_provider_event"));
+    }
+    let index = event["output_index"]
+        .as_u64()
+        .filter(|index| *index < 1000)
+        .ok_or_else(|| failure(502, "invalid_provider_output_index"))?;
+    let _ = index;
+    let id = event["item_id"]
+        .as_str()
+        .filter(|id| !id.is_empty() && id.len() <= 256 && id.bytes().all(|b| b.is_ascii_graphic()))
+        .ok_or_else(|| failure(502, "invalid_provider_event"))?;
+    let _ = id;
+    if !event["sequence_number"].is_u64() {
+        return Err(failure(502, "invalid_provider_event"));
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct StreamAnnotations {
+    values: BTreeMap<(usize, usize, usize), (String, Value)>,
+    bytes: usize,
+}
+impl StreamAnnotations {
+    fn observe(&mut self, event: &Value) -> Result<(), ApiError> {
+        let object = event
+            .as_object()
+            .ok_or_else(|| failure(502, "invalid_provider_event"))?;
+        if object.keys().any(|key| {
+            ![
+                "type",
+                "item_id",
+                "output_index",
+                "content_index",
+                "annotation_index",
+                "annotation",
+                "sequence_number",
+            ]
+            .contains(&key.as_str())
+        }) {
+            return Err(failure(502, "invalid_provider_event"));
+        }
+        let item_id = event["item_id"]
+            .as_str()
+            .filter(|id| {
+                !id.is_empty() && id.len() <= 256 && id.bytes().all(|b| b.is_ascii_graphic())
+            })
+            .ok_or_else(|| failure(502, "invalid_provider_event"))?;
+        let output_index = event["output_index"]
+            .as_u64()
+            .filter(|i| *i < 1000)
+            .ok_or_else(|| failure(502, "invalid_provider_output_index"))?
+            as usize;
+        let content_index = event["content_index"]
+            .as_u64()
+            .filter(|i| *i < 256)
+            .ok_or_else(|| failure(502, "invalid_provider_event"))?
+            as usize;
+        let annotation_index = event["annotation_index"]
+            .as_u64()
+            .filter(|i| *i < 256)
+            .ok_or_else(|| failure(502, "invalid_provider_event"))?
+            as usize;
+        if !event["sequence_number"].is_u64() {
+            return Err(failure(502, "invalid_provider_event"));
+        }
+        let annotation = event
+            .get("annotation")
+            .filter(|v| v.is_object())
+            .ok_or_else(|| failure(502, "invalid_provider_event"))?;
+        if annotation["type"] != "url_citation" {
+            return Err(failure(502, "unsupported_provider_output"));
+        }
+        let key = (output_index, content_index, annotation_index);
+        if let Some((previous_id, previous)) = self.values.get(&key) {
+            return if previous_id == item_id && previous == annotation {
+                Ok(())
+            } else {
+                Err(failure(502, "inconsistent_provider_output"))
+            };
+        }
+        self.bytes = self.bytes.saturating_add(annotation.to_string().len());
+        if self.bytes > 64 * 1024 {
+            return Err(failure(502, "output_limit_exceeded"));
+        }
+        self.values
+            .insert(key, (item_id.to_owned(), annotation.clone()));
+        Ok(())
+    }
+
+    fn apply(&self, response: &Value) -> Result<Value, ApiError> {
+        if self.values.is_empty() {
+            return Ok(response.clone());
+        }
+        let mut result = response.clone();
+        let output = result["output"]
+            .as_array_mut()
+            .filter(|items| items.len() <= 1000)
+            .ok_or_else(|| failure(502, "invalid_provider_output"))?;
+        for ((output_index, content_index, annotation_index), (item_id, annotation)) in &self.values
+        {
+            let item = output
+                .get_mut(*output_index)
+                .ok_or_else(|| failure(502, "invalid_provider_output_index"))?;
+            if item["type"] != "message" || item["id"].as_str() != Some(item_id.as_str()) {
+                return Err(failure(502, "inconsistent_provider_output"));
+            }
+            let content = item["content"]
+                .as_array_mut()
+                .ok_or_else(|| failure(502, "invalid_provider_output"))?;
+            let part = content
+                .get_mut(*content_index)
+                .ok_or_else(|| failure(502, "invalid_provider_output_index"))?;
+            if part["type"] != "output_text" || !part["text"].is_string() {
+                return Err(failure(502, "invalid_provider_output"));
+            }
+            if part.get("annotations").is_none_or(Value::is_null) {
+                part["annotations"] = json!([]);
+            }
+            let annotations = part["annotations"]
+                .as_array_mut()
+                .ok_or_else(|| failure(502, "invalid_provider_output"))?;
+            match annotations.get(*annotation_index) {
+                Some(existing) if existing == annotation => {}
+                Some(_) => return Err(failure(502, "inconsistent_provider_output")),
+                None if annotations.len() == *annotation_index => {
+                    annotations.push(annotation.clone())
+                }
+                None => return Err(failure(502, "invalid_provider_output_index")),
+            }
+        }
+        Ok(result)
     }
 }
 
@@ -788,6 +957,7 @@ fn serialize(request: &RunRequest) -> Result<Value, ApiError> {
                 input.push(item);
             }
             "function_call" => input.push(json!({"type":"function_call", "call_id":item["call_id"], "name":item["name"], "arguments":item["arguments"]})),
+            "web_search_call" => input.push(crate::protocol::validate_hosted_search_call(item)?),
             "function_call_output" => input.push(json!({"type":"function_call_output", "call_id":item["call_id"], "output":content_text(&item["output"])?})),
             "message" => {
                 let role = item["role"].as_str().ok_or_else(|| ApiError::bad_request("Missing message role"))?;
@@ -796,8 +966,8 @@ fn serialize(request: &RunRequest) -> Result<Value, ApiError> {
                     continue;
                 }
                 let mapped_role = if role == "system" { "developer" } else { role };
-                let content = content_text(&item["content"])?;
-                if !content.is_empty() || item.get("tool_calls").is_none() {
+                let content = crate::media::openai_content(&item["content"])?;
+                if !content_value_is_empty(&content) || item.get("tool_calls").is_none() {
                     input.push(json!({"role":mapped_role, "content":content}));
                 }
                 if let Some(calls) = item["tool_calls"].as_array() {
@@ -818,6 +988,14 @@ fn serialize(request: &RunRequest) -> Result<Value, ApiError> {
         input.insert(0, json!({"role":"developer", "content":format!("Return only valid JSON satisfying this JSON Schema. Do not use Markdown fences: {}", request.schema.as_ref().unwrap())}));
     }
     let mut body = json!({"model":request.model,"input":input,"store":false,"stream":true,"parallel_tool_calls":request.parallel_tool_calls,"include":["reasoning.encrypted_content"]});
+    if !request.hosted_tools.is_empty() {
+        body["tools"] = json!(request.hosted_tools);
+    }
+    if !request.hosted_include.is_empty() {
+        for include in &request.hosted_include {
+            body["include"].as_array_mut().unwrap().push(json!(include));
+        }
+    }
     if !request.tools.is_empty() {
         // additional_tools is the documented subscription route's dynamic tool catalogue.
         let definitions: Vec<_> = request.tools.iter().map(|t| json!({"type":"function", "name":t.name,"description":t.description,"parameters":t.parameters,"strict":false})).collect();
@@ -828,14 +1006,20 @@ fn serialize(request: &RunRequest) -> Result<Value, ApiError> {
         // Named and allowed-tools choices are already narrowed to this
         // catalogue, so "required" expresses each of them without naming a
         // tool upstream. Local validation still fails closed without a call.
-        if request.tool_required {
-            body["tool_choice"] = json!("required");
-        }
+    }
+    if request.tool_required {
+        body["tool_choice"] = json!("required");
     }
     if let Some(effort) = &request.effort {
         body["reasoning"] = json!({"effort":effort});
     }
     Ok(body)
+}
+
+fn content_value_is_empty(value: &Value) -> bool {
+    value.is_null()
+        || value.as_str().is_some_and(str::is_empty)
+        || value.as_array().is_some_and(Vec::is_empty)
 }
 
 fn order_replay(input: Vec<Value>) -> Vec<Value> {
@@ -890,6 +1074,7 @@ fn parse_result(
         .ok_or_else(|| failure(502, "invalid_provider_terminal"))?;
     let mut text = String::new();
     let mut calls = Vec::new();
+    let mut annotations = Vec::new();
     let mut ids = HashSet::new();
     let mut opaque = Vec::new();
     let output = response["output"]
@@ -906,11 +1091,23 @@ fn parse_result(
                     .ok_or_else(|| failure(502, "invalid_provider_output"))?
                 {
                     if part["type"] == "output_text" {
-                        text.push_str(
-                            part["text"]
-                                .as_str()
-                                .ok_or_else(|| failure(502, "invalid_provider_output"))?,
-                        );
+                        let part_text = part["text"]
+                            .as_str()
+                            .ok_or_else(|| failure(502, "invalid_provider_output"))?;
+                        if let Some(values) = part.get("annotations") {
+                            let values = values
+                                .as_array()
+                                .filter(|values| values.len() <= 256)
+                                .ok_or_else(|| failure(502, "invalid_provider_output"))?;
+                            let offset = text.encode_utf16().count();
+                            for value in values {
+                                if request.hosted_tools.is_empty() || annotations.len() >= 256 {
+                                    return Err(failure(502, "unsupported_provider_output"));
+                                }
+                                annotations.push(chat_citation(value, part_text, offset)?);
+                            }
+                        }
+                        text.push_str(part_text);
                     } else if part["type"] == "refusal" {
                         text.push_str(part["refusal"].as_str().unwrap_or("Request declined"));
                     } else {
@@ -964,6 +1161,14 @@ fn parse_result(
                     opaque.push(json!({"type":"reasoning","id":id,"summary":[],"encrypted_content":item["encrypted_content"]}));
                 }
             }
+            Some("web_search_call") => {
+                if request.hosted_tools.is_empty() {
+                    return Err(failure(502, "unsupported_provider_output"));
+                }
+                let search = crate::protocol::validate_hosted_search_call(item)
+                    .map_err(|_| failure(502, "invalid_provider_output"))?;
+                opaque.push(search);
+            }
             _ => return Err(failure(502, "unsupported_provider_output")),
         }
     }
@@ -975,7 +1180,8 @@ fn parse_result(
             None,
         ));
     }
-    if request.tool_required && calls.is_empty() {
+    let hosted_called = opaque.iter().any(|item| item["type"] == "web_search_call");
+    if request.tool_required && calls.is_empty() && !hosted_called {
         // The unmet field, as for tool_choice validation errors.
         return Err(with_diagnostics(
             failure(502, "missing_required_tool_call").with_param("tool_choice"),
@@ -1068,8 +1274,46 @@ fn parse_result(
         tool_calls: calls,
         status: status.into(),
         output_items: opaque,
+        annotations,
         upstream_request_id: None,
     })
+}
+
+fn chat_citation(value: &Value, part_text: &str, offset: usize) -> Result<Value, ApiError> {
+    let annotation = value
+        .as_object()
+        .ok_or_else(|| failure(502, "invalid_provider_output"))?;
+    if annotation["type"] != "url_citation" || annotation.len() != 5 {
+        return Err(failure(502, "unsupported_provider_output"));
+    }
+    let url = annotation["url"]
+        .as_str()
+        .ok_or_else(|| failure(502, "invalid_provider_output"))?;
+    crate::protocol::validate_search_url(url)
+        .map_err(|_| failure(502, "invalid_provider_output"))?;
+    let title = annotation["title"]
+        .as_str()
+        .filter(|title| title.len() <= 1024 && !title.chars().any(char::is_control))
+        .ok_or_else(|| failure(502, "invalid_provider_output"))?;
+    let start = annotation["start_index"]
+        .as_u64()
+        .filter(|value| *value <= u32::MAX as u64)
+        .ok_or_else(|| failure(502, "invalid_provider_output"))? as usize;
+    let end = annotation["end_index"]
+        .as_u64()
+        .filter(|value| *value <= u32::MAX as u64)
+        .ok_or_else(|| failure(502, "invalid_provider_output"))? as usize;
+    let text_len = part_text.encode_utf16().count();
+    if start >= end || end > text_len {
+        return Err(failure(502, "invalid_provider_output"));
+    }
+    let start = offset
+        .checked_add(start)
+        .ok_or_else(|| failure(502, "invalid_provider_output"))?;
+    let end = offset
+        .checked_add(end)
+        .ok_or_else(|| failure(502, "invalid_provider_output"))?;
+    Ok(json!({"type":"url_citation","url":url,"title":title,"start_index":start,"end_index":end}))
 }
 
 fn upstream_error(http_status: u16, value: &Value) -> ApiError {
@@ -1199,6 +1443,23 @@ fn upstream_failure(mut error: ApiError, phase: &str, http_status: u16, body: &[
     error
 }
 
+/// Preserve specialized tool diagnostics; otherwise retain a value-free reason
+/// and the bounded terminal response in the memory-only capture pipeline.
+fn response_validation_failure(
+    mut error: ApiError,
+    terminal: &Value,
+    text_bytes: usize,
+) -> ApiError {
+    if error.diagnostics.is_none() {
+        error.diagnostics = Some(crate::protocol::FailureDiagnostics {
+            metadata: json!({"phase":"response_validation","reason":error.code,
+                "output_item_count":terminal["output"].as_array().map(Vec::len),"text_bytes":text_bytes}),
+            private_body: Some(terminal.clone()),
+        });
+    }
+    error
+}
+
 fn with_diagnostics(mut error: ApiError, metadata: Value, private_body: Option<Value>) -> ApiError {
     error.diagnostics = Some(crate::protocol::FailureDiagnostics {
         metadata,
@@ -1284,6 +1545,7 @@ impl SseDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
     fn request() -> RunRequest {
         normalize_chat(json!({"model":"synthetic-openai", "messages":[{"role":"system","content":"Be useful"},{"role":"user","content":"Hi"}]}),"synthetic".into()).unwrap()
     }
@@ -1307,6 +1569,234 @@ mod tests {
         assert_eq!(body["stream"], true);
         assert!(body.get("temperature").is_none());
         assert!(body.get("max_output_tokens").is_none());
+    }
+    #[test]
+    fn media_history_serializes_as_documented_openai_content_blocks() {
+        let image = format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode({
+                fn chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+                    let mut bytes = (data.len() as u32).to_be_bytes().to_vec();
+                    bytes.extend_from_slice(kind);
+                    bytes.extend_from_slice(data);
+                    bytes.extend_from_slice(&[0; 4]);
+                    bytes
+                }
+                let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+                let mut header = vec![0; 13];
+                header[..4].copy_from_slice(&1u32.to_be_bytes());
+                header[4..8].copy_from_slice(&1u32.to_be_bytes());
+                bytes.extend(chunk(b"IHDR", &header));
+                bytes.extend(chunk(b"IDAT", &[1]));
+                bytes.extend(chunk(b"IEND", &[]));
+                bytes
+            })
+        );
+        let request = normalize_response(json!({"model":"synthetic-openai","input":[
+            {"role":"user","content":[{"type":"input_text","text":"inspect"},{"type":"input_image","image_url":image,"detail":"high"}]}
+        ]}),"synthetic".into()).unwrap();
+        assert!(request.has_media() && request.has_images() && !request.has_files());
+        let body = serialize(&request).unwrap();
+        assert_eq!(
+            body["input"][0]["content"][0],
+            json!({"type":"input_text","text":"inspect"})
+        );
+        assert_eq!(body["input"][0]["content"][1]["type"], "input_image");
+        assert_eq!(body["input"][0]["content"][1]["detail"], "high");
+
+        let pdf = format!(
+            "data:application/pdf;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(b"%PDF-1.7\nsynthetic\n%%EOF")
+        );
+        let request = normalize_response(json!({"model":"synthetic-openai","input":[
+            {"role":"user","content":[{"type":"input_file","file_data":pdf,"filename":"brief.pdf"}]}
+        ]}),"synthetic".into()).unwrap();
+        assert!(request.has_media() && !request.has_images() && request.has_files());
+        let body = serialize(&request).unwrap();
+        assert_eq!(body["input"][0]["content"][0]["filename"], "brief.pdf");
+        assert!(
+            body["input"][0]["content"][0]["file_data"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:application/pdf;base64,")
+        );
+    }
+    #[test]
+    fn hosted_search_serializes_separately_from_custom_tools_for_both_endpoints() {
+        let response = normalize_response(
+            json!({"model":"synthetic-openai","input":"search",
+            "tools":[{"type":"web_search","search_context_size":"low"}],
+            "include":["web_search_call.action.sources"]}),
+            "synthetic".into(),
+        )
+        .unwrap();
+        let body = serialize(&response).unwrap();
+        assert_eq!(body["store"], false);
+        assert_eq!(body["stream"], true);
+        assert_eq!(
+            body["tools"],
+            json!([{"type":"web_search","search_context_size":"low"}])
+        );
+        assert_eq!(
+            body["include"],
+            json!([
+                "reasoning.encrypted_content",
+                "web_search_call.action.sources"
+            ])
+        );
+
+        let chat = normalize_chat(json!({"model":"synthetic-openai","messages":[{"role":"user","content":"search"}],
+            "tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}},
+                {"type":"web_search"}],"include":["web_search_call.action.sources"],"tool_choice":"required"}), "synthetic".into()).unwrap();
+        let body = serialize(&chat).unwrap();
+        assert_eq!(body["tools"], json!([{"type":"web_search"}]));
+        assert_eq!(
+            body["include"],
+            json!([
+                "reasoning.encrypted_content",
+                "web_search_call.action.sources"
+            ])
+        );
+        assert_eq!(body["input"][0]["type"], "additional_tools");
+        assert_eq!(body["input"][0]["tools"][0]["name"], "lookup");
+        assert_eq!(body["tool_choice"], "required");
+
+        let chat_none = normalize_chat(json!({"model":"synthetic-openai","messages":[{"role":"user","content":"skip search"}],
+            "tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}},
+                {"type":"web_search"}],"include":["web_search_call.action.sources"],"tool_choice":"none"}), "synthetic".into()).unwrap();
+        let body = serialize(&chat_none).unwrap();
+        assert!(body.get("tools").is_none());
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+        assert!(body["input"][0]["type"] != "additional_tools");
+
+        let response_none = normalize_response(json!({"model":"synthetic-openai","input":"skip search",
+            "tools":[{"type":"web_search"}],"include":["web_search_call.action.sources"],"tool_choice":"none"}), "synthetic".into()).unwrap();
+        let body = serialize(&response_none).unwrap();
+        assert!(body.get("tools").is_none());
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+    }
+
+    #[test]
+    fn hosted_search_output_and_citations_are_validated_and_retained() {
+        let request = normalize_response(
+            json!({"model":"synthetic-openai","input":"search",
+            "tools":[{"type":"web_search"}]}),
+            "synthetic".into(),
+        )
+        .unwrap();
+        let terminal = json!({"id":"resp_synthetic","status":"completed","output":[
+            {"id":"ws_1","type":"web_search_call","status":"completed","action":{"type":"search","query":"synthetic query","sources":[{"url":"https://example.test/source","title":"Example"}]}},
+            {"id":"msg_1","type":"message","status":"completed","role":"assistant","content":[
+                {"type":"output_text","text":"A😀B","annotations":[{"type":"url_citation","start_index":1,"end_index":3,"url":"https://example.test/source","title":"Example"}]}
+            ]}
+        ]});
+        let result = parse_result(&request, &terminal, "A😀B").unwrap();
+        assert!(result.tool_calls.is_empty());
+        assert_eq!(json!(result.output_items), json!([terminal["output"][0]]));
+        assert_eq!(
+            json!(result.annotations),
+            json!([{"type":"url_citation","url":"https://example.test/source","title":"Example","start_index":1,"end_index":3}])
+        );
+
+        let mut no_search = request.clone();
+        no_search.hosted_tools.clear();
+        assert_eq!(
+            parse_result(&no_search, &terminal, "A😀B")
+                .unwrap_err()
+                .code,
+            "unsupported_provider_output"
+        );
+        let mut malformed = terminal;
+        malformed["output"][1]["content"][0]["annotations"][0]["end_index"] = json!(9);
+        let failure = response_validation_failure(
+            parse_result(&request, &malformed, "A😀B").unwrap_err(),
+            &malformed,
+            "A😀B".len(),
+        );
+        assert_eq!(failure.code, "invalid_provider_output");
+        let diagnostics = failure.diagnostics.unwrap();
+        assert_eq!(diagnostics.metadata["phase"], "response_validation");
+        assert!(!diagnostics.metadata.to_string().contains("example.test"));
+        assert_eq!(diagnostics.private_body.unwrap(), malformed);
+    }
+    #[test]
+    fn hosted_search_history_serializes_and_stream_citations_merge_safely() {
+        let search = json!({"type":"web_search_call","id":"ws_history","status":"completed",
+            "action":{"type":"search","query":"synthetic history","sources":[{"url":"https://example.test/source","title":"Example"}]}});
+        let request = normalize_response(
+            json!({"model":"synthetic-openai","input":[
+            {"role":"user","content":"search"},search.clone()],"tools":[{"type":"web_search"}]}),
+            "synthetic".into(),
+        )
+        .unwrap();
+        assert_eq!(serialize(&request).unwrap()["input"][1], search);
+
+        let mut annotations = StreamAnnotations::default();
+        let event = json!({"type":"response.output_text.annotation.added","item_id":"msg_stream",
+            "output_index":0,"content_index":0,"annotation_index":0,"sequence_number":3,
+            "annotation":{"type":"url_citation","start_index":1,"end_index":3,
+                "url":"https://example.test/source","title":"Example"}});
+        annotations.observe(&event).unwrap();
+        annotations.observe(&event).unwrap(); // exact duplicate replay is harmless
+        let terminal = json!({"status":"completed","output":[{"id":"msg_stream","type":"message",
+            "content":[{"type":"output_text","text":"A😀B"}]}]});
+        let merged = annotations.apply(&terminal).unwrap();
+        assert_eq!(
+            merged["output"][0]["content"][0]["annotations"][0],
+            event["annotation"]
+        );
+        let request = request;
+        let parsed = parse_result(&request, &merged, "A😀B").unwrap();
+        assert_eq!(parsed.annotations[0]["start_index"], 1);
+
+        let mut invalid_id = event.clone();
+        invalid_id["item_id"] = json!("other_message");
+        let mut conflict = StreamAnnotations::default();
+        conflict.observe(&event).unwrap();
+        invalid_id["annotation"]["title"] = json!("Changed");
+        assert_eq!(
+            conflict.observe(&invalid_id).unwrap_err().code,
+            "inconsistent_provider_output"
+        );
+        let mut invalid_terminal = terminal;
+        invalid_terminal["output"][0]["id"] = json!("different_message");
+        assert_eq!(
+            annotations.apply(&invalid_terminal).unwrap_err().code,
+            "inconsistent_provider_output"
+        );
+        let mut malformed = event;
+        malformed["annotation"]["url"] = json!("file:///etc/passwd");
+        let mut invalid_annotation = StreamAnnotations::default();
+        invalid_annotation.observe(&malformed).unwrap();
+        let invalid = invalid_annotation
+            .apply(
+                &json!({"status":"completed","output":[{"id":"msg_stream","type":"message",
+            "content":[{"type":"output_text","text":"A😀B"}]}]}),
+            )
+            .unwrap();
+        assert_eq!(
+            parse_result(&request, &invalid, "A😀B").unwrap_err().code,
+            "invalid_provider_output"
+        );
+    }
+
+    #[test]
+    fn hosted_search_progress_events_are_bounded_and_structural() {
+        let valid = json!({"type":"response.web_search_call.searching","item_id":"ws_stream",
+            "output_index":2,"sequence_number":7});
+        assert!(validate_search_progress_event(&valid).is_ok());
+        let mut invalid = valid.clone();
+        invalid["output_index"] = json!(1000);
+        assert_eq!(
+            validate_search_progress_event(&invalid).unwrap_err().code,
+            "invalid_provider_output_index"
+        );
+        invalid = valid;
+        invalid["unexpected"] = json!(true);
+        assert_eq!(
+            validate_search_progress_event(&invalid).unwrap_err().code,
+            "invalid_provider_event"
+        );
     }
     #[test]
     fn catalogue_reasoning_levels_accept_presets_and_strings_only_when_known() {

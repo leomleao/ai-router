@@ -1,5 +1,46 @@
 # Local validation
 
+## Media, search and images (2026-11-01)
+
+The [plan and DAG](media-search-plan.md) now completes image understanding on
+AGY/OpenAI, the explicit OpenAI document subset, OpenAI hosted search/citations,
+and separate AGY image generation/editing. GPT-6 Luna implementation workers
+completed the assigned components; independent cross-reviews and coordinator
+review produced the corrections recorded in the linked review reports.
+
+All **286 Rust tests** passed with external networking disabled, up from the
+258-test baseline. This includes the existing official Python, n8n
+Vercel/LangChain and Studio compatibility suites plus **25 new SDK calls**:
+11 Python media/document/search calls, 10 Vercel/LangChain media/search calls,
+and four Python AGY image-generation/edit/vision calls. Both Chat/Responses,
+streaming/nonstreaming, flat Responses citations, nested Chat annotations and
+provider-executed search results are exercised over real loopback TCP.
+
+New fixtures also cover typed serializer bodies, image structure/count/byte
+bounds, one-file limits across turns, safe file names and explicit file formats,
+AGY model capability gates, image-only IDs rejected on chat, exact image model
+rediscovery and account-generation isolation, native STOP+EOF/optional DONE,
+malformed/partial images, cancellation/deadlines, and a TCP client disconnect
+releasing the unary image handler and admission before the request deadline.
+Capture tests redact binary before truncation; persisted telemetry excludes
+media, prompt and filename values. Search validation failures preserve safe
+metadata and memory-only details without overwriting tool diagnostics.
+
+The current binary built without compiler warnings. Monitor PTY checks passed
+(pages/scroll, pause/range, disconnect/recovery, themes, resize, q/Ctrl+C and
+text/JSON). Formatting, Docker policy, protected-context checks and the five
+login-helper tests passed. All **68 pairs
+of pinned public OMP source hashes** matched (136 individual hashes). Added
+multipart support changes only its required lockfile dependencies. The reviewed
+OAuth identity, scopes and baseline revision are unchanged by these features.
+
+Live provider eligibility, image generation, remote media fetching and search
+acceptance were **not run**. Neither an account token-refresh acceptance cycle
+nor matched CLI/direct latency comparison is claimed. No server/deployment,
+authenticated local gateway, saved OAuth state or real secret was used. See
+[the media guide](media-search.md) for model/account limits and supported shapes.
+
+
 The [2026-11-01 OMP alignment review](upstream-review-2026-11-01.md) records
 the Hub 2.28.2 / OMP 686b5e2f baseline. All **258 Rust tests** passed in the
 isolated Docker test environment with external networking disabled, including

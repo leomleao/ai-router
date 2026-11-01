@@ -36,6 +36,9 @@ pub struct Antigravity {
 struct ProfileCatalogue {
     generation: String,
     models: HashMap<String, crate::antigravity_profile::WireProfile>,
+    vision: HashSet<String>,
+    image_models: Vec<String>,
+    checked_at: Option<Instant>,
 }
 impl ProfileCatalogue {
     fn get(
@@ -83,6 +86,42 @@ impl Antigravity {
     }
     pub async fn generation(&self) -> Result<String, ApiError> {
         self.auth.generation().await
+    }
+    pub async fn supports_images(&self, model: &str) -> bool {
+        self.vision_models().await.contains(model)
+    }
+    pub async fn vision_models(&self) -> HashSet<String> {
+        let Ok(generation) = self.auth.generation().await else {
+            return HashSet::new();
+        };
+        let profiles = self.profiles.lock().await;
+        if profiles.generation == generation
+            && profiles
+                .checked_at
+                .is_some_and(|at| at.elapsed() < Duration::from_secs(180))
+        {
+            profiles.vision.clone()
+        } else {
+            HashSet::new()
+        }
+    }
+    pub async fn image_models(&self) -> Vec<String> {
+        if self.availability_error().await.is_some() {
+            return vec![];
+        }
+        let Ok(generation) = self.auth.generation().await else {
+            return vec![];
+        };
+        let profiles = self.profiles.lock().await;
+        if profiles.generation == generation
+            && profiles
+                .checked_at
+                .is_some_and(|at| at.elapsed() < Duration::from_secs(180))
+        {
+            profiles.image_models.clone()
+        } else {
+            vec![]
+        }
     }
     pub async fn availability_error(&self) -> Option<ApiError> {
         if !self.config.antigravity_enabled {
@@ -135,6 +174,21 @@ impl Antigravity {
             };
             *self.profiles.lock().await = ProfileCatalogue {
                 generation: token.generation.clone(),
+                vision: models
+                    .iter()
+                    .filter(|model| value["models"][&model.id]["supportsImages"] == true)
+                    .map(|model| model.id.clone())
+                    .collect(),
+                image_models: value["imageGenerationModelIds"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .filter(|id| crate::config::valid_model_id(id))
+                    .take(128)
+                    .map(str::to_owned)
+                    .collect(),
+                checked_at: Some(Instant::now()),
                 models: models
                     .iter()
                     .filter_map(|model| {
@@ -210,6 +264,13 @@ impl Antigravity {
             .is_some_and(|g| g != &token.generation)
         {
             return Err(failure(503, "provider_account_changed"));
+        }
+        // The serving account must advertise image input for this exact ID.
+        // Never silently discard media or borrow another account's capability.
+        if request.has_media() && !self.supports_images(&request.model).await {
+            return Err(ApiError::unsupported(
+                "image input for the selected AGY model",
+            ));
         }
         let replay = {
             let mut cache = self.replay.lock().await;
@@ -338,6 +399,7 @@ impl Antigravity {
             send(
                 sender,
                 RunEvent::Completed(RunResult {
+                    annotations: vec![],
                     output_items: vec![],
                     upstream_request_id: decoded.upstream_request_id.or(upstream_id.clone()),
                     text: decoded.text,
@@ -635,6 +697,7 @@ mod tests {
                 crate::antigravity_profile::WireProfile::from_row(&json!({"maxOutputTokens":8192}))
                     .unwrap(),
             )]),
+            ..Default::default()
         };
         assert!(
             catalogue

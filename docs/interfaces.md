@@ -59,6 +59,8 @@ provider_generation: Option<String>
 endpoint: String                  "chat" or "responses"
 request_id, model: String
 tools: Vec<ToolDefinition>
+hosted_tools: Vec<Value>          separately validated OpenAI web search tools
+hosted_include: Vec<String>       supported search sources include
 schema: Option<Value>
 effort: Option<String>
 ignored: Vec<String>              accepted no-op fields, for disclosure only (not serialized)
@@ -79,7 +81,7 @@ matching `tool` results. Responses history retains typed `message`,
 and developer messages that precede the conversation remain instructions;
 later turns retain their original chronology.
 
-`normalize_chat` and `normalize_response` validate supported fields, text-only
+`normalize_chat` and `normalize_response` validate supported fields, typed bounded text/image/document
 content, call/result pairing, identifiers, and bounded item counts. They
 support tool choice `auto`, `none`, `required`, a named function and
 `allowed_tools`. `none` removes the tool inventory; named and allowed-tools
@@ -129,6 +131,9 @@ validation errors.
 
 Shared types include `ToolDefinition`, `ToolCall`, `Usage`, `RunResult`, and
 `RunEvent`. `RunResult::usage_partial` carries incomplete or inferred usage.
+`RunResult::annotations` carries bounded flat Responses URL citations; Chat
+wraps these in its nested annotation shape. Hosted search items stay in
+`output_items` and never become client function calls.
 Chat and Responses output continue to expose both `agy_usage_partial` and
 `ai_router_usage_partial`. `RunEvent` contains `Init`, `TextDelta`, `ToolCall`,
 `Completed`, and `Error`; there is no native event.
@@ -231,7 +236,10 @@ evicted, and wrong-generation reasoning references return the same
 `item_reference_not_found` response. Storage is cleared at restart.
 
 The router exposes `/health`, `/ready`, `/v1/models`, `/v1/capabilities`,
-`/v1/chat/completions`, and `/v1/responses`. The removed `/v1/agy/runs` route
+`/v1/chat/completions`, `/v1/responses`, `/v1/images/generations` and
+`/v1/images/edits`. The image routes share model authentication, AGY admission,
+account-generation barriers, cancellation, deadlines and completion telemetry.
+See [media/search](media-search.md) for exact provider and media boundaries. The removed `/v1/agy/runs` route
 and its children fall through to 404. All protected routes require a model-scoped
 client key. Capabilities currently report schema version 3 and explicit
 unsupported features.

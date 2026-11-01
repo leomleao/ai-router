@@ -279,6 +279,13 @@ pub struct RunRequest {
     pub request_id: String,
     pub model: String,
     pub tools: Vec<ToolDefinition>,
+    /// Provider-hosted tools such as Responses web search. Kept separate from
+    /// client functions so hosted calls can never become function handoffs.
+    #[serde(default)]
+    pub hosted_tools: Vec<Value>,
+    /// Bounded Responses include hints associated with hosted tools.
+    #[serde(default)]
+    pub hosted_include: Vec<String>,
     pub schema: Option<Value>,
     pub effort: Option<String>,
     /// Accepted fields that change nothing, for response disclosure only.
@@ -299,11 +306,58 @@ impl RunRequest {
     pub fn withholds_text(&self) -> bool {
         self.schema.is_some() || self.tool_required
     }
+
+    /// Whether this request contains normalized image or document input.
+    pub fn has_media(&self) -> bool {
+        self.has_images() || self.has_files()
+    }
+
+    pub fn has_images(&self) -> bool {
+        self.input
+            .iter()
+            .chain(self.instructions.iter())
+            .any(|item| {
+                let content = if item["type"] == "function_call_output" {
+                    &item["output"]
+                } else {
+                    &item["content"]
+                };
+                content
+                    .as_array()
+                    .is_some_and(|parts| parts.iter().any(|part| part["type"] == "input_image"))
+            })
+    }
+
+    pub fn has_files(&self) -> bool {
+        self.input
+            .iter()
+            .chain(self.instructions.iter())
+            .any(|item| {
+                let content = if item["type"] == "function_call_output" {
+                    &item["output"]
+                } else {
+                    &item["content"]
+                };
+                content
+                    .as_array()
+                    .is_some_and(|parts| parts.iter().any(|part| part["type"] == "input_file"))
+            })
+    }
+
+    pub fn has_hosted_search(&self) -> bool {
+        !self.hosted_tools.is_empty()
+            || self
+                .input
+                .iter()
+                .any(|item| item["type"] == "web_search_call")
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RunResult {
     #[serde(default)]
     pub output_items: Vec<Value>,
+    #[serde(default)]
+    pub annotations: Vec<Value>,
     #[serde(default)]
     pub upstream_request_id: Option<String>,
     pub text: String,
@@ -376,11 +430,21 @@ pub const DROPPED_REASONING: &str = "reasoning_without_encrypted_content";
 
 pub fn normalize_chat(value: Value, request_id: String) -> Result<RunRequest, ApiError> {
     let root = object(&value, "request")?;
-    let mut ignored = validate_common(root, false)?;
     let model = model(root)?;
-    let mut tools = parse_tools(root.get("tools"), false)?;
+    let (mut tools, mut hosted_tools) = parse_tools_with_hosted(root.get("tools"), false)?;
+    let mut ignored = validate_common(root, false, !hosted_tools.is_empty())?;
     let tool_relay = unconstrained_tool_choice(root.get("tool_choice"));
-    let tool_required = apply_tool_choice(root.get("tool_choice"), &mut tools, false)?;
+    let tool_required = apply_tool_choice(
+        root.get("tool_choice"),
+        &mut tools,
+        false,
+        !hosted_tools.is_empty(),
+    )?;
+    let mut hosted_include = parse_hosted_include(root, &hosted_tools, false)?;
+    if root.get("tool_choice").and_then(Value::as_str) == Some("none") {
+        hosted_tools.clear();
+        hosted_include.clear();
+    }
     let schema = chat_schema(root.get("response_format"))?;
     required_tool_without_schema(tool_required, &schema)?;
     let effort = parse_effort(root.get("reasoning_effort"))?;
@@ -398,6 +462,8 @@ pub fn normalize_chat(value: Value, request_id: String) -> Result<RunRequest, Ap
     let mut leading = true;
     let mut calls = HashMap::new();
     let mut returned = HashSet::new();
+    let mut media_images = 0usize;
+    let mut media_files = 0usize;
     for message in messages {
         let msg = object(message, "message")?;
         allowed_fields(
@@ -463,10 +529,29 @@ pub fn normalize_chat(value: Value, request_id: String) -> Result<RunRequest, Ap
             }
         }
         let content = normalized.get("content").cloned().unwrap_or(Value::Null);
+        let content = crate::media::normalize_content(
+            &content,
+            crate::media::ContentApi::Chat,
+            role == "user",
+        )?;
+        let (images, files) = crate::media::media_counts(&content);
+        media_images += images;
+        media_files += files;
+        if media_images > crate::media::MAX_IMAGES {
+            return Err(ApiError::bad_request(
+                "Too many images (maximum 8 per request)",
+            ));
+        }
+        if media_files > crate::media::MAX_FILES {
+            return Err(ApiError::bad_request(
+                "Too many files (maximum 1 per request)",
+            ));
+        }
+        normalized.insert("content".to_owned(), content.clone());
         validate_content(
             &content,
-            false,
             role == "assistant" && (has_calls || nonnull(msg.get("refusal")).is_some()),
+            role == "user",
         )?;
         if role == "assistant" {
             if let Some(refusal) = nonnull(msg.get("refusal")) {
@@ -478,7 +563,7 @@ pub fn normalize_chat(value: Value, request_id: String) -> Result<RunRequest, Ap
                     Some(Value::Array(parts)) => parts.clone(),
                     Some(_) => return Err(ApiError::internal("Validated content changed shape")),
                 };
-                parts.push(json!({"type":"text", "text":refusal}));
+                parts.push(json!({"type":"input_text", "text":refusal}));
                 normalized.insert("content".to_owned(), Value::Array(parts));
                 normalized.remove("refusal");
             }
@@ -547,6 +632,8 @@ pub fn normalize_chat(value: Value, request_id: String) -> Result<RunRequest, Ap
     request.ignored = ignored;
     request.tool_required = tool_required;
     request.tool_relay = tool_relay;
+    request.hosted_tools = hosted_tools;
+    request.hosted_include = hosted_include;
     request.parallel_tool_calls = root
         .get("parallel_tool_calls")
         .and_then(Value::as_bool)
@@ -556,11 +643,21 @@ pub fn normalize_chat(value: Value, request_id: String) -> Result<RunRequest, Ap
 
 pub fn normalize_response(value: Value, request_id: String) -> Result<RunRequest, ApiError> {
     let root = object(&value, "request")?;
-    let mut ignored = validate_common(root, true)?;
     let model = model(root)?;
-    let mut tools = parse_tools(root.get("tools"), true)?;
+    let (mut tools, mut hosted_tools) = parse_tools_with_hosted(root.get("tools"), true)?;
+    let mut ignored = validate_common(root, true, !hosted_tools.is_empty())?;
     let tool_relay = unconstrained_tool_choice(root.get("tool_choice"));
-    let tool_required = apply_tool_choice(root.get("tool_choice"), &mut tools, true)?;
+    let tool_required = apply_tool_choice(
+        root.get("tool_choice"),
+        &mut tools,
+        true,
+        !hosted_tools.is_empty(),
+    )?;
+    let mut hosted_include = parse_hosted_include(root, &hosted_tools, true)?;
+    if root.get("tool_choice").and_then(Value::as_str) == Some("none") {
+        hosted_tools.clear();
+        hosted_include.clear();
+    }
     let schema = response_schema(root.get("text"))?;
     required_tool_without_schema(tool_required, &schema)?;
     let effort = if let Some(reasoning) = nonnull(root.get("reasoning")) {
@@ -605,6 +702,8 @@ pub fn normalize_response(value: Value, request_id: String) -> Result<RunRequest
     let mut leading = true;
     let mut calls = HashMap::new();
     let mut returned = HashSet::new();
+    let mut media_images = 0usize;
+    let mut media_files = 0usize;
     for item in items {
         let data = object(&item, "input item")?;
         let kind = match nonnull(data.get("type")) {
@@ -630,7 +729,26 @@ pub fn normalize_response(value: Value, request_id: String) -> Result<RunRequest
                 if role == "assistant" {
                     refusal_parts_to_text(content)?;
                 }
-                validate_content(content, true, false)?;
+                let content = crate::media::normalize_content(
+                    content,
+                    crate::media::ContentApi::Responses,
+                    role == "user",
+                )?;
+                let (images, files) = crate::media::media_counts(&content);
+                media_images += images;
+                media_files += files;
+                if media_images > crate::media::MAX_IMAGES {
+                    return Err(ApiError::bad_request(
+                        "Too many images (maximum 8 per request)",
+                    ));
+                }
+                if media_files > crate::media::MAX_FILES {
+                    return Err(ApiError::bad_request(
+                        "Too many files (maximum 1 per request)",
+                    ));
+                }
+                *normalized.get_mut("content").unwrap() = content;
+                validate_content(normalized.get("content").unwrap(), false, role == "user")?;
                 validate_item_metadata(data)?;
                 if leading && (role == "system" || role == "developer") {
                     system.push(normalized);
@@ -670,7 +788,7 @@ pub fn normalize_response(value: Value, request_id: String) -> Result<RunRequest
                 let output = data
                     .get("output")
                     .ok_or_else(|| ApiError::bad_request("Tool output is required"))?;
-                validate_content(output, true, false)?;
+                validate_content(output, false, false)?;
                 if !calls.contains_key(id) || !returned.insert(id.to_owned()) {
                     return Err(ApiError::bad_request(
                         "Tool output must match one preceding function call exactly once",
@@ -710,6 +828,11 @@ pub fn normalize_response(value: Value, request_id: String) -> Result<RunRequest
                 leading = false;
                 transcript.push(item);
             }
+            "web_search_call" => {
+                leading = false;
+                let search = validate_hosted_search_call(&item)?;
+                transcript.push(search);
+            }
             _ => return Err(ApiError::unsupported("input item type")),
         }
     }
@@ -723,6 +846,8 @@ pub fn normalize_response(value: Value, request_id: String) -> Result<RunRequest
     request.ignored = ignored;
     request.tool_required = tool_required;
     request.tool_relay = tool_relay;
+    request.hosted_tools = hosted_tools;
+    request.hosted_include = hosted_include;
     request.parallel_tool_calls = root
         .get("parallel_tool_calls")
         .and_then(Value::as_bool)
@@ -784,6 +909,8 @@ fn make_request(
         request_id,
         model,
         tools,
+        hosted_tools: Vec::new(),
+        hosted_include: Vec::new(),
         schema,
         effort,
         ignored: Vec::new(),
@@ -793,7 +920,11 @@ fn make_request(
 }
 
 /// Returns accepted fields that change nothing, in request order.
-fn validate_common(root: &Map<String, Value>, responses: bool) -> Result<Vec<String>, ApiError> {
+fn validate_common(
+    root: &Map<String, Value>,
+    responses: bool,
+    hosted_search: bool,
+) -> Result<Vec<String>, ApiError> {
     let supported = if responses {
         vec![
             "model",
@@ -869,15 +1000,16 @@ fn validate_common(root: &Map<String, Value>, responses: bool) -> Result<Vec<Str
                 tier => return Err(ApiError::unsupported(&format!("service_tier {tier}"))),
             },
             "stop" => value.as_array().is_some_and(Vec::is_empty),
-            // The OpenAI adapter always requests and returns encrypted
-            // reasoning; AGY returns no reasoning items, so nothing is claimed.
-            // Chat Completions has no include field and no reasoning items.
+            // The OpenAI adapter always requests encrypted reasoning. Public
+            // include hints are accepted only when their corresponding route
+            // and hosted search tool can honor them.
             "include" => value.as_array().is_some_and(|entries| {
                 entries.is_empty()
-                    || responses
-                        && entries
-                            .iter()
-                            .all(|entry| entry.as_str() == Some("reasoning.encrypted_content"))
+                    || entries.iter().all(|entry| match entry.as_str() {
+                        Some("reasoning.encrypted_content") => responses,
+                        Some("web_search_call.action.sources") => responses || hosted_search,
+                        _ => false,
+                    })
             }),
             // The router never truncates history: an oversized context fails
             // at the provider's limit. "auto" therefore changes nothing.
@@ -987,6 +1119,404 @@ fn model(root: &Map<String, Value>) -> Result<String, ApiError> {
     Ok(model.to_owned())
 }
 
+fn parse_tools_with_hosted(
+    value: Option<&Value>,
+    responses: bool,
+) -> Result<(Vec<ToolDefinition>, Vec<Value>), ApiError> {
+    let Some(value) = nonnull(value) else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let entries = value
+        .as_array()
+        .filter(|entries| entries.len() <= MAX_TOOLS)
+        .ok_or_else(|| ApiError::bad_request("tools must be an array with at most 128 entries"))?;
+    let mut functions = Vec::new();
+    let mut hosted = Vec::new();
+    let mut hosted_seen = HashSet::new();
+    for entry in entries {
+        let kind = entry.get("type").and_then(Value::as_str);
+        if matches!(kind, Some("web_search" | "web_search_preview")) {
+            let normalized = normalize_hosted_search_tool(entry)?;
+            let kind = normalized["type"].as_str().unwrap();
+            if !hosted_seen.insert(kind.to_owned()) || !hosted.is_empty() {
+                return Err(ApiError::bad_request(
+                    "At most one hosted web search tool is supported",
+                ));
+            }
+            hosted.push(normalized);
+        } else {
+            functions.push(entry.clone());
+        }
+    }
+    Ok((parse_tools(Some(&json!(functions)), responses)?, hosted))
+}
+
+fn normalize_hosted_search_tool(value: &Value) -> Result<Value, ApiError> {
+    let tool = object(value, "hosted tool")?;
+    let kind = required_string(tool, "type")?;
+    if !matches!(kind, "web_search" | "web_search_preview") {
+        return Err(ApiError::unsupported("hosted tool type"));
+    }
+    allowed_fields(
+        tool,
+        &[
+            "type",
+            "search_context_size",
+            "filters",
+            "user_location",
+            "external_web_access",
+            "search_content_types",
+        ],
+        "web search tool",
+    )?;
+    let mut normalized = Map::new();
+    normalized.insert("type".into(), json!(kind));
+    if let Some(context) = nonnull(tool.get("search_context_size")) {
+        if !matches!(
+            string(context, "search_context_size")?,
+            "low" | "medium" | "high"
+        ) {
+            return Err(ApiError::bad_request(
+                "search_context_size must be low, medium, or high",
+            ));
+        }
+        normalized.insert("search_context_size".into(), context.clone());
+    }
+    if let Some(filters) = nonnull(tool.get("filters")) {
+        if kind != "web_search" {
+            return Err(ApiError::unsupported("filters on web_search_preview"));
+        }
+        let filters = object(filters, "web search filters")?;
+        allowed_fields(
+            filters,
+            &["allowed_domains", "blocked_domains"],
+            "web search filters",
+        )?;
+        let mut clean = Map::new();
+        for key in ["allowed_domains", "blocked_domains"] {
+            if let Some(value) = nonnull(filters.get(key)) {
+                let domains = value
+                    .as_array()
+                    .filter(|entries| entries.len() <= 100)
+                    .ok_or_else(|| {
+                        ApiError::bad_request(format!(
+                            "filters.{key} must contain at most 100 domains"
+                        ))
+                    })?;
+                let mut clean_domains = Vec::new();
+                let mut seen = HashSet::new();
+                for domain in domains {
+                    let domain = string(domain, "web search domain")?;
+                    validate_domain(domain)?;
+                    if !seen.insert(domain.to_ascii_lowercase()) {
+                        return Err(ApiError::bad_request(
+                            "Web search filter domains must be unique",
+                        ));
+                    }
+                    clean_domains.push(json!(domain));
+                }
+                clean.insert(key.into(), json!(clean_domains));
+            }
+        }
+        normalized.insert("filters".into(), Value::Object(clean));
+    }
+    if let Some(location) = nonnull(tool.get("user_location")) {
+        normalized.insert("user_location".into(), normalize_search_location(location)?);
+    }
+    if let Some(value) = nonnull(tool.get("external_web_access")) {
+        if kind != "web_search" {
+            return Err(ApiError::unsupported(
+                "external_web_access on web_search_preview",
+            ));
+        }
+        if !value.is_boolean() {
+            return Err(ApiError::bad_request("external_web_access must be boolean"));
+        }
+        normalized.insert("external_web_access".into(), value.clone());
+    }
+    if let Some(value) = nonnull(tool.get("search_content_types")) {
+        let kinds = value
+            .as_array()
+            .filter(|v| !v.is_empty() && v.len() <= 2)
+            .ok_or_else(|| {
+                ApiError::bad_request("search_content_types must be a nonempty array")
+            })?;
+        if kinds.iter().any(|v| v.as_str() != Some("text")) {
+            return Err(ApiError::unsupported("non-text web search results"));
+        }
+        normalized.insert("search_content_types".into(), json!(["text"]));
+    }
+    Ok(Value::Object(normalized))
+}
+
+fn normalize_search_location(value: &Value) -> Result<Value, ApiError> {
+    let location = object(value, "user_location")?;
+    allowed_fields(
+        location,
+        &["type", "country", "region", "city", "timezone"],
+        "user_location",
+    )?;
+    if required_string(location, "type")? != "approximate" {
+        return Err(ApiError::unsupported("user_location type"));
+    }
+    let mut normalized = Map::new();
+    normalized.insert("type".into(), json!("approximate"));
+    for key in ["country", "region", "city", "timezone"] {
+        if let Some(value) = nonnull(location.get(key)) {
+            let text = string(value, key)?;
+            if text.is_empty() || text.len() > 128 || text.chars().any(char::is_control) {
+                return Err(ApiError::bad_request(format!(
+                    "user_location.{key} must be 1 to 128 safe characters"
+                )));
+            }
+            normalized.insert(key.into(), json!(text));
+        }
+    }
+    Ok(Value::Object(normalized))
+}
+
+fn validate_domain(domain: &str) -> Result<(), ApiError> {
+    if domain.is_empty()
+        || domain.len() > 253
+        || domain.contains('/')
+        || domain.contains(':')
+        || domain.contains('@')
+        || domain.starts_with('.')
+        || domain.ends_with('.')
+        || domain.split('.').any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+    {
+        return Err(ApiError::bad_request(
+            "Web search filters require bare domain names",
+        ));
+    }
+    Ok(())
+}
+
+fn parse_hosted_include(
+    root: &Map<String, Value>,
+    hosted: &[Value],
+    responses: bool,
+) -> Result<Vec<String>, ApiError> {
+    let Some(include) = nonnull(root.get("include")) else {
+        return Ok(Vec::new());
+    };
+    let values = include
+        .as_array()
+        .filter(|v| v.len() <= 16)
+        .ok_or_else(|| ApiError::bad_request("include must be an array with at most 16 values"))?;
+    let mut output = Vec::new();
+    let mut seen = HashSet::new();
+    for value in values {
+        let value = string(value, "include item")?;
+        if value == "web_search_call.action.sources" {
+            if hosted.is_empty() {
+                return Err(ApiError::bad_request(
+                    "web_search_call.action.sources requires a web search tool",
+                ));
+            }
+            if !seen.insert(value) {
+                return Err(ApiError::bad_request("include values must be unique"));
+            }
+            output.push(value.to_owned());
+        } else if value != "reasoning.encrypted_content" || !responses {
+            return Err(ApiError::unsupported("include item"));
+        }
+    }
+    Ok(output)
+}
+
+/// Validate and retain the documented bounded web_search_call history/output
+/// shape. Its payload is not interpreted as a client function call.
+pub(crate) fn validate_hosted_search_call(value: &Value) -> Result<Value, ApiError> {
+    let item = object(value, "web_search_call")?;
+    allowed_fields(
+        item,
+        &["type", "id", "status", "action", "results"],
+        "web_search_call",
+    )?;
+    if required_string(item, "type")? != "web_search_call" {
+        return Err(ApiError::bad_request("Invalid hosted search item type"));
+    }
+    let id = required_string(item, "id")?;
+    if id.is_empty() || id.len() > 256 || !id.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err(ApiError::bad_request("Invalid hosted search item ID"));
+    }
+    if required_string(item, "status")? != "completed" {
+        return Err(ApiError::bad_request(
+            "Hosted search history items must be completed",
+        ));
+    }
+    let action = object(
+        item.get("action")
+            .ok_or_else(|| ApiError::bad_request("web_search_call.action is required"))?,
+        "web_search_call.action",
+    )?;
+    let action_type = required_string(action, "type")?;
+    let allowed_action_fields: &[&str] = match action_type {
+        "search" => &["type", "query", "queries", "sources"],
+        "open_page" => &["type", "url"],
+        "find_in_page" => &["type", "url", "pattern"],
+        _ => return Err(ApiError::unsupported("web_search_call action")),
+    };
+    allowed_fields(action, allowed_action_fields, "web_search_call.action")?;
+    if let Some(query) = nonnull(action.get("query")) {
+        bounded_search_text(query, "web search query", 4096)?;
+    }
+    if let Some(queries) = nonnull(action.get("queries")) {
+        let queries = queries
+            .as_array()
+            .filter(|values| values.len() <= 32)
+            .ok_or_else(|| {
+                ApiError::bad_request(
+                    "web_search_call queries must be an array of at most 32 strings",
+                )
+            })?;
+        for query in queries {
+            bounded_search_text(query, "web search query", 4096)?;
+        }
+    }
+    if let Some(url) = nonnull(action.get("url")) {
+        validate_search_url(string(url, "web_search_call URL")?)?;
+    }
+    if let Some(pattern) = nonnull(action.get("pattern")) {
+        bounded_search_text(pattern, "web search pattern", 1024)?;
+    }
+    if let Some(sources) = nonnull(action.get("sources")) {
+        if action_type != "search" {
+            return Err(ApiError::bad_request(
+                "Only search actions may contain sources",
+            ));
+        }
+        let sources = sources
+            .as_array()
+            .filter(|values| values.len() <= 100)
+            .ok_or_else(|| {
+                ApiError::bad_request(
+                    "web_search_call sources must be an array of at most 100 items",
+                )
+            })?;
+        for source in sources {
+            let fields = object(source, "web search source")?;
+            allowed_fields(
+                fields,
+                &["type", "url", "title", "snippet", "source", "domain"],
+                "web search source",
+            )?;
+            if let Some(url) = nonnull(fields.get("url")) {
+                validate_search_url(string(url, "web search source URL")?)?;
+            }
+            for key in ["type", "title", "snippet", "source", "domain"] {
+                if let Some(value) = nonnull(fields.get(key)) {
+                    bounded_search_text(value, "web search source field", 4096)?;
+                }
+            }
+        }
+    }
+    if let Some(results) = nonnull(item.get("results")) {
+        let results = results
+            .as_array()
+            .filter(|values| values.len() <= 100)
+            .ok_or_else(|| {
+                ApiError::bad_request(
+                    "web_search_call results must be an array of at most 100 items",
+                )
+            })?;
+        for result in results {
+            validate_search_json(result, 0)?;
+        }
+    }
+    if serde_json::to_vec(value).map_or(true, |bytes| bytes.len() > 64 * 1024) {
+        return Err(ApiError::bad_request("web_search_call exceeds 64 KiB"));
+    }
+    Ok(value.clone())
+}
+
+fn bounded_search_text(value: &Value, field: &str, max: usize) -> Result<(), ApiError> {
+    let text = value
+        .as_str()
+        .ok_or_else(|| ApiError::bad_request(format!("{field} must be a string")))?;
+    if text.len() > max
+        || text
+            .chars()
+            .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\t'))
+    {
+        return Err(ApiError::bad_request(format!(
+            "{field} is invalid or too long"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_search_url(value: &str) -> Result<(), ApiError> {
+    if value.len() > 2048 {
+        return Err(ApiError::bad_request("Web search URL exceeds 2048 bytes"));
+    }
+    let parsed = url::Url::parse(value)
+        .map_err(|_| ApiError::bad_request("Web search URL must be absolute HTTP or HTTPS"))?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err(ApiError::bad_request(
+            "Web search URLs must be HTTP or HTTPS without credentials",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_search_json(value: &Value, depth: usize) -> Result<(), ApiError> {
+    if depth > 8 {
+        return Err(ApiError::bad_request(
+            "Web search result nesting exceeds 8 levels",
+        ));
+    }
+    match value {
+        Value::String(text) if text.len() > 4096 => Err(ApiError::bad_request(
+            "Web search result string exceeds 4096 bytes",
+        )),
+        Value::String(_) | Value::Null | Value::Bool(_) | Value::Number(_) => Ok(()),
+        Value::Array(values) if values.len() <= 100 => {
+            for value in values {
+                validate_search_json(value, depth + 1)?;
+            }
+            Ok(())
+        }
+        Value::Array(_) => Err(ApiError::bad_request(
+            "Web search result array exceeds 100 items",
+        )),
+        Value::Object(fields) if fields.len() <= 32 => {
+            for (key, value) in fields {
+                if key.len() > 64 {
+                    return Err(ApiError::bad_request(
+                        "Web search result field name is too long",
+                    ));
+                }
+                if matches!(
+                    key.as_str(),
+                    "url" | "image_url" | "thumbnail_url" | "source_website_url"
+                ) {
+                    validate_search_url(string(value, "web search result URL")?)?;
+                } else {
+                    validate_search_json(value, depth + 1)?;
+                }
+            }
+            Ok(())
+        }
+        Value::Object(_) => Err(ApiError::bad_request(
+            "Web search result object exceeds 32 fields",
+        )),
+    }
+}
+
 fn parse_tools(value: Option<&Value>, responses: bool) -> Result<Vec<ToolDefinition>, ApiError> {
     let Some(value) = nonnull(value) else {
         return Ok(Vec::new());
@@ -1088,14 +1618,17 @@ fn apply_tool_choice(
     value: Option<&Value>,
     tools: &mut Vec<ToolDefinition>,
     responses: bool,
+    hosted: bool,
 ) -> Result<bool, ApiError> {
-    parse_tool_choice(value, tools, responses).map_err(|error| error.with_param("tool_choice"))
+    parse_tool_choice(value, tools, responses, hosted)
+        .map_err(|error| error.with_param("tool_choice"))
 }
 
 fn parse_tool_choice(
     value: Option<&Value>,
     tools: &mut Vec<ToolDefinition>,
     responses: bool,
+    hosted: bool,
 ) -> Result<bool, ApiError> {
     let (allowed, required) = match nonnull(value) {
         None => return Ok(false),
@@ -1155,9 +1688,14 @@ fn parse_tool_choice(
             ));
         }
     };
-    if tools.is_empty() {
+    if tools.is_empty() && !hosted {
         return Err(ApiError::bad_request(
-            "tool_choice requires at least one function tool in tools",
+            "tool_choice requires at least one client function or hosted web search tool",
+        ));
+    }
+    if hosted && allowed.is_some() {
+        return Err(ApiError::unsupported(
+            "named or allowed tool_choice with hosted web search",
         ));
     }
     if let Some(names) = allowed {
@@ -1424,7 +1962,7 @@ fn validate_arguments(arguments: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn validate_content(value: &Value, responses: bool, nullable: bool) -> Result<(), ApiError> {
+fn validate_content(value: &Value, nullable: bool, allow_media: bool) -> Result<(), ApiError> {
     if let Some(text) = value.as_str() {
         return bounded_text(text);
     }
@@ -1439,18 +1977,38 @@ fn validate_content(value: &Value, responses: bool, nullable: bool) -> Result<()
     }
     for part in parts {
         let part = object(part, "content block")?;
-        allowed_fields(
-            part,
-            &["type", "text", "annotations", "logprobs"],
-            "content block",
-        )?;
         let kind = required_string(part, "type")?;
-        if (!responses && kind != "text")
-            || (responses && kind != "input_text" && kind != "output_text")
-        {
-            return Err(ApiError::unsupported("non-text content blocks"));
+        match kind {
+            "input_text" | "output_text" => {
+                allowed_fields(
+                    part,
+                    &["type", "text", "annotations", "logprobs"],
+                    "content block",
+                )?;
+                bounded_text(required_string(part, "text")?)?;
+            }
+            "input_image" if allow_media => {
+                allowed_fields(part, &["type", "image_url", "detail"], "content block")?;
+                if !part.get("image_url").is_some_and(Value::is_string) {
+                    return Err(ApiError::bad_request("Invalid normalized image"));
+                }
+            }
+            // Both public endpoints normalize their permitted file forms to
+            // the canonical Responses input_file block before this check.
+            "input_file" if allow_media => {
+                allowed_fields(
+                    part,
+                    &["type", "file_data", "filename", "file_url"],
+                    "content block",
+                )?;
+                if !(part.get("file_data").is_some_and(Value::is_string)
+                    || part.get("file_url").is_some_and(Value::is_string))
+                {
+                    return Err(ApiError::bad_request("Invalid normalized file"));
+                }
+            }
+            _ => return Err(ApiError::unsupported("non-text content blocks")),
         }
-        bounded_text(required_string(part, "text")?)?;
         for field in ["annotations", "logprobs"] {
             if let Some(extra) = nonnull(part.get(field)) {
                 if !extra.as_array().is_some_and(Vec::is_empty) {
@@ -1527,7 +2085,7 @@ fn bounded_history(input: &[Value], instructions: &[Value]) -> Result<(), ApiErr
         .map_err(|_| ApiError::internal("Could not measure conversation"))?
         .len();
     if size > MAX_TEXT_BYTES {
-        Err(ApiError::new(413, "input_too_large", "Text exceeds 1 MiB"))
+        Err(ApiError::new(413, "input_too_large", "Input exceeds 1 MiB"))
     } else {
         Ok(())
     }
@@ -1575,6 +2133,7 @@ fn allowed_fields(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
     fn chat() -> Value {
         json!({"model":"gemini-test", "messages":[{"role":"user","content":"hello"}]})
     }
@@ -1903,11 +2462,11 @@ mod tests {
         assert_eq!(request.ignored, ["cache_control"]);
         assert_eq!(
             request.instructions[0]["content"],
-            json!([{"type":"text","text":"rules"}])
+            json!([{"type":"input_text","text":"rules"}])
         );
         assert_eq!(
             request.input[0]["content"],
-            json!([{"type":"text","text":"hi"}])
+            json!([{"type":"input_text","text":"hi"}])
         );
         for message in [
             json!({"role":"assistant","content":"hi","annotations":[{"type":"file_citation"}]}),
@@ -2233,6 +2792,144 @@ mod tests {
         let request = normalize_chat(input, "req".to_owned()).unwrap();
         assert!(request.tools.is_empty() && !request.tool_required);
     }
+
+    #[test]
+    fn hosted_search_is_separate_from_client_functions_for_both_public_endpoints() {
+        let mut chat_request = chat();
+        chat_request["tools"] = json!([
+            {"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}},
+            {"type":"web_search","search_context_size":"low","filters":{"allowed_domains":["example.com"]}}
+        ]);
+        let request = normalize_chat(chat_request, "req".into()).unwrap();
+        assert_eq!(request.tools.len(), 1);
+        assert_eq!(
+            json!(request.hosted_tools),
+            json!([{"type":"web_search","search_context_size":"low","filters":{"allowed_domains":["example.com"]}}])
+        );
+        assert!(request.has_hosted_search());
+
+        let request = normalize_response(
+            json!({"model":"gemini-test","input":"search",
+            "tools":[{"type":"web_search_preview","search_context_size":"medium"}],
+            "include":["reasoning.encrypted_content","web_search_call.action.sources"]}),
+            "req".into(),
+        )
+        .unwrap();
+        assert_eq!(
+            json!(request.hosted_tools),
+            json!([{"type":"web_search_preview","search_context_size":"medium"}])
+        );
+        assert_eq!(request.hosted_include, ["web_search_call.action.sources"]);
+        assert!(request.tools.is_empty());
+    }
+
+    #[test]
+    fn hosted_search_include_and_none_semantics_cover_chat_and_responses() {
+        let mut chat_request = chat();
+        chat_request["tools"] = json!([
+            {"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}},
+            {"type":"web_search"}
+        ]);
+        chat_request["include"] = json!(["web_search_call.action.sources"]);
+        let request = normalize_chat(chat_request.clone(), "req".into()).unwrap();
+        assert_eq!(request.tools.len(), 1);
+        assert_eq!(request.hosted_tools.len(), 1);
+        assert_eq!(request.hosted_include, ["web_search_call.action.sources"]);
+
+        chat_request["tool_choice"] = json!("none");
+        let request = normalize_chat(chat_request, "req".into()).unwrap();
+        assert!(request.tools.is_empty());
+        assert!(request.hosted_tools.is_empty());
+        assert!(request.hosted_include.is_empty());
+        assert!(!request.has_hosted_search());
+
+        let responses = json!({"model":"gemini-test","input":"search",
+            "tools":[{"type":"web_search"}],
+            "include":["web_search_call.action.sources"],"tool_choice":"none"});
+        let request = normalize_response(responses, "req".into()).unwrap();
+        assert!(request.tools.is_empty());
+        assert!(request.hosted_tools.is_empty());
+        assert!(request.hosted_include.is_empty());
+        assert!(!request.has_hosted_search());
+
+        let mut unknown = chat();
+        unknown["tools"] = json!([{"type":"web_search"}]);
+        unknown["include"] = json!(["unsupported.include"]);
+        assert_eq!(
+            normalize_chat(unknown, "req".into()).unwrap_err().code,
+            "unsupported_parameter"
+        );
+        let mut without_search = chat();
+        without_search["include"] = json!(["web_search_call.action.sources"]);
+        assert!(normalize_chat(without_search, "req".into()).is_err());
+    }
+
+    #[test]
+    fn chat_file_limit_counts_pdf_attachments_across_turns() {
+        let pdf = format!(
+            "data:application/pdf;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(b"%PDF-1.7\nsynthetic\n%%EOF")
+        );
+        let mut input = chat();
+        input["messages"] = json!([
+            {"role":"user","content":[{"type":"file","file":{"filename":"one.pdf","file_data":pdf}}]},
+            {"role":"assistant","content":"first document noted"},
+            {"role":"user","content":[{"type":"file","file":{"filename":"two.pdf","file_data":pdf}}]}
+        ]);
+        let error = normalize_chat(input, "req".into()).unwrap_err();
+        assert_eq!(error.code, "invalid_request");
+    }
+
+    #[test]
+    fn hosted_search_history_and_tool_choice_constraints_are_explicit() {
+        let search = json!({"type":"web_search_call","id":"ws_1","status":"completed",
+            "action":{"type":"search","query":"synthetic query","sources":[{"url":"https://example.test/a","title":"Example"}]}});
+        let request = normalize_response(
+            json!({"model":"gemini-test","input":[
+            {"role":"user","content":"search"},search.clone()],
+            "tools":[{"type":"web_search"}]}),
+            "req".into(),
+        )
+        .unwrap();
+        assert_eq!(request.input[1], search);
+        assert!(request.has_hosted_search());
+
+        let required = normalize_response(
+            json!({"model":"gemini-test","input":"search",
+            "tools":[{"type":"web_search"}],"tool_choice":"required"}),
+            "req".into(),
+        )
+        .unwrap();
+        assert!(required.tool_required);
+        let mut named = json!({"model":"gemini-test","input":"search","tools":[
+            {"type":"function","name":"lookup","parameters":{"type":"object"}},
+            {"type":"web_search"}],"tool_choice":{"type":"function","name":"lookup"}});
+        assert_eq!(
+            normalize_response(named.clone(), "req".into())
+                .unwrap_err()
+                .code,
+            "unsupported_parameter"
+        );
+        named["tool_choice"] = json!("none");
+        let none = normalize_response(named, "req".into()).unwrap();
+        assert!(none.tools.is_empty() && none.hosted_tools.is_empty());
+
+        let mut include_without_tool = json!({"model":"gemini-test","input":"search",
+            "include":["web_search_call.action.sources"]});
+        assert_eq!(
+            normalize_response(include_without_tool.clone(), "req".into())
+                .unwrap_err()
+                .code,
+            "invalid_request"
+        );
+        include_without_tool["tools"] = json!([{"type":"web_search","unknown":true}]);
+        assert_eq!(
+            normalize_response(include_without_tool, "req".into())
+                .unwrap_err()
+                .code,
+            "unsupported_parameter"
+        );
+    }
     #[test]
     fn forced_tool_choices_narrow_the_inventory_and_require_a_call() {
         let named = |name: &str| {
@@ -2413,15 +3110,15 @@ mod tests {
         assert_eq!(
             request.input[0]["content"],
             json!([
-                {"type":"text","text":"I cannot comply"}
+                {"type":"input_text","text":"I cannot comply"}
             ])
         );
         assert_eq!(
             request.input[1]["content"],
             json!([
-                {"type":"text","text":"Existing preface"},
-                {"type":"text","text":"Existing detail"},
-                {"type":"text","text":"Additional refusal"}
+                {"type":"input_text","text":"Existing preface"},
+                {"type":"input_text","text":"Existing detail"},
+                {"type":"input_text","text":"Additional refusal"}
             ])
         );
         assert!(request.input[0].get("refusal").is_none());
@@ -2443,10 +3140,10 @@ mod tests {
     fn media_and_unknown_tools_never_become_text_placeholders() {
         let mut input = chat();
         input["messages"][0]["content"] =
-            json!([{"type":"image_url","image_url":{"url":"https://example.invalid/image.png"}}]);
+            json!([{"type":"image_url","image_url":{"url":"file:///tmp/image.png"}}]);
         assert!(normalize_chat(input, "req".to_owned()).is_err());
-        let input =
-            json!({"model":"gemini-test", "input":"hello", "tools":[{"type":"web_search"}]});
+        let input = json!({"model":"gemini-test", "input":"hello",
+            "tools":[{"type":"unsupported_hosted_tool"}]});
         assert!(normalize_response(input, "req".to_owned()).is_err());
     }
     #[test]

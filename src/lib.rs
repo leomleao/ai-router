@@ -13,10 +13,13 @@ pub mod providers;
 
 pub mod antigravity;
 pub mod antigravity_auth;
+mod antigravity_images;
 mod antigravity_profile;
 mod antigravity_schema;
 pub mod antigravity_transport;
 pub mod antigravity_wire;
+mod images;
+mod media;
 pub mod provider_stream;
 
 pub mod antigravity_release;

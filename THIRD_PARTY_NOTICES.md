@@ -16,6 +16,7 @@ The Antigravity adapter translates selected protocol behaviour from
 - `packages/ai/src/registry/engine/common.ts`
 - `packages/ai/src/registry/engine/refresh.ts`
 - `packages/catalog/src/discovery/antigravity.ts`
+- `packages/ai/src/images/google-antigravity.ts`
 - `packages/catalog/src/types.ts`
 
 Visible-content rewriting, dynamic client identity, endpoint failover, automatic

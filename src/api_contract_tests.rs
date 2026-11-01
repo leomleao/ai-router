@@ -437,7 +437,7 @@ async fn studio_store_false_reasoning_tool_turns_round_trip_on_both_providers() 
     let profile = &capabilities["profiles"]["model"];
     assert_eq!(
         profile["responses_include"],
-        json!(["reasoning.encrypted_content"])
+        json!(["reasoning.encrypted_content", "web_search_call.action.sources"])
     );
     assert_eq!(profile["reasoning_summary"]["mode"], "unavailable");
 }
