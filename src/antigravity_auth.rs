@@ -1,6 +1,6 @@
 //! Router-owned Google authorization. Never imports AGY/OMP token files.
 //! All authenticated operations share this gate and fixed, reviewed origins.
-//! OAuth registration provenance: OMP 686b5e2f, catalog auth/google-antigravity.kdl.
+//! OAuth registration provenance: OMP 21f1188c, catalog auth/google-antigravity.kdl.
 //! This bundled installed-app registration was explicitly selected by the operator.
 //! Login is an explicit account recovery exception; protocol restrictions still apply.
 use crate::protocol::ApiError;
@@ -33,13 +33,13 @@ use tokio_util::sync::CancellationToken;
 
 pub const CCA_ORIGIN: &str = "https://daily-cloudcode-pa.googleapis.com";
 const LINUX_USER_AGENT: &str =
-    "antigravity/hub/2.28.2 (aidev_client; os_type=linux; arch=amd64; cl=1005016104)";
+    "antigravity/hub/2.29.0 (aidev_client; os_type=linux; arch=amd64; cl=1005016104)";
 #[cfg(target_os = "macos")]
 pub const PINNED_USER_AGENT: &str =
-    "antigravity/hub/2.28.2 (aidev_client; os_type=darwin; arch=arm64; cl=1005016104)";
+    "antigravity/hub/2.29.0 (aidev_client; os_type=darwin; arch=arm64; cl=1005016104)";
 #[cfg(target_os = "windows")]
 pub const PINNED_USER_AGENT: &str =
-    "antigravity/hub/2.28.2 (aidev_client; os_type=windows; arch=amd64; cl=1005016104)";
+    "antigravity/hub/2.29.0 (aidev_client; os_type=windows; arch=amd64; cl=1005016104)";
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub const PINNED_USER_AGENT: &str = LINUX_USER_AGENT;
 fn native_build() -> &'static str {
@@ -51,7 +51,7 @@ fn native_build() -> &'static str {
         "linux"
     }
 }
-pub const BASELINE_REVISION: &str = "omp-686b5e2f-antigravity-v4";
+pub const BASELINE_REVISION: &str = "omp-21f1188c-antigravity-v5";
 // Match OMP's google-antigravity credential expires.skew-ms=300000.
 // Store actual expiry; renew before dispatch inside the same five-minute window.
 const TOKEN_REFRESH_SKEW_SECS: u64 = 300;
@@ -1456,6 +1456,7 @@ mod tests {
             "omp-2220e581-antigravity-v1",
             "omp-d5cd750e-antigravity-v2",
             "omp-0b5c27ab-antigravity-v3",
+            "omp-686b5e2f-antigravity-v4",
         ] {
             let (_root, auth) = store();
             let generation = seed(&auth).await;

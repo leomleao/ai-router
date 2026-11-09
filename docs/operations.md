@@ -120,6 +120,25 @@ renewal; they do not publish callback ports. Other non-login one-offs are offlin
 
 ### Adopting a newly reviewed baseline
 
+The 2026-11-09 release adopts `omp-21f1188c-antigravity-v5` / Hub 2.29.0.
+The registration, six OAuth scopes and saved-state format are unchanged from
+v4. Existing fully consented v4 sessions require baseline adoption with the
+gateway stopped; fresh login is not required for this update. Inspect status
+and restrictions first, since resume also clears restrictions and rotates the
+account generation:
+
+```sh
+./scripts/login.sh agy status
+./scripts/login.sh agy resume
+```
+
+Use `./login.sh` in the home-server deployment directory. Build the new image
+before stopping, then adopt using that image and start the gateway afterward.
+Verify AGY separately from overall readiness, since OpenAI can satisfy readiness.
+See [the November 9 review](upstream-review-2026-11-09.md).
+
+#### Deployments older than the November 1 baseline
+
 The 2026-11-01 release adopts `omp-686b5e2f-antigravity-v4` / Hub 2.28.2.
 The public OAuth registration is unchanged, but OMP adds the `aicode` scope.
 Existing sessions need fresh Google consent; baseline adoption cannot grant a
@@ -166,7 +185,7 @@ protocol, authentication or account failures from actual provider operations
 persist restrictions and require explicit recovery. These checks and restrictions
 do not disable OpenAI.
 
-The catalogue contains only the 13 reviewed exact model IDs, and the saved
+The chat catalogue contains only the 13 reviewed exact model IDs, and the saved
 account roster determines which of those IDs are available. New upstream model
 SKUs require a reviewed baseline/code change, tests, and a rebuilt image before
 they can appear. Normal OAuth `refresh_token` calls renew an existing session;

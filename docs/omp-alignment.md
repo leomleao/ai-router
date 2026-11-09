@@ -117,3 +117,13 @@ include the additional `aicode` OAuth scope, native-build identity and headers,
 request labels and discovery-provided generation settings. Fresh Google consent
 is required for existing sessions; resume adopts the baseline but cannot add
 the scope. Live acceptance remains an operator check after adoption.
+
+## Observation on 2026-11-09
+
+The [November 9 review](upstream-review-2026-11-09.md) compares all 68 recorded
+paths: 57 unchanged and 11 changed. It adopts Hub **2.29.0** / OMP **21f1188c**
+and distinguishes recognized unsuccessful generations such as
+`MALFORMED_RESPONSE` from protocol corruption. The registration and six scopes
+are unchanged; existing v4 sessions need explicit baseline adoption without
+fresh consent. Supplied live cancellation records remain a separate diagnostic
+question and are not attributed to this AGY change.

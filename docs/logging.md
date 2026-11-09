@@ -35,7 +35,18 @@ was already sent, so a failure reached the client as a stream event).
 | `tool_call_relayed` | A noncompliant call to a non-strict tool was handed to the client (see "Noncompliant tool calls" in [capabilities](capabilities.md)) | `tool_name`, `call_id`, `declared` (false for an undeclared tool), `diagnostics` (`reason` `unknown_tool` or `schema_mismatch`, `validation_errors` with schema paths, expected and actual JSON types and missing required field names) |
 | `model_request_completed` | The provider returned a result | `status` (`completed`/`incomplete`), `finish_reason`, `text_bytes`, `structured_output`, `tool_call_count`, `tool_call_names`, `relayed_tool_calls`, `opaque_output_items` (e.g. reasoning item counts), `usage`, `usage_partial`, `upstream_request_id` |
 | `provider_request_failed` | The provider call failed or its output was rejected | `status`, `code`, `param`, `retry` (`x-should-retry`), `explanation`, `upstream_request_id`, `diagnostics` (below), `private_capture` (the monitor capture holds the offending content) |
-| `model_request_ended_early` | No terminal event: the client disconnected, or the request deadline passed | `status` (`cancelled`/`failed`), `code` (`client_disconnected`/`provider_timeout`) |
+| `model_request_ended_early` | The handler or response body was dropped without a terminal event | `status`, legacy `code` (`client_disconnected`/`provider_timeout`), `termination_evidence`, `disconnect_confirmed:false`, `terminal_event_observed:false`, `provider_task_finished` |
+
+An early ending's legacy `client_disconnected` code does not establish a peer
+closure or client timeout. `termination_evidence` records only observed state:
+`request_deadline_elapsed`, `shutdown_token_cancelled`,
+`request_token_cancelled`, `response_body_dropped` or `handler_future_dropped`.
+Cancellation tokens are inspected before cleanup cancels the request token.
+An elapsed request deadline keeps the existing `provider_timeout` record;
+otherwise the underlying disconnect cause remains unknown. Null startup,
+first-output and upstream-ID fields mean those observations were not recorded,
+not that no upstream work occurred. Early-ending metadata is also retained in
+the bounded memory-only response detail. No automatic retry is introduced.
 
 The request shape (`request`) summarizes what the client sent without content:
 `requested_model`, `stream`, `fields` (top-level field names), `input_items`
@@ -56,6 +67,7 @@ identify the client (n8n, Twenty, Supabase Studio, Cognee).
 | `upstream_http`, `upstream_error_body`, `upstream_stream` | The provider returned an HTTP error, an error body with a 2xx status, or a `response.failed`/`error` event | `http_status`, `upstream_code`, `upstream_type`, `upstream_param`, `upstream_status`, `body_bytes`; stream failures add `event_type` and `text_bytes`. The upstream body is in the monitor capture |
 | `upstream_transport` | Connection or stream failure | `stage` (`send`/`stream`), `kind` (`timeout`, `connect`, `body`, `decode`, `request`, `other`); stream failures add `bytes_received`, `text_bytes` |
 | `wire_validation` | An Antigravity frame was malformed or unsupported | `reason` |
+| `provider_terminal` | A recognized unsuccessful AGY generation, including `MALFORMED_RESPONSE` | Allowlisted `finish_reason`, `withheld_tool_count`, `text_bytes`; no call handoff, automatic retry or provider-wide protocol latch |
 
 Antigravity tool failures use the same `tool_validation` phase and keep the
 rejected `functionCall` part in the capture. Errors without diagnostics are the

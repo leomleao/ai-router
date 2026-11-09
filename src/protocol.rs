@@ -18,6 +18,9 @@ pub(crate) fn error_explanation(provider: &str, code: &str) -> Option<&'static s
         ("agy", "agy_scope_update_required") => Some(
             "Antigravity requires fresh Google consent for the added aicode scope. Stop the gateway, adopt the reviewed baseline if required, then run login.sh agy login.",
         ),
+        ("agy", "provider_generation_failed") => Some(
+            "AGY returned a recognized unsuccessful generation. Tool calls were withheld; this error does not restrict the provider or trigger automatic retries.",
+        ),
         ("openai", "server_is_overloaded") => Some(
             "OpenAI is temporarily overloaded. Try again shortly. The router did not retry automatically.",
         ),
@@ -33,9 +36,9 @@ pub(crate) fn error_explanation(provider: &str, code: &str) -> Option<&'static s
         (_, "missing_required_tool_call") => Some(
             "The model answered without the tool call that tool_choice required. The output was withheld.",
         ),
-        (_, "client_disconnected") => {
-            Some("The client disconnected before the response completed.")
-        }
+        (_, "client_disconnected") => Some(
+            "The request ended before completion. Inspect termination evidence; the underlying disconnect cause may be unknown.",
+        ),
         _ => None,
     }
 }

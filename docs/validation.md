@@ -1,5 +1,30 @@
 # Local validation
 
+## AGY v5 and cancellation evidence (2026-11-09)
+
+The [November 9 review](upstream-review-2026-11-09.md) adopts Hub 2.29.0 /
+OMP 21f1188c with unchanged registration and six scopes. The new generation-error
+regression covers known failed terminals, including unusable parts under
+`MALFORMED_RESPONSE`, then successful subsequent requests without a provider
+restriction. Unknown terminals still latch protocol protection. Calls are
+withheld and exact dispatch counts prove no automatic retries.
+
+The complete isolated suite passes **289 Rust tests**, including the existing
+real-TCP official Python, n8n Vercel/LangChain, Studio, media/search, tool
+continuation, strict/non-strict, auth and deadline regressions. API tests now
+verify early-ending details before and after SSE commit, and distinguish a
+shutdown token from an unproven client disconnect. Public explanations for
+historical cancellation records preserve that uncertainty. Existing v4 auth
+sessions are included in the baseline-adoption test; their matching session
+and grant evidence survive resume without fresh consent.
+
+All 68 public source hash pairs match (136 individual hashes). No runtime
+lockfile dependencies changed. Final binary/monitor and policy results are
+recorded in the review. Live provider inference, real token-expiry acceptance
+and matched CLI/direct latency were not run. Supplied November 8 live
+cancellations remain observations, not a reproduced client/proxy root cause.
+
+
 ## Media, search and images (2026-11-01)
 
 The [plan and DAG](media-search-plan.md) now completes image understanding on

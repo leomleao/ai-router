@@ -116,7 +116,7 @@ fails with a real HTTP error until its first output. See
 
 ## Operations and design notes
 
-[The latest upstream review](docs/upstream-review-2026-11-01.md) records Hub 2.28.2, OMP-aligned native headers and discovery settings, and the fresh Google consent required for the added `aicode` scope.
+[The latest upstream review](docs/upstream-review-2026-11-09.md) records Hub 2.29.0 / OMP 21f1188c, recognized generation-error handling and clearer cancellation diagnostics. Existing v4 sessions need baseline adoption without fresh Google consent; older sessions still need the November 1 `aicode` consent update.
 [The OMP alignment policy](docs/omp-alignment.md) explains why upstream OAuth and
 AGY protocol changes must be reviewed and carried into the router.
 [Local operations](docs/operations.md) covers login, volumes, OpenAI opt-in,

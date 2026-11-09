@@ -1656,6 +1656,21 @@ impl CompletionGuard {
             stream_committed: false,
         }
     }
+    /// Evidence available on drop, not an inference about the remote peer or its timeout.
+    fn early_termination_evidence(&self) -> &'static str {
+        if self.started.elapsed() >= Duration::from_secs(self.state.config.request_timeout_secs) {
+            "request_deadline_elapsed"
+        } else if self.state.shutdown.is_cancelled() {
+            "shutdown_token_cancelled"
+        } else if self.cancel.is_cancelled() {
+            "request_token_cancelled"
+        } else if self.stream_committed {
+            "response_body_dropped"
+        } else {
+            "handler_future_dropped"
+        }
+    }
+
     /// Shared fields of this request's lifecycle events.
     fn log_fields(&self, mut fields: Value) -> Value {
         if let (Some(fields), Value::Object(context)) = (fields.as_object_mut(), &self.log_context)
@@ -1772,20 +1787,23 @@ impl CompletionGuard {
 }
 impl Drop for CompletionGuard {
     fn drop(&mut self) {
+        // Observe cancellation before cancelling our own child token on cleanup.
+        let evidence = self.early_termination_evidence();
         self.cancel.cancel();
-        // Still the constructor's default: no terminal event was observed.
+        // Keep the legacy telemetry code; it is not proof of peer closure.
         let unfinished = self.record.error_code.as_deref() == Some("client_disconnected");
-        if unfinished
-            && self.started.elapsed() >= Duration::from_secs(self.state.config.request_timeout_secs)
-        {
+        if unfinished && evidence == "request_deadline_elapsed" {
             self.record.status = "failed".into();
             self.record.error_code = Some("provider_timeout".into());
         }
         self.record.duration_ms = self.started.elapsed().as_millis() as u64;
         if unfinished {
-            crate::log::event(
-                "model_request_ended_early",
-                self.log_fields(json!({"status":self.record.status,"code":self.record.error_code})),
+            let details = self.log_fields(json!({"status":self.record.status,"code":self.record.error_code,
+                "termination_evidence":evidence,"disconnect_confirmed":false,
+                "terminal_event_observed":false,"provider_task_finished":self.finished.is_cancelled()}));
+            crate::log::event("model_request_ended_early", details.clone());
+            self.capture_response(
+                &json!({"error":{"code":self.record.error_code},"diagnostics":details}),
             );
         }
         let record = self.record.clone();
@@ -3516,6 +3534,19 @@ mod tests {
             (record.status.as_str(), record.error_code.as_deref()),
             ("cancelled", Some("client_disconnected"))
         );
+        let detail = h
+            .state
+            .telemetry
+            .request_detail(&record.request_id)
+            .await
+            .unwrap();
+        let capture: Value = serde_json::from_str(&detail.response.unwrap().json).unwrap();
+        assert_eq!(
+            capture["diagnostics"]["termination_evidence"],
+            "handler_future_dropped"
+        );
+        assert_eq!(capture["diagnostics"]["disconnect_confirmed"], false);
+        assert_eq!(capture["diagnostics"]["stream_committed"], false);
         assert!(h.state.drain(Duration::from_secs(2)).await);
         let h = DualHarness::with_commit_wait(5, Duration::from_millis(100)).await;
         let response = h.send(axum::http::Method::POST, "/v1/chat/completions",
@@ -3527,8 +3558,49 @@ mod tests {
             (record.status.as_str(), record.error_code.as_deref()),
             ("cancelled", Some("client_disconnected"))
         );
+        let detail = h
+            .state
+            .telemetry
+            .request_detail(&record.request_id)
+            .await
+            .unwrap();
+        let capture: Value = serde_json::from_str(&detail.response.unwrap().json).unwrap();
+        assert_eq!(
+            capture["diagnostics"]["termination_evidence"],
+            "response_body_dropped"
+        );
+        assert_eq!(capture["diagnostics"]["disconnect_confirmed"], false);
+        assert_eq!(capture["diagnostics"]["stream_committed"], true);
         assert!(h.state.drain(Duration::from_secs(2)).await);
     }
+    #[tokio::test]
+    async fn unfinished_handler_records_shutdown_evidence_without_claiming_peer_disconnect() {
+        let h = DualHarness::new().await;
+        let mut pending=Box::pin(h.send(axum::http::Method::POST,"/v1/chat/completions",
+            Some(json!({"model":"synthetic-openai","messages":[{"role":"user","content":"deadline-fixture"}],"stream":true})),Some("test-key")));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), pending.as_mut())
+                .await
+                .is_err()
+        );
+        h.state.stop();
+        drop(pending);
+        let record = last_record(&h).await;
+        let detail = h
+            .state
+            .telemetry
+            .request_detail(&record.request_id)
+            .await
+            .unwrap();
+        let capture: Value = serde_json::from_str(&detail.response.unwrap().json).unwrap();
+        assert_eq!(
+            capture["diagnostics"]["termination_evidence"],
+            "shutdown_token_cancelled"
+        );
+        assert_eq!(capture["diagnostics"]["disconnect_confirmed"], false);
+        assert!(h.state.drain(Duration::from_secs(2)).await);
+    }
+
     // Each client gets a fresh gateway per failure: overload and auth failures
     // latch provider availability, which would mask the streamed path.
     #[tokio::test]

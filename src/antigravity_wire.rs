@@ -879,6 +879,68 @@ impl Decoder {
                 if candidate.get("index").is_some_and(|v| v != 0) {
                     return Err(invalid("invalid_provider_candidate"));
                 }
+                if let Some(reason) = candidate.get("finishReason") {
+                    let reason = reason
+                        .as_str()
+                        .ok_or_else(|| invalid("invalid_provider_terminal"))?;
+                    if self.finish_reason.is_some() {
+                        return Err(invalid("duplicate_provider_terminal"));
+                    }
+                    match reason {
+                        "STOP" | "MAX_TOKENS" => {}
+                        "SAFETY"
+                        | "RECITATION"
+                        | "BLOCKLIST"
+                        | "PROHIBITED_CONTENT"
+                        | "SPII"
+                        | "IMAGE_SAFETY"
+                        | "IMAGE_PROHIBITED_CONTENT"
+                        | "IMAGE_RECITATION" => return Err(invalid("provider_content_blocked")),
+                        "MALFORMED_RESPONSE"
+                        | "MALFORMED_FUNCTION_CALL"
+                        | "UNEXPECTED_TOOL_CALL"
+                        | "OTHER"
+                        | "LANGUAGE"
+                        | "FINISH_REASON_UNSPECIFIED"
+                        | "NO_IMAGE"
+                        | "IMAGE_OTHER" => {
+                            // A recognized unsuccessful generation is not evidence of protocol drift.
+                            // Calls remain withheld and the decoder is poisoned for this request.
+                            let mut error = ApiError::new(
+                                502,
+                                "provider_generation_failed",
+                                "Antigravity could not complete this generation",
+                            );
+                            error.durable = true; // Disable automatic client retries; do not latch the account.
+                            let failed_parts = candidate
+                                .pointer("/content/parts")
+                                .and_then(Value::as_array);
+                            let withheld_tool_count = self.calls.len()
+                                + failed_parts.map_or(0, |parts| {
+                                    parts
+                                        .iter()
+                                        .filter(|part| part.get("functionCall").is_some())
+                                        .count()
+                                });
+                            let text_bytes = self.text.len()
+                                + failed_parts.map_or(0, |parts| {
+                                    parts
+                                        .iter()
+                                        .filter_map(|part| part["text"].as_str())
+                                        .map(str::len)
+                                        .sum::<usize>()
+                                });
+                            error.diagnostics = Some(
+                                crate::protocol::FailureDiagnostics::metadata(json!({
+                                    "phase":"provider_terminal", "finish_reason":reason,
+                                    "withheld_tool_count":withheld_tool_count,"text_bytes":text_bytes
+                                })),
+                            );
+                            return Err(error);
+                        }
+                        _ => return Err(invalid("invalid_provider_terminal")),
+                    }
+                }
                 if let Some(content) = candidate.get("content") {
                     if content.get("role").is_some_and(|v| v != "model") {
                         return Err(invalid("invalid_provider_role"));
@@ -893,19 +955,8 @@ impl Decoder {
                         self.part(part, deltas)?;
                     }
                 }
-                if let Some(reason) = candidate.get("finishReason") {
-                    let reason = reason
-                        .as_str()
-                        .ok_or_else(|| invalid("invalid_provider_terminal"))?;
-                    if self.finish_reason.is_some() {
-                        return Err(invalid("duplicate_provider_terminal"));
-                    }
-                    match reason {
-                        "STOP" | "MAX_TOKENS" => self.finish_reason = Some(reason.to_owned()),
-                        "SAFETY" | "RECITATION" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII"
-                        | "IMAGE_SAFETY" => return Err(invalid("provider_content_blocked")),
-                        _ => return Err(invalid("invalid_provider_terminal")),
-                    }
+                if let Some(reason) = candidate.get("finishReason").and_then(Value::as_str) {
+                    self.finish_reason = Some(reason.to_owned());
                 }
             }
         }
@@ -1758,6 +1809,51 @@ mod tests {
                 json!({"candidates":[{"content":{"parts":[{"functionCall":{"name":"weather","args":{"city":"London"}}}]},"finishReason":reason}]}),
             );
             assert!(decode(&tools_request(), &bytes).is_err());
+        }
+    }
+
+    #[test]
+    fn recognized_generation_errors_withhold_calls_and_preserve_safe_terminal_diagnostics() {
+        for reason in [
+            "MALFORMED_RESPONSE",
+            "MALFORMED_FUNCTION_CALL",
+            "UNEXPECTED_TOOL_CALL",
+            "OTHER",
+            "LANGUAGE",
+            "FINISH_REASON_UNSPECIFIED",
+            "NO_IMAGE",
+            "IMAGE_OTHER",
+        ] {
+            let bytes = frame(
+                json!({"responseId":"failure-fixture","candidates":[{"content":{"parts":[
+                {"text":"private partial output"}, {"functionCall":{"name":"weather","args":{"city":"private-city"}}}
+            ]},"finishReason":reason}]}),
+            );
+            let mut decoder = Decoder::new(&tools_request(), MAX_STREAM_BYTES);
+            let error = decoder.push(&bytes).unwrap_err();
+            assert_eq!(error.code, "provider_generation_failed");
+            assert_eq!(
+                error.upstream_request_id.as_deref(),
+                Some("failure-fixture")
+            );
+            assert_eq!(error.retry_header(), Some(("x-should-retry", "false")));
+            let metadata = error.diagnostics.unwrap().metadata;
+            assert_eq!(metadata["finish_reason"], reason);
+            assert_eq!(metadata["withheld_tool_count"], 1);
+            assert!(!metadata.to_string().contains("private"));
+            assert!(decoder.finish().is_err());
+        }
+        for parts in [
+            json!("unusable parts"),
+            json!([{"functionCall":{"name":"weather","args":"not an object"}}]),
+        ] {
+            let bytes = frame(
+                json!({"candidates":[{"content":{"parts":parts},"finishReason":"MALFORMED_RESPONSE"}]}),
+            );
+            assert_eq!(
+                decode(&tools_request(), &bytes).err().unwrap().code,
+                "provider_generation_failed"
+            );
         }
     }
 

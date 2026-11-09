@@ -1635,7 +1635,7 @@ mod tests {
         for (code, expected) in [
             ("server_is_overloaded", "OpenAI is temporarily overloaded"),
             ("invalid_structured_output", "OpenAI returned invalid JSON"),
-            ("client_disconnected", "The client disconnected"),
+            ("client_disconnected", "disconnect cause may be unknown"),
         ] {
             record.error_code = Some(code.into());
             let rendered: String = request_detail_lines(record, 200, Palette::new(&app))

@@ -123,9 +123,10 @@ See [the plan and DAG](media-search-plan.md) and the review reports
 
 ## Protocol provenance
 
-The reviewed OMP identity remains Hub 2.28.2 / OMP 686b5e2f / adapter v4.
-This feature review adds the pinned image adapter/shared/types source hashes
-to the existing baseline, for 68 pairs of public source hashes. It introduces no
+The reviewed identity is now Hub 2.29.0 / OMP 21f1188c / adapter v5; see
+[the November 9 review](upstream-review-2026-11-09.md).
+The media feature review added the pinned image adapter/shared/types sources
+to the baseline, which now tracks 68 pairs of public source hashes. It introduces no
 additional OAuth scope, registration change or automatic state migration. The
 added `aicode` consent requirement from the preceding baseline update still
 applies when adopting that update for the first time.

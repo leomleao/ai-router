@@ -594,6 +594,87 @@ fn protocol_failure(code: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn generation_failures_do_not_latch_protocol_but_unknown_terminals_still_do() {
+        use axum::{Json, Router, routing::post};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let mock = Router::new()
+            .route("/v1internal:fetchAvailableModels",post(|| async { Json(json!({"models":{"gemini-4-argon-medium":{"displayName":"Fixture"}}})) }))
+            .route("/v1internal:streamGenerateContent",post(move |Json(body):Json<Value>| {
+                count.fetch_add(1,Ordering::SeqCst);
+                async move {
+                    let encoded=body.to_string();
+                    let reason=["MALFORMED_RESPONSE","MALFORMED_FUNCTION_CALL","UNEXPECTED_TOOL_CALL","UNKNOWN_FINISH"].into_iter().find(|reason|encoded.contains(reason)).unwrap_or("STOP");
+                    let parts=if reason=="STOP" {json!([{"text":"done"}])} else if reason=="MALFORMED_RESPONSE" {json!([{"functionCall":{"name":"weather","args":"malformed generation arguments"}}])} else {json!([{"functionCall":{"name":"weather","args":{"city":"London"}}}])};
+                    ([("content-type","text/event-stream")],format!("data: {}\n\n",json!({"response":{"candidates":[{"content":{"role":"model","parts":parts},"finishReason":reason}]}})))
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+        let root = tempfile::tempdir().unwrap();
+        let provider =
+            Antigravity::synthetic(Arc::new(Config::for_test(root.path())), origin).await;
+        assert!(provider.probe().await.authenticated);
+        for reason in [
+            "MALFORMED_RESPONSE",
+            "MALFORMED_FUNCTION_CALL",
+            "UNEXPECTED_TOOL_CALL",
+            "UNKNOWN_FINISH",
+        ] {
+            for successful in [false, true] {
+                if successful && reason == "UNKNOWN_FINISH" {
+                    break;
+                }
+                let prompt = if successful { "good request" } else { reason };
+                let request=normalize_chat(json!({"model":"gemini-4-argon-medium","messages":[{"role":"user","content":prompt}],
+                    "tools":[{"type":"function","function":{"name":"weather","strict":true,"parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"],"additionalProperties":false}}}]}),"terminal-fixture".into()).unwrap();
+                let mut run = provider
+                    .start(request, CancellationToken::new())
+                    .await
+                    .unwrap();
+                let terminal = tokio::time::timeout(Duration::from_secs(3), async {
+                    loop {
+                        match run.events.recv().await.unwrap() {
+                            RunEvent::ToolCall(_) => {
+                                panic!("failed generation must not hand off calls")
+                            }
+                            event @ (RunEvent::Completed(_) | RunEvent::Error(_)) => break event,
+                            _ => {}
+                        }
+                    }
+                })
+                .await
+                .unwrap();
+                match terminal {
+                    RunEvent::Completed(result) if successful => assert_eq!(result.text, "done"),
+                    RunEvent::Error(error) if !successful => {
+                        assert_eq!(
+                            error.code,
+                            if reason == "UNKNOWN_FINISH" {
+                                "invalid_provider_terminal"
+                            } else {
+                                "provider_generation_failed"
+                            }
+                        );
+                        if reason != "UNKNOWN_FINISH" {
+                            assert_eq!(error.retry_header(), Some(("x-should-retry", "false")));
+                        }
+                    }
+                    _ => panic!("unexpected terminal result"),
+                }
+                assert_eq!(
+                    provider.auth.status().await.unwrap()["protocol_blocked"],
+                    reason == "UNKNOWN_FINISH"
+                );
+            }
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 7, "no automatic retries");
+        server.abort();
+    }
+
     #[test]
     fn catalogue_requires_recognized_shape_and_preserves_exact_variants() {
         assert!(parse_models(&json!({})).is_err());
